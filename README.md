@@ -1,6 +1,6 @@
-# go-indexus-core
+# Indexus Core
 
-<a href="https://github.com/yourusername/go-indexus-core/blob/master/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License"/></a> <a href="https://discord.gg/yourdiscordlink"><img src="https://img.shields.io/discord/1234567890?logo=discord&logoColor=white" alt="Discord"/></a>
+<a href="https://github.com/indexus/go-indexus-core/blob/master/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License"/></a> <a href="https://discord.gg/EXuGtcDgaS"><img src="https://img.shields.io/discord/1235219716738519080?logo=discord&logoColor=white" alt="Discord"/></a>
 
 ### Peer-to-Peer Information Access
 
@@ -10,7 +10,7 @@
 
 ## Table of Contents
 
-- [go-indexus-core](#go-indexus-core)
+- [Indexus Core](#indexus-core)
     - [Peer-to-Peer Information Access](#peer-to-peer-information-access)
   - [Table of Contents](#table-of-contents)
   - [About go-indexus-core](#about-go-indexus-core)
@@ -27,6 +27,11 @@
     - [Starting a Node](#starting-a-node)
     - [Connecting to the Network](#connecting-to-the-network)
     - [Monitoring the Node](#monitoring-the-node)
+    - [Monitoring the Node](#monitoring-the-node-1)
+  - [API Endpoints](#api-endpoints)
+    - [Client Endpoints](#client-endpoints)
+    - [Peer Endpoints](#peer-endpoints)
+    - [Monitoring Endpoints](#monitoring-endpoints)
   - [Contributing](#contributing)
   - [License](#license)
   - [Contact](#contact)
@@ -159,9 +164,110 @@ The node includes a monitoring service that runs on the specified monitoring por
 http://localhost:19000/
 ```
 
+### Monitoring the Node
+
+The node includes a monitoring service that runs on the specified monitoring port (default `19000`). You can access the monitoring interface by navigating to:
+
+```
+http://localhost:19000/
+```
+
 (Note: Monitoring endpoints and features will be expanded in future releases.)
 
 ---
+
+## API Endpoints
+
+### Client Endpoints
+
+1. **Item**
+
+   - **Method:** `POST`
+   - **URL:** `http://bootstrap.indexus.io:21000/item`
+   - **Body:**
+
+     ```json
+     {
+       "item": {
+         "id": "reference",
+         "collection": "oVxwqpn90mkO7ZX9xHCaiskLkTo",
+         "location": "rAwbDBzPQPR0e5NXGCDCZXg6d4s"
+       },
+       "root": "@",
+       "current": "rAwbDBzPQPR0e5NXGCDCZXg6d4s"
+     }
+     ```
+
+   - **Description:** Adds an item to the specified collection at the given location.
+
+2. **Set**
+
+   - **Method:** `GET`
+   - **URL:** `http://bootstrap.indexus.io:21000/set`
+     - **Query Parameters:**
+       - `collection=oVxwqpn90mkO7ZX9xHCaiskLkTo`
+       - `location=@`
+
+   - **Description:** Retrieves a set of items from the specified collection and location.
+
+---
+
+### Peer Endpoints
+
+1. **Ping**
+
+   - **Method:** `POST`
+   - **URL:** `http://bootstrap.indexus.io:21000/ping`
+
+   - **Description:** Checks the availability of a peer node.
+
+2. **Neighbors**
+
+   - **Method:** `GET`
+   - **URL:** `http://bootstrap.indexus.io:21000/neighbors`
+     - **Query Parameters:**
+       - `origin=rAwbDBzPQPR0e5NXGCDCZXg6d4s`
+
+   - **Description:** Retrieves a list of neighboring peers relative to the specified origin.
+
+---
+
+### Monitoring Endpoints
+
+1. **Acknowledged**
+
+   - **Method:** `GET`
+   - **URL:** `http://bootstrap.indexus.io:19000/acknowledged`
+
+   - **Description:** Lists acknowledged nodes in the network.
+
+2. **Registered**
+
+   - **Method:** `GET`
+   - **URL:** `http://bootstrap.indexus.io:19000/registered`
+
+   - **Description:** Lists registered nodes in the network.
+
+3. **Routing**
+
+   - **Method:** `GET`
+   - **URL:** `http://bootstrap.indexus.io:19000/routing`
+
+   - **Description:** Displays the routing table of the node.
+
+4. **Ownership**
+
+   - **Method:** `GET`
+   - **URL:** `http://bootstrap.indexus.io:19000/ownership`
+
+   - **Description:** Shows the collections and items owned by the node.
+
+5. **Queue**
+
+   - **Method:** `GET`
+   - **URL:** `http://bootstrap.indexus.io:19000/queue`
+
+   - **Description:** Displays the current task queue of the node.
 
 ## Contributing
 
