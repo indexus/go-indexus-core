@@ -12,13 +12,13 @@ import (
 	"syscall"
 	"time"
 
-	"gitlab.com/indexus/node/app/simulation/mockup"
-	"gitlab.com/indexus/node/core"
-	"gitlab.com/indexus/node/domain"
-	"gitlab.com/indexus/node/http/monitoring"
-	"gitlab.com/indexus/node/http/p2p"
-	"gitlab.com/indexus/node/peer"
-	"gitlab.com/indexus/node/worker"
+	"github.com/indexus/go-indexus-core/app/simulation/mockup"
+	"github.com/indexus/go-indexus-core/core"
+	"github.com/indexus/go-indexus-core/domain"
+	"github.com/indexus/go-indexus-core/http/monitoring"
+	"github.com/indexus/go-indexus-core/http/p2p"
+	"github.com/indexus/go-indexus-core/peer"
+	"github.com/indexus/go-indexus-core/worker"
 )
 
 const asciiArt = `

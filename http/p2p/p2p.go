@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"strings"
 
-	"gitlab.com/indexus/node/domain"
+	"github.com/indexus/go-indexus-core/domain"
 )
 
 type Contact struct {

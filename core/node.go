@@ -6,7 +6,7 @@ import (
 	"math/rand"
 	"time"
 
-	"gitlab.com/indexus/node/domain"
+	"github.com/indexus/go-indexus-core/domain"
 )
 
 type Node struct {

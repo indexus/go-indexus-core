@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"math/rand"
 
-	"gitlab.com/indexus/node/core"
-	"gitlab.com/indexus/node/domain"
+	"github.com/indexus/go-indexus-core/core"
+	"github.com/indexus/go-indexus-core/domain"
 )
 
 var network = NewNetwork()

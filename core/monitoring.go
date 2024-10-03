@@ -3,7 +3,7 @@ package core
 import (
 	"fmt"
 
-	"gitlab.com/indexus/node/domain"
+	"github.com/indexus/go-indexus-core/domain"
 )
 
 func (n *Node) Routing() ([]domain.Contact, error) {

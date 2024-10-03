@@ -4,7 +4,7 @@ import (
 	"net"
 	"time"
 
-	"gitlab.com/indexus/node/domain"
+	"github.com/indexus/go-indexus-core/domain"
 )
 
 type Settings struct {

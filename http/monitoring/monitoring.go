@@ -6,7 +6,7 @@ import (
 	"net"
 	"net/http"
 
-	"gitlab.com/indexus/node/domain"
+	"github.com/indexus/go-indexus-core/domain"
 )
 
 type Service interface {

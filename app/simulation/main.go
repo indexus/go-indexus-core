@@ -10,8 +10,8 @@ import (
 	"syscall"
 	"time"
 
-	"gitlab.com/indexus/node/app/simulation/mockup"
-	"gitlab.com/indexus/node/peer"
+	"github.com/indexus/go-indexus-core/app/simulation/mockup"
+	"github.com/indexus/go-indexus-core/peer"
 )
 
 const asciiArt = `
