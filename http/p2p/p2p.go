@@ -3,10 +3,14 @@ package p2p
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"strings"
+
+	files "github.com/ipfs/boxo/files"
+	shell "github.com/ipfs/go-ipfs-api"
 
 	"github.com/indexus/go-indexus-core/domain"
 )
@@ -82,6 +86,9 @@ func (h *Handler) Serve(lis net.Listener) error {
 	mux.HandleFunc("/set", h.Get)
 	mux.HandleFunc("/item", h.New)
 
+	// IPFS
+	mux.HandleFunc("/content", h.ContentHandler)
+
 	s := &http.Server{Handler: mux}
 
 	log.Println("P2P HTTP Server started")
@@ -93,6 +100,74 @@ func writeJSON(w http.ResponseWriter, code int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(data)
+}
+
+// ContentHandler handles the /content endpoint
+func (h *Handler) ContentHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case "POST":
+		h.PostContent(w, r)
+	case "GET":
+		h.GetContent(w, r)
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "Method not allowed"})
+	}
+}
+
+// PostContent handles the POST method for /content endpoint
+func (h *Handler) PostContent(w http.ResponseWriter, r *http.Request) {
+	// Read the JSON body
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid request body"})
+		return
+	}
+
+	// Connect to the local IPFS node
+	sh := shell.NewShell("localhost:5001")
+
+	// Add the content to IPFS
+	cid, err := sh.Add(files.NewBytesFile(body))
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to add content to IPFS"})
+		return
+	}
+
+	// Return the CID
+	writeJSON(w, http.StatusOK, map[string]string{"cid": cid})
+}
+
+// GetContent handles the GET method for /content endpoint
+func (h *Handler) GetContent(w http.ResponseWriter, r *http.Request) {
+	// Get the 'cid' query parameter
+	cid := r.URL.Query().Get("cid")
+	if cid == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Missing 'cid' query parameter"})
+		return
+	}
+
+	// Connect to the local IPFS node
+	sh := shell.NewShell("localhost:5001")
+
+	// Get the content from IPFS
+	reader, err := sh.Cat(cid)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to retrieve content from IPFS"})
+		return
+	}
+	defer reader.Close()
+
+	// Read the content
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to read content"})
+		return
+	}
+
+	// Set the content type to JSON and write the response
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(data)
 }
 
 // Ping handles the /ping endpoint
