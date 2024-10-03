@@ -1,6 +1,6 @@
 package core
 
-import "gitlab.com/indexus/node/domain"
+import "github.com/indexus/go-indexus-core/domain"
 
 type Element struct {
 	item    *domain.Item

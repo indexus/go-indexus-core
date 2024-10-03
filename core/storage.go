@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"strings"
 
-	"gitlab.com/indexus/node/domain"
+	"github.com/indexus/go-indexus-core/domain"
 )
 
 func (n *Node) Snapshot() []string {

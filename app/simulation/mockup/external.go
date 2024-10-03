@@ -11,9 +11,9 @@ import (
 	"sync"
 	"time"
 
-	"gitlab.com/indexus/node/core"
-	"gitlab.com/indexus/node/domain"
-	"gitlab.com/indexus/node/worker"
+	"github.com/indexus/go-indexus-core/core"
+	"github.com/indexus/go-indexus-core/domain"
+	"github.com/indexus/go-indexus-core/worker"
 )
 
 type Contact struct {

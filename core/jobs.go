@@ -3,7 +3,7 @@ package core
 import (
 	"log"
 
-	"gitlab.com/indexus/node/domain"
+	"github.com/indexus/go-indexus-core/domain"
 )
 
 func (n *Node) Observe() error {
