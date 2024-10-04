@@ -77,7 +77,7 @@ func main() {
 
 // parseFlags handles command-line flag parsing and returns a Config struct
 func parseFlags() Config {
-	bootstrapFlagPtr := flag.String("bootstrap", "", "Host of the bootstrap peer")
+	bootstrapFlagPtr := flag.String("bootstrap", "", "Host of the bootstrap peers")
 	nameFlagPtr := flag.String("name", domain.EncodeId(domain.RandomId()), "Name of the node")
 	monitoringPortFlagPtr := flag.Int("monitoringPort", 19000, "Port number of the node for the monitoring service")
 	p2pPortFlagPtr := flag.Int("p2pPort", 21000, "Port number of the node for the peer to peer network")
@@ -88,14 +88,16 @@ func parseFlags() Config {
 	bootstraps := make([]domain.Contact, 0)
 
 	if len(*bootstrapFlagPtr) > 0 {
-		arr := strings.Split(*bootstrapFlagPtr, "|")
-		ip := arr[0]
-		port, err := strconv.Atoi(arr[1])
-		if err != nil {
-			log.Fatal(err)
+		arr1 := strings.Split(*bootstrapFlagPtr, ",")
+		for _, value := range arr1 {
+			arr2 := strings.Split(value, "|")
+			ip := arr2[0]
+			port, err := strconv.Atoi(arr2[1])
+			if err != nil {
+				log.Fatal(err)
+			}
+			bootstraps = append(bootstraps, peer.NewContact(domain.EncodeId(make([]byte, domain.IdLength())), map[string]any{ip: nil}, port))
 		}
-
-		bootstraps = append(bootstraps, peer.NewContact(domain.EncodeId(make([]byte, domain.IdLength())), map[string]any{ip: nil}, port))
 	}
 
 	return Config{
