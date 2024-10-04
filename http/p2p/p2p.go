@@ -9,6 +9,8 @@ import (
 	"strings"
 
 	"github.com/indexus/go-indexus-core/domain"
+
+	"github.com/rs/cors"
 )
 
 type Contact struct {
@@ -82,7 +84,17 @@ func (h *Handler) Serve(lis net.Listener) error {
 	mux.HandleFunc("/set", h.Get)
 	mux.HandleFunc("/item", h.New)
 
-	s := &http.Server{Handler: mux}
+	// Configure CORS
+	c := cors.New(cors.Options{
+		AllowedOrigins:   []string{"*"},
+		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowedHeaders:   []string{"Content-Type", "Authorization"},
+		AllowCredentials: true,
+	})
+
+	handler := c.Handler(mux)
+
+	s := &http.Server{Handler: handler}
 
 	log.Println("P2P HTTP Server started")
 
