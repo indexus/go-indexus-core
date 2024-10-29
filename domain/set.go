@@ -6,56 +6,56 @@ import (
 )
 
 type Set struct {
-	list map[string]int
+	list map[string]*Abelian
 	last time.Time
 	mu   *sync.Mutex
 }
 
 func NewSet() *Set {
 	return &Set{
-		list: make(map[string]int),
+		list: make(map[string]*Abelian),
 		last: time.Now(),
 		mu:   &sync.Mutex{},
 	}
 }
 
-func (s *Set) List() map[string]int {
+func (s *Set) List() map[string]*Abelian {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	result := make(map[string]int)
+	result := make(map[string]*Abelian)
 	for key, value := range s.list {
 		result[key] = value
 	}
 	return result
 }
 
-func (s *Set) Traverse(process func(string, int)) {
+func (s *Set) Traverse(process func(string, *Abelian)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	s.traverse(process)
 }
 
-func (s *Set) Get(value string) (int, bool) {
+func (s *Set) Get(value string) (*Abelian, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	return s.get(value)
 }
 
-func (s *Set) Add(value string, max int) bool {
+func (s *Set) Add(value string, abelian *Abelian, max int) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	return s.add(value, max)
+	return s.add(value, abelian, max)
 }
 
-func (s *Set) Put(value string, count int) {
+func (s *Set) Put(value string, abelian *Abelian) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.put(value, count)
+	s.put(value, abelian)
 }
 
 func (s *Set) Count() int {
@@ -65,11 +65,18 @@ func (s *Set) Count() int {
 	return s.count()
 }
 
-func (s *Set) Incr(value string, n int) int {
+func (s *Set) Abelian() *Abelian {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	return s.incr(value, n)
+	return s.abelian()
+}
+
+func (s *Set) Incr(value string, abelian *Abelian) *Abelian {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.incr(value, abelian)
 }
 
 func (s *Set) Reset() {
@@ -93,81 +100,105 @@ func (s *Set) Shrink(sets map[string]*Set, key string, max int) {
 	s.shrink(sets, key, max)
 }
 
-func (s *Set) traverse(process func(string, int)) {
+func (s *Set) traverse(process func(string, *Abelian)) {
 	for key, value := range s.list {
 		process(key, value)
 	}
 }
 
-func (s *Set) get(value string) (int, bool) {
-	count, ok := s.list[value]
-	return count, ok
+func (s *Set) get(value string) (*Abelian, bool) {
+	abelian, ok := s.list[value]
+	return abelian, ok
 }
 
-func (s *Set) add(value string, max int) bool {
-	s.list[value] = 1
+func (s *Set) add(value string, abelian *Abelian, max int) bool {
+	s.list[value] = abelian
 	return len(s.list) > max
 }
 
-func (s *Set) put(value string, count int) {
-	s.list[value] = count
+func (s *Set) put(value string, abelian *Abelian) {
+	s.list[value] = abelian
 }
 
 func (s *Set) count() int {
 	count := 0
 	for _, elm := range s.list {
-		count += elm
+		count += elm.Count()
 	}
 	return count
 }
 
-func (s *Set) incr(value string, n int) int {
-	result := s.list[value] + n
-	s.list[value] = result
-	return result
+func (s *Set) abelian() *Abelian {
+	var count int
+	var properties []float64
+
+	for _, elm := range s.list {
+		count += elm.Count()
+
+		if properties == nil {
+			properties = make([]float64, len(elm.Properties()))
+		}
+		for idx, value := range elm.Properties() {
+			properties[idx] += value
+		}
+	}
+
+	return NewAbelian(count, properties)
+}
+
+func (s *Set) incr(value string, delta *Abelian) *Abelian {
+	s.list[value].Sum(delta)
+	return s.list[value]
 }
 
 func (s *Set) shrink(sets map[string]*Set, key string, max int) {
 
-	list := make(map[string]int)
-	exist := make(map[string]string)
+	type tmp struct {
+		key     string
+		abelian *Abelian
+	}
+	list := make(map[string]*Abelian)
+	exist := make(map[string]tmp)
 
 	child, precision := "", len(key)
 	if key == root {
 		precision = 0
 	}
 
-	for current, count := range s.list {
+	for current, abelian := range s.list {
 
-		if count > 1 {
-			list[current] = count
+		if abelian.Count() > 1 {
+			list[current] = abelian
 			continue
 		}
 
 		child = current[:precision+1]
 
 		if set, ok1 := sets[child]; ok1 {
-			full := set.add(current, max)
-			list[child] = list[child] + 1
+			full := set.add(current, abelian, max)
+			list[child].Sum(abelian)
 
 			if full {
 				set.shrink(sets, child, max)
 			}
 		} else if first, ok2 := exist[child]; ok2 {
 			set := NewSet()
-			set.add(first, max)
-			set.add(current, max)
+			set.add(first.key, first.abelian, max)
+			set.add(current, abelian, max)
 
 			sets[child] = set
-			list[child] = 2
+			list[child] = set.Abelian()
 			delete(exist, child)
 		} else {
-			exist[child] = current
+			exist[child] = tmp{
+				key:     current,
+				abelian: abelian,
+			}
 		}
 	}
 
 	for _, elm := range exist {
-		list[elm] = 1
+		list[elm.key] = elm.abelian
 	}
 
 	s.list = list

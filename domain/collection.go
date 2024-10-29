@@ -116,12 +116,13 @@ func (c *Collection) List() map[string]*Set {
 	return c.sets
 }
 
-func (c *Collection) Add(location, id string, setLength, delegation int) Ownership {
+func (c *Collection) Add(location, id string, metrics []float64, setLength, delegation int) Ownership {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	added, areas := false, Ownership{}
 	entry := fmt.Sprintf("%s:%s", location, id)
+	abelian := NewAbelian(1, metrics)
 
 	child, parent := "", location
 
@@ -133,9 +134,9 @@ func (c *Collection) Add(location, id string, setLength, delegation int) Ownersh
 			continue
 		}
 
-		if !added && set.Add(entry, setLength) {
+		if !added && set.Add(entry, abelian, setLength) {
 			set.Shrink(c.sets, parent, setLength)
-		} else if added && set.Incr(child, 1) == delegation {
+		} else if added && set.Incr(child, abelian).Count() == delegation {
 			areas[child] = Delegation{}
 		}
 		added = true
@@ -157,7 +158,7 @@ func (c *Collection) Add(location, id string, setLength, delegation int) Ownersh
 	return areas
 }
 
-func (c *Collection) Update(location, sublocation string, count int) {
+func (c *Collection) Update(location, sublocation string, abelian *Abelian) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -166,13 +167,17 @@ func (c *Collection) Update(location, sublocation string, count int) {
 		return
 	}
 
+	delta := NewAbelian(abelian.Count(), abelian.Properties())
+
 	previous, _ := set.Get(sublocation)
-	delta := count - previous
-	if delta == 0 {
+
+	delta.Substract(previous)
+
+	if delta.IsEmpty() {
 		return
 	}
 
-	set.Put(sublocation, count)
+	set.Put(sublocation, abelian)
 
 	parent, child := location, sublocation
 	for {
@@ -220,7 +225,7 @@ func (c *Collection) Complete(root string) Ownership {
 				c.sets[parent] = NewSet()
 			}
 
-			c.sets[parent].Put(previous, c.sets[previous].Count())
+			c.sets[parent].Put(previous, c.sets[previous].Abelian())
 
 			if _, exist := areas[parent]; !exist {
 				areas[parent] = Delegation{}
@@ -236,10 +241,10 @@ func (c *Collection) Delegate(location string) ([]*Item, bool) {
 	defer c.mu.Unlock()
 
 	items := make([]*Item, 0)
-	c.traverse(location, func(set string, count int) {
+	c.traverse(location, func(set string, abelian *Abelian) {
 		delete(c.sets, set)
-	}, func(parent, location, id string) {
-		items = append(items, &Item{Collection: c.name, Location: location, Id: id})
+	}, func(parent, location, id string, abelian *Abelian) {
+		items = append(items, &Item{Collection: c.name, Location: location, Id: id, Metrics: abelian.Properties()})
 	})
 
 	_, exist := c.owned[Parent(location)]
@@ -252,22 +257,25 @@ func (c *Collection) Delegate(location string) ([]*Item, bool) {
 	return items, len(c.owned) == 0
 }
 
-func (c *Collection) Traverse(parent string, processSet func(string, int), processItem func(string, string, string)) {
+func (c *Collection) Traverse(parent string, processSet func(string, *Abelian), processItem func(string, string, string, *Abelian)) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	c.traverse(parent, processSet, processItem)
 }
 
-func (c *Collection) traverse(parent string, processSet func(string, int), processItem func(string, string, string)) {
+func (c *Collection) traverse(parent string, processSet func(string, *Abelian), processItem func(string, string, string, *Abelian)) {
 
-	total := 0
-	c.sets[parent].Traverse(func(key string, count int) {
+	var total *Abelian
+	c.sets[parent].Traverse(func(key string, abelian *Abelian) {
 
-		total += count
-		if count == 1 {
+		if total == nil {
+			total = NewAbelian(abelian.Count(), abelian.Properties())
+		}
+
+		if abelian.Count() == 1 {
 			arr := strings.Split(key, ":")
-			processItem(parent, arr[0], arr[1])
+			processItem(parent, arr[0], arr[1], abelian)
 			return
 		}
 
@@ -279,20 +287,17 @@ func (c *Collection) traverse(parent string, processSet func(string, int), proce
 	processSet(parent, total)
 }
 
-func (c *Collection) Clean(parent string, processSet func(string, int), processItem func(string, string, string)) {
+func (c *Collection) Clean(parent string, processSet func(string, *Abelian), processItem func(string, string, string, *Abelian)) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	c.clean(parent, processSet, processItem)
 }
 
-func (c *Collection) clean(parent string, processSet func(string, int), processItem func(string, string, string)) {
+func (c *Collection) clean(parent string, processSet func(string, *Abelian), processItem func(string, string, string, *Abelian)) {
 
-	total := 0
-	c.sets[parent].Traverse(func(key string, count int) {
-		total += count
-
-		if count == 1 {
+	c.sets[parent].Traverse(func(key string, abelian *Abelian) {
+		if abelian.Count() == 1 {
 			arr := strings.Split(key, ":")
 
 			k := arr[0][:len(parent)]
@@ -301,7 +306,7 @@ func (c *Collection) clean(parent string, processSet func(string, int), processI
 			}
 
 			if !c.browsable(parent, k) {
-				processItem(parent, arr[0], arr[1])
+				processItem(parent, arr[0], arr[1], abelian)
 			}
 			return
 		}
