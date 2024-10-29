@@ -47,8 +47,8 @@ func (n *Node) Count() (int, error) {
 			}
 			collection.Traverse(
 				key.Location,
-				func(s string, i int) {},
-				func(s1, s2, s3 string) { total++ },
+				func(s string, a *domain.Abelian) {},
+				func(s1, s2, s3 string, a *domain.Abelian) { total++ },
 			)
 		}
 	})

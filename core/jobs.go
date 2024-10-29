@@ -112,7 +112,7 @@ func (n *Node) Update() error {
 			n.cache.Set(collection, location, set)
 
 			if c, exist := n.collections.Get(collection); exist {
-				c.Update(domain.Parent(location), location, set.Count())
+				c.Update(domain.Parent(location), location, set.Abelian())
 			}
 		}
 	}

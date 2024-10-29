@@ -211,14 +211,14 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var list map[string]int
+	var list map[string]*domain.Abelian
 	if set != nil {
 		list = set.List()
 	}
 
 	var body = struct {
-		Contact Contact        `json:"contact"`
-		Set     map[string]int `json:"set"`
+		Contact Contact                    `json:"contact"`
+		Set     map[string]*domain.Abelian `json:"set"`
 	}{
 		Contact: Contact{
 			Name: contact.Name(),
@@ -488,6 +488,7 @@ func (h *Handler) FeedCollection(w http.ResponseWriter, r *http.Request) {
 				Collection: collectionId,
 				Location:   domain.EncodeId(domain.RandomId()),
 				Id:         fmt.Sprintf("%d", i),
+				Metrics:    []float64{rand.Float64(), rand.Float64()},
 			}
 			err := network.Random().New(item, domain.Root(), item.Location)
 			if err != nil {

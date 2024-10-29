@@ -349,7 +349,7 @@ func (n *Node) add(item *domain.Item) bool {
 		return false
 	}
 
-	areas := collection.Add(item.Location, item.Id, n.settings.setLength, n.settings.delegation)
+	areas := collection.Add(item.Location, item.Id, item.Metrics, n.settings.setLength, n.settings.delegation)
 	if n.ready {
 		n.storage.Append(item.Content())
 	}

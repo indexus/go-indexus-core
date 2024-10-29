@@ -257,14 +257,14 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var list map[string]int
+	var list map[string]*domain.Abelian
 	if set != nil {
 		list = set.List()
 	}
 
 	var body = struct {
-		Contact Contact        `json:"contact"`
-		Set     map[string]int `json:"set"`
+		Contact Contact                    `json:"contact"`
+		Set     map[string]*domain.Abelian `json:"set"`
 	}{
 		Contact: Contact{
 			Name: contact.Name(),

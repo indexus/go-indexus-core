@@ -295,8 +295,8 @@ func (c *Contact) Get(collection string, location string) (domain.Contact, *doma
 	}
 
 	var body struct {
-		Contact *Contact       `json:"contact"`
-		Set     map[string]int `json:"set"`
+		Contact *Contact                   `json:"contact"`
+		Set     map[string]*domain.Abelian `json:"set"`
 	}
 	decoder := json.NewDecoder(resp.Body)
 	if err := decoder.Decode(&body); err != nil {
