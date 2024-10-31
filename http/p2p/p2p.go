@@ -3,6 +3,7 @@ package p2p
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -55,13 +56,15 @@ type Service interface {
 }
 
 type Handler struct {
+	SSLStorage string
 	Service    Service
 	NewContact func(string, map[string]any, int) domain.Contact
 }
 
 // New - Create a HTTP handler
-func NewHttpHandler(service Service, newContact func(string, map[string]any, int) domain.Contact) *Handler {
+func NewHttpHandler(sslStorage string, service Service, newContact func(string, map[string]any, int) domain.Contact) *Handler {
 	return &Handler{
+		SSLStorage: sslStorage,
 		Service:    service,
 		NewContact: newContact,
 	}
@@ -96,8 +99,13 @@ func (h *Handler) Serve(lis net.Listener) error {
 
 	s := &http.Server{Handler: handler}
 
-	log.Println("P2P HTTP Server started")
+	if len(h.SSLStorage) > 0 {
 
+		log.Println("Monitoring HTTPS Server started")
+		return s.ServeTLS(lis, fmt.Sprintf("%s/server.crt", h.SSLStorage), fmt.Sprintf("%s/server.key", h.SSLStorage))
+	}
+
+	log.Println("Monitoring HTTP Server started")
 	return s.Serve(lis)
 }
 

@@ -130,20 +130,20 @@ func (s *Set) count() int {
 
 func (s *Set) abelian() *Abelian {
 	var count int
-	var properties []float64
+	var metrics []float64
 
 	for _, elm := range s.list {
 		count += elm.Count()
 
-		if properties == nil {
-			properties = make([]float64, len(elm.Properties()))
+		if metrics == nil {
+			metrics = make([]float64, len(elm.Metrics()))
 		}
-		for idx, value := range elm.Properties() {
-			properties[idx] += value
+		for idx, value := range elm.Metrics() {
+			metrics[idx] += value
 		}
 	}
 
-	return NewAbelian(count, properties)
+	return NewAbelian(count, metrics)
 }
 
 func (s *Set) incr(value string, delta *Abelian) *Abelian {

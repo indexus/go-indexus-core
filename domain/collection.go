@@ -167,7 +167,7 @@ func (c *Collection) Update(location, sublocation string, abelian *Abelian) {
 		return
 	}
 
-	delta := NewAbelian(abelian.Count(), abelian.Properties())
+	delta := NewAbelian(abelian.Count(), abelian.Metrics())
 
 	previous, _ := set.Get(sublocation)
 
@@ -244,7 +244,7 @@ func (c *Collection) Delegate(location string) ([]*Item, bool) {
 	c.traverse(location, func(set string, abelian *Abelian) {
 		delete(c.sets, set)
 	}, func(parent, location, id string, abelian *Abelian) {
-		items = append(items, &Item{Collection: c.name, Location: location, Id: id, Metrics: abelian.Properties()})
+		items = append(items, &Item{Collection: c.name, Location: location, Id: id, Metrics: abelian.Metrics()})
 	})
 
 	_, exist := c.owned[Parent(location)]
@@ -270,7 +270,7 @@ func (c *Collection) traverse(parent string, processSet func(string, *Abelian), 
 	c.sets[parent].Traverse(func(key string, abelian *Abelian) {
 
 		if total == nil {
-			total = NewAbelian(abelian.Count(), abelian.Properties())
+			total = NewAbelian(abelian.Count(), abelian.Metrics())
 		}
 
 		if abelian.Count() == 1 {
