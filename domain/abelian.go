@@ -3,41 +3,41 @@ package domain
 import "encoding/json"
 
 type Abelian struct {
-	count      int
-	properties []float64
+	count   int
+	metrics []float64
 }
 
 // Implementing json.Marshaler interface
 func (a *Abelian) MarshalJSON() ([]byte, error) {
 	type Obj struct {
-		Count      int       `json:"count"`
-		Properties []float64 `json:"properties"`
+		Count   int       `json:"count"`
+		Metrics []float64 `json:"metrics"`
 	}
 	return json.Marshal(&Obj{
-		Count:      a.count,
-		Properties: a.properties,
+		Count:   a.count,
+		Metrics: a.metrics,
 	})
 }
 
 // Implementing json.Unmarshaler interface
 func (a *Abelian) UnmarshalJSON(data []byte) error {
 	type Obj struct {
-		Count      int       `json:"count"`
-		Properties []float64 `json:"properties"`
+		Count   int       `json:"count"`
+		Metrics []float64 `json:"metrics"`
 	}
 	obj := &Obj{}
 	if err := json.Unmarshal(data, obj); err != nil {
 		return err
 	}
 	a.count = obj.Count
-	a.properties = obj.Properties
+	a.metrics = obj.Metrics
 	return nil
 }
 
-func NewAbelian(count int, properties []float64) *Abelian {
+func NewAbelian(count int, metrics []float64) *Abelian {
 	return &Abelian{
-		count:      count,
-		properties: properties,
+		count:   count,
+		metrics: metrics,
 	}
 }
 
@@ -45,8 +45,8 @@ func (a *Abelian) IsEmpty() bool {
 	if a.count != 0 {
 		return false
 	}
-	for idx := range a.properties {
-		if a.properties[idx] != 0 {
+	for idx := range a.metrics {
+		if a.metrics[idx] != 0 {
 			return false
 		}
 	}
@@ -57,20 +57,20 @@ func (a *Abelian) Count() int {
 	return a.count
 }
 
-func (a *Abelian) Properties() []float64 {
-	return a.properties
+func (a *Abelian) Metrics() []float64 {
+	return a.metrics
 }
 
 func (a *Abelian) Sum(delta *Abelian) {
 	a.count += delta.count
-	for idx := range a.properties {
-		a.properties[idx] += delta.properties[idx]
+	for idx := range a.metrics {
+		a.metrics[idx] += delta.metrics[idx]
 	}
 }
 
 func (a *Abelian) Substract(delta *Abelian) {
 	a.count -= delta.count
-	for idx := range a.properties {
-		a.properties[idx] -= delta.properties[idx]
+	for idx := range a.metrics {
+		a.metrics[idx] -= delta.metrics[idx]
 	}
 }

@@ -48,6 +48,7 @@ type Config struct {
 	P2pPortFlag        int
 	ClientPortFlag     int
 	StorageFlag        string
+	SSLStorageFlag     string
 	Bootstraps         []domain.Contact
 }
 
@@ -82,6 +83,7 @@ func parseFlags() Config {
 	monitoringPortFlagPtr := flag.Int("monitoringPort", 19000, "Port number of the node for the monitoring service")
 	p2pPortFlagPtr := flag.Int("p2pPort", 21000, "Port number of the node for the peer to peer network")
 	storageFlagPtr := flag.String("storage", ".data/backup", "Path to the backup file")
+	sslStorageFlagPtr := flag.String("sslStorage", "", "Path to the ssl certificates")
 
 	flag.Parse()
 
@@ -106,6 +108,7 @@ func parseFlags() Config {
 		MonitoringPortFlag: *monitoringPortFlagPtr,
 		P2pPortFlag:        *p2pPortFlagPtr,
 		StorageFlag:        *storageFlagPtr,
+		SSLStorageFlag:     *sslStorageFlagPtr,
 		Bootstraps:         bootstraps,
 	}
 }
@@ -141,13 +144,13 @@ func startProcess(config Config) {
 		log.Fatal(err)
 	}
 
-	monitoringHttpHandler := monitoring.NewHttpHandler(node)
+	monitoringHttpHandler := monitoring.NewHttpHandler(config.SSLStorageFlag, node)
 	monitoringListener, err := net.Listen("tcp", fmt.Sprintf(":%d", config.MonitoringPortFlag))
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	p2pHttpHandler := p2p.NewHttpHandler(node, peer.NewContact)
+	p2pHttpHandler := p2p.NewHttpHandler(config.SSLStorageFlag, node, peer.NewContact)
 	p2pListener, err := net.Listen("tcp", fmt.Sprintf(":%d", config.P2pPortFlag))
 	if err != nil {
 		log.Fatal(err)

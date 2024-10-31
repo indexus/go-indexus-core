@@ -161,7 +161,7 @@ The node will automatically attempt to connect to the specified bootstrap node a
 The node includes a monitoring service that runs on the specified monitoring port (default `19000`). You can access the monitoring interface by navigating to:
 
 ```
-http://localhost:19000/
+https://localhost:19000/
 ```
 
 ### Monitoring the Node
@@ -169,7 +169,7 @@ http://localhost:19000/
 The node includes a monitoring service that runs on the specified monitoring port (default `19000`). You can access the monitoring interface by navigating to:
 
 ```
-http://localhost:19000/
+https://localhost:19000/
 ```
 
 (Note: Monitoring endpoints and features will be expanded in future releases.)
@@ -183,7 +183,7 @@ http://localhost:19000/
 1. **Item**
 
    - **Method:** `POST`
-   - **URL:** `http://bootstrap.indexus.io:21000/item`
+   - **URL:** `https://bootstrap.indexus.io:21000/item`
    - **Body:**
 
      ```json
@@ -203,7 +203,7 @@ http://localhost:19000/
 2. **Set**
 
    - **Method:** `GET`
-   - **URL:** `http://bootstrap.indexus.io:21000/set`
+   - **URL:** `https://bootstrap.indexus.io:21000/set`
      - **Query Parameters:**
        - `collection=oVxwqpn90mkO7ZX9xHCaiskLkTo`
        - `location=@`
@@ -217,14 +217,14 @@ http://localhost:19000/
 1. **Ping**
 
    - **Method:** `POST`
-   - **URL:** `http://bootstrap.indexus.io:21000/ping`
+   - **URL:** `https://bootstrap.indexus.io:21000/ping`
 
    - **Description:** Checks the availability of a peer node.
 
 2. **Neighbors**
 
    - **Method:** `GET`
-   - **URL:** `http://bootstrap.indexus.io:21000/neighbors`
+   - **URL:** `https://bootstrap.indexus.io:21000/neighbors`
      - **Query Parameters:**
        - `origin=rAwbDBzPQPR0e5NXGCDCZXg6d4s`
 
@@ -237,35 +237,35 @@ http://localhost:19000/
 1. **Acknowledged**
 
    - **Method:** `GET`
-   - **URL:** `http://bootstrap.indexus.io:19000/acknowledged`
+   - **URL:** `https://bootstrap.indexus.io:19000/acknowledged`
 
    - **Description:** Lists acknowledged nodes in the network.
 
 2. **Registered**
 
    - **Method:** `GET`
-   - **URL:** `http://bootstrap.indexus.io:19000/registered`
+   - **URL:** `https://bootstrap.indexus.io:19000/registered`
 
    - **Description:** Lists registered nodes in the network.
 
 3. **Routing**
 
    - **Method:** `GET`
-   - **URL:** `http://bootstrap.indexus.io:19000/routing`
+   - **URL:** `https://bootstrap.indexus.io:19000/routing`
 
    - **Description:** Displays the routing table of the node.
 
 4. **Ownership**
 
    - **Method:** `GET`
-   - **URL:** `http://bootstrap.indexus.io:19000/ownership`
+   - **URL:** `https://bootstrap.indexus.io:19000/ownership`
 
    - **Description:** Shows the collections and items owned by the node.
 
 5. **Queue**
 
    - **Method:** `GET`
-   - **URL:** `http://bootstrap.indexus.io:19000/queue`
+   - **URL:** `https://bootstrap.indexus.io:19000/queue`
 
    - **Description:** Displays the current task queue of the node.
 

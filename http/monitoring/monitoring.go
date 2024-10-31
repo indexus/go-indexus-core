@@ -2,6 +2,7 @@ package monitoring
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -18,13 +19,15 @@ type Service interface {
 }
 
 type Handler struct {
-	Service Service
+	SSLStorage string
+	Service    Service
 }
 
 // New - Create a HTTP handler
-func NewHttpHandler(service Service) *Handler {
+func NewHttpHandler(sslStorage string, service Service) *Handler {
 	return &Handler{
-		Service: service,
+		SSLStorage: sslStorage,
+		Service:    service,
 	}
 }
 
@@ -42,8 +45,13 @@ func (h *Handler) Serve(lis net.Listener) error {
 
 	s := &http.Server{Handler: mux}
 
-	log.Println("Monitoring HTTP Server started")
+	if len(h.SSLStorage) > 0 {
 
+		log.Println("Monitoring HTTPS Server started")
+		return s.ServeTLS(lis, fmt.Sprintf("%s/server.crt", h.SSLStorage), fmt.Sprintf("%s/server.key", h.SSLStorage))
+	}
+
+	log.Println("Monitoring HTTP Server started")
 	return s.Serve(lis)
 }
 
