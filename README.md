@@ -116,7 +116,7 @@ go build -o indexus-core app/node/main.go
 
 The application accepts several command-line flags for configuration:
 
-- `-bootstrap`: Host of the bootstrap peer in the format `host|port` (e.g., `bootstrap.indexus.io|21000`).
+- `-bootstrap`: Host of the bootstrap peer in the format `host|port` (e.g., `bootstrap.testnet.indexus.network|21000`).
 - `-name`: Name of the node (defaults to a random ID).
 - `-monitoringPort`: Port number for the monitoring service (default: `19000`).
 - `-p2pPort`: Port number for the peer-to-peer network (default: `21000`).
@@ -125,7 +125,7 @@ The application accepts several command-line flags for configuration:
 ### Example:
 
 ```bash
-go run app/node/main.go -bootstrap bootstrap.indexus.io|21000 -name dlLUqr7C9118Ja9etrk_RjN9EMU -p2pPort 21000 -monitoringPort 19000 -storage ./data
+go run app/node/main.go -bootstrap bootstrap.testnet.indexus.network|21000 -name dlLUqr7C9118Ja9etrk_RjN9EMU -p2pPort 21000 -monitoringPort 19000 -storage ./data
 ```
 
 ---
@@ -149,7 +149,7 @@ To start a node on the network, you can use the following commands:
    To join an existing network, specify the bootstrap node:
 
    ```bash
-   go run app/node/main.go -bootstrap bootstrap.indexus.io|21000 -name MyNode
+   go run app/node/main.go -bootstrap bootstrap.testnet.indexus.network|21000 -name MyNode
    ```
 
 ### Connecting to the Network
@@ -183,7 +183,7 @@ https://localhost:19000/
 1. **Item**
 
    - **Method:** `POST`
-   - **URL:** `https://bootstrap.indexus.io:21000/item`
+   - **URL:** `https://bootstrap.testnet.indexus.network:21000/item`
    - **Body:**
 
      ```json
@@ -203,7 +203,7 @@ https://localhost:19000/
 2. **Set**
 
    - **Method:** `GET`
-   - **URL:** `https://bootstrap.indexus.io:21000/set`
+   - **URL:** `https://bootstrap.testnet.indexus.network:21000/set`
      - **Query Parameters:**
        - `collection=oVxwqpn90mkO7ZX9xHCaiskLkTo`
        - `location=@`
@@ -217,14 +217,14 @@ https://localhost:19000/
 1. **Ping**
 
    - **Method:** `POST`
-   - **URL:** `https://bootstrap.indexus.io:21000/ping`
+   - **URL:** `https://bootstrap.testnet.indexus.network:21000/ping`
 
    - **Description:** Checks the availability of a peer node.
 
 2. **Neighbors**
 
    - **Method:** `GET`
-   - **URL:** `https://bootstrap.indexus.io:21000/neighbors`
+   - **URL:** `https://bootstrap.testnet.indexus.network:21000/neighbors`
      - **Query Parameters:**
        - `origin=rAwbDBzPQPR0e5NXGCDCZXg6d4s`
 
@@ -237,35 +237,35 @@ https://localhost:19000/
 1. **Acknowledged**
 
    - **Method:** `GET`
-   - **URL:** `https://bootstrap.indexus.io:19000/acknowledged`
+   - **URL:** `https://bootstrap.testnet.indexus.network:19000/acknowledged`
 
    - **Description:** Lists acknowledged nodes in the network.
 
 2. **Registered**
 
    - **Method:** `GET`
-   - **URL:** `https://bootstrap.indexus.io:19000/registered`
+   - **URL:** `https://bootstrap.testnet.indexus.network:19000/registered`
 
    - **Description:** Lists registered nodes in the network.
 
 3. **Routing**
 
    - **Method:** `GET`
-   - **URL:** `https://bootstrap.indexus.io:19000/routing`
+   - **URL:** `https://bootstrap.testnet.indexus.network:19000/routing`
 
    - **Description:** Displays the routing table of the node.
 
 4. **Ownership**
 
    - **Method:** `GET`
-   - **URL:** `https://bootstrap.indexus.io:19000/ownership`
+   - **URL:** `https://bootstrap.testnet.indexus.network:19000/ownership`
 
    - **Description:** Shows the collections and items owned by the node.
 
 5. **Queue**
 
    - **Method:** `GET`
-   - **URL:** `https://bootstrap.indexus.io:19000/queue`
+   - **URL:** `https://bootstrap.testnet.indexus.network:19000/queue`
 
    - **Description:** Displays the current task queue of the node.
 
@@ -318,7 +318,7 @@ Indexus Version 1.0.0 | Build Date: 2023-10-03 | Commit Hash: abcdef1234567890
 Start Time: 2023-10-03 15:04:05
 Name: dlLUqr7C9118Ja9etrk_RjN9EMU
 Monitoring, P2P Ports: 19000 21000
-Bootstrap Nodes: bootstrap.indexus.io:21000
+Bootstrap Nodes: bootstrap.testnet.indexus.network:21000
 Storage Path: ./data
 
 [Additional logs...]
