@@ -12,12 +12,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/indexus/go-indexus-core/app/simulation/mockup"
 	"github.com/indexus/go-indexus-core/core"
 	"github.com/indexus/go-indexus-core/domain"
 	"github.com/indexus/go-indexus-core/http/monitoring"
 	"github.com/indexus/go-indexus-core/http/p2p"
 	"github.com/indexus/go-indexus-core/peer"
+	"github.com/indexus/go-indexus-core/storage"
 	"github.com/indexus/go-indexus-core/worker"
 )
 
@@ -42,14 +42,15 @@ const (
 
 // Config holds the configuration parsed from command-line flags
 type Config struct {
-	BootstrapFlag      string
-	NameFlag           string
-	MonitoringPortFlag int
-	P2pPortFlag        int
-	ClientPortFlag     int
-	StorageFlag        string
-	SSLStorageFlag     string
-	Bootstraps         []domain.Contact
+	BootstrapFlag         string
+	NameFlag              string
+	MonitoringPortFlag    int
+	P2pPortFlag           int
+	ClientPortFlag        int
+	ArchiveStorageDirFlag string
+	StorageFlag           string
+	SSLStorageFlag        string
+	Bootstraps            []domain.Contact
 }
 
 func displayContacts(contacts []domain.Contact) string {
@@ -82,6 +83,7 @@ func parseFlags() Config {
 	nameFlagPtr := flag.String("name", domain.EncodeId(domain.RandomId()), "Name of the node")
 	monitoringPortFlagPtr := flag.Int("monitoringPort", 19000, "Port number of the node for the monitoring service")
 	p2pPortFlagPtr := flag.Int("p2pPort", 21000, "Port number of the node for the peer to peer network")
+	archiveStorageDirFlagPtr := flag.String("archive", ".data/archive", "Path to the backup file")
 	storageFlagPtr := flag.String("storage", ".data/backup", "Path to the backup file")
 	sslStorageFlagPtr := flag.String("sslStorage", "", "Path to the ssl certificates")
 
@@ -103,13 +105,14 @@ func parseFlags() Config {
 	}
 
 	return Config{
-		BootstrapFlag:      *bootstrapFlagPtr,
-		NameFlag:           *nameFlagPtr,
-		MonitoringPortFlag: *monitoringPortFlagPtr,
-		P2pPortFlag:        *p2pPortFlagPtr,
-		StorageFlag:        *storageFlagPtr,
-		SSLStorageFlag:     *sslStorageFlagPtr,
-		Bootstraps:         bootstraps,
+		BootstrapFlag:         *bootstrapFlagPtr,
+		NameFlag:              *nameFlagPtr,
+		MonitoringPortFlag:    *monitoringPortFlagPtr,
+		P2pPortFlag:           *p2pPortFlagPtr,
+		ArchiveStorageDirFlag: *archiveStorageDirFlagPtr,
+		StorageFlag:           *storageFlagPtr,
+		SSLStorageFlag:        *sslStorageFlagPtr,
+		Bootstraps:            bootstraps,
 	}
 }
 
@@ -127,6 +130,7 @@ func displayMessages(config Config) {
 	fmt.Println("Name:", config.NameFlag)
 	fmt.Println("Monitoring, P2P Ports:", config.MonitoringPortFlag, config.P2pPortFlag)
 	fmt.Println("Bootstrap Nodes:", displayContacts(config.Bootstraps))
+	fmt.Println("Archive Path:", config.ArchiveStorageDirFlag)
 	fmt.Println("Storage Path:", config.StorageFlag)
 	fmt.Println()
 }
@@ -138,7 +142,7 @@ func startProcess(config Config) {
 		log.Fatal(err)
 	}
 
-	storageInstance := mockup.NewStorage() // storage.NewStorage(config.StorageFlag)
+	storageInstance := storage.NewStorage(config.ArchiveStorageDirFlag, config.StorageFlag)
 	node, err := core.NewNode(settings, peer.NewContact, config.Bootstraps, storageInstance)
 	if err != nil {
 		log.Fatal(err)
@@ -161,7 +165,7 @@ func startProcess(config Config) {
 	errChan := make(chan error, 3)
 
 	go func() {
-		// errChan <- storageInstance.Start()
+		errChan <- storageInstance.Start()
 	}()
 	go func() {
 		errChan <- monitoringHttpHandler.Serve(monitoringListener)

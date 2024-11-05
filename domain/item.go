@@ -2,6 +2,7 @@ package domain
 
 import (
 	"fmt"
+	"strings"
 )
 
 type Item struct {
@@ -12,5 +13,9 @@ type Item struct {
 }
 
 func (i Item) Content() string {
-	return fmt.Sprintf("%s|%s|%s", i.Collection, i.Location, i.Id)
+	metrics := make([]string, len(i.Metrics))
+	for idx := range i.Metrics {
+		metrics[idx] = fmt.Sprintf("%f", i.Metrics[idx])
+	}
+	return fmt.Sprintf("%s|%s|%s|%s", i.Collection, i.Location, i.Id, strings.Join(metrics, ":"))
 }
