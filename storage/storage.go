@@ -5,24 +5,28 @@ import (
 	"encoding/gob"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
+	"time"
 )
 
 type Storage struct {
-	filename string
-	logs     *os.File
-	writer   *bufio.Writer
-	input    chan string
-	wg       sync.WaitGroup
-	quit     chan struct{}
+	archiveDir string
+	filename   string
+	logs       *os.File
+	writer     *bufio.Writer
+	input      chan string
+	wg         sync.WaitGroup
+	quit       chan struct{}
 }
 
-func NewStorage(filename string) *Storage {
+func NewStorage(archiveDir, filename string) *Storage {
 
 	storage := &Storage{
-		filename: filename,
-		input:    make(chan string, 100),
-		quit:     make(chan struct{}),
+		archiveDir: archiveDir,
+		filename:   filename,
+		input:      make(chan string, 100),
+		quit:       make(chan struct{}),
 	}
 
 	return storage
@@ -37,14 +41,31 @@ func (s *Storage) Exist() bool {
 }
 
 func (s *Storage) Reset() error {
-	err := os.Remove(fmt.Sprintf("%s.logs", s.filename))
-	if err != nil && !os.IsNotExist(err) {
-		return err
+
+	if err := os.MkdirAll(s.archiveDir, 0755); err != nil {
+		return fmt.Errorf("failed to create archive directory: %w", err)
 	}
 
-	err = os.Remove(fmt.Sprintf("%s.snapshot", s.filename))
-	if err != nil && !os.IsNotExist(err) {
-		return err
+	currentDate := time.Now().Format("20060102_150405")
+
+	filesToArchive := []string{
+		fmt.Sprintf("%s.logs", s.filename),
+		fmt.Sprintf("%s.snapshot", s.filename),
+	}
+
+	for _, file := range filesToArchive {
+		if _, err := os.Stat(file); os.IsNotExist(err) {
+			continue
+		} else if err != nil {
+			return fmt.Errorf("failed to stat file %s: %w", file, err)
+		}
+
+		newFilename := fmt.Sprintf("%s_%s", currentDate, filepath.Base(file))
+		archivePath := filepath.Join(s.archiveDir, newFilename)
+
+		if err := os.Rename(file, archivePath); err != nil {
+			return fmt.Errorf("failed to archive file %s: %w", file, err)
+		}
 	}
 
 	return nil
@@ -65,27 +86,7 @@ func (s *Storage) Save(commands []string) error {
 }
 
 func (s *Storage) Load() ([]string, error) {
-	logs, err := os.OpenFile(fmt.Sprintf("%s.logs", s.filename), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return nil, fmt.Errorf("error opening the logs file: %v", err)
-	}
-
-	s.logs = logs
-	s.writer = bufio.NewWriter(logs)
-
-	file, err := os.Open(fmt.Sprintf("%s.snapshot", s.filename))
-	if err != nil {
-		return nil, fmt.Errorf("error opening the snapshot file: %v", err)
-	}
-	defer file.Close()
-
-	var commands []string
-	decoder := gob.NewDecoder(file)
-	if err := decoder.Decode(&commands); err != nil {
-		return nil, fmt.Errorf("error decoding snapshot: %v", err)
-	}
-
-	return commands, nil
+	return nil, fmt.Errorf("error when loading the file resetting the in any case")
 }
 
 func (s *Storage) Append(log string) {
