@@ -167,17 +167,15 @@ func (c *Collection) Update(location, sublocation string, abelian *Abelian) {
 		return
 	}
 
-	delta := NewAbelian(abelian.Count(), abelian.Metrics())
-
 	previous, _ := set.Get(sublocation)
-
-	delta.Substract(previous)
-
-	if delta.IsEmpty() {
+	if abelian.IsEqual(previous) {
 		return
 	}
 
 	set.Put(sublocation, abelian)
+
+	delta := abelian.Clone()
+	delta.Substract(previous)
 
 	parent, child := location, sublocation
 	for {

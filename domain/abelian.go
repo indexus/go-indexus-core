@@ -61,6 +61,28 @@ func (a *Abelian) Metrics() []float64 {
 	return a.metrics
 }
 
+func (a *Abelian) Clone() *Abelian {
+	metrics := make([]float64, len(a.metrics))
+	copy(metrics, a.metrics)
+
+	return &Abelian{
+		count:   a.count,
+		metrics: a.metrics,
+	}
+}
+
+func (a *Abelian) IsEqual(b *Abelian) bool {
+	if a.count != b.count {
+		return false
+	}
+	for idx := range a.metrics {
+		if a.metrics[idx] != b.metrics[idx] {
+			return false
+		}
+	}
+	return true
+}
+
 func (a *Abelian) Sum(delta *Abelian) {
 	a.count += delta.count
 	for idx := range a.metrics {
