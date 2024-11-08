@@ -100,6 +100,10 @@ func (n *Node) Update() error {
 				log.Println(err)
 			}
 
+			if contact.Name() == n.Name() {
+				continue
+			}
+
 			_, set, err := contact.Get(collection, location)
 			if err != nil {
 				log.Println(err)
