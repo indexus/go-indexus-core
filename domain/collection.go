@@ -167,8 +167,8 @@ func (c *Collection) Update(location, sublocation string, abelian *Abelian) {
 		return
 	}
 
-	previous, _ := set.Get(sublocation)
-	if abelian.IsEqual(previous) {
+	previous, exist := set.Get(sublocation)
+	if exist && abelian.IsEqual(previous) {
 		return
 	}
 
