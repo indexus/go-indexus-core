@@ -64,7 +64,6 @@ func (a *Abelian) Metrics() []float64 {
 func (a *Abelian) Clone() *Abelian {
 	metrics := make([]float64, len(a.metrics))
 	copy(metrics, a.metrics)
-
 	return &Abelian{
 		count:   a.count,
 		metrics: a.metrics,
