@@ -152,13 +152,6 @@ func (n *Node) Get(collection, location string) (domain.Contact, *domain.Set, er
 		}
 	}
 
-	if collection, exist := n.collections.Get(collection); exist {
-		set, ok := collection.Get(location)
-		if ok {
-			return nearest, set, nil
-		}
-	}
-
 	if set, exist := n.cache.Get(collection, location); exist {
 		return nearest, set, nil
 	}
@@ -166,6 +159,33 @@ func (n *Node) Get(collection, location string) (domain.Contact, *domain.Set, er
 	n.cache.Set(collection, location, nil)
 
 	return nearest, nil, nil
+}
+
+func (n *Node) GetMultiple(collection string, locations []string) []byte {
+
+	var start = time.Now()
+	encoded := n.collections.GetMultiple(collection, locations)
+	fmt.Println(time.Now().Sub(start))
+
+	// // Decode the encoded data
+	// decoded, err := domain.DecodeMultiple(encoded)
+	// if err != nil {
+	// 	fmt.Printf("Decoding failed: %v\n", err)
+	// 	return encoded
+	// }
+
+	// // Print decoded data
+	// i := 0
+	// for key, abelian := range decoded {
+	// 	fmt.Println(key, abelian.Count, abelian.Metrics)
+
+	// 	i++
+	// 	if i > 10 {
+	// 		break
+	// 	}
+	// }
+
+	return encoded
 }
 
 func (n *Node) New(item *domain.Item, root, current string) error {
