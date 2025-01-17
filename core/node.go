@@ -152,13 +152,6 @@ func (n *Node) Get(collection, location string) (domain.Contact, *domain.Set, er
 		}
 	}
 
-	if collection, exist := n.collections.Get(collection); exist {
-		set, ok := collection.Get(location)
-		if ok {
-			return nearest, set, nil
-		}
-	}
-
 	if set, exist := n.cache.Get(collection, location); exist {
 		return nearest, set, nil
 	}
@@ -166,6 +159,10 @@ func (n *Node) Get(collection, location string) (domain.Contact, *domain.Set, er
 	n.cache.Set(collection, location, nil)
 
 	return nearest, nil, nil
+}
+
+func (n *Node) GetMultiple(collection string, locations []string) []byte {
+	return n.collections.GetMultiple(collection, locations)
 }
 
 func (n *Node) New(item *domain.Item, root, current string) error {
