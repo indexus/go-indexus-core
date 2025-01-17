@@ -1,7 +1,9 @@
 package domain
 
 import (
+	"encoding/binary"
 	"fmt"
+	"math/bits"
 	"strings"
 	"sync"
 )
@@ -24,6 +26,113 @@ func (c *Collections) Get(name string) (*Collection, bool) {
 
 	collection, ok := c.data[name]
 	return collection, ok
+}
+
+// GetMultiple retrieves and encodes data from the collection.
+func (c *Collections) GetMultiple(col string, locations []string) []byte {
+	var result []byte
+	collection, exist := c.data[col]
+	if !exist {
+		return result
+	}
+
+	precision := 6
+	properties := [4](func(*Abelian) int){
+		func(a *Abelian) int {
+			return a.count
+		},
+		func(a *Abelian) int {
+			return int(a.metrics[2])
+		},
+		func(a *Abelian) int {
+			return int(1_000_000 * a.metrics[3])
+		},
+		func(a *Abelian) int {
+			return int(1_000_000 * a.metrics[4])
+		},
+	}
+
+	type t struct {
+		size    int
+		bits    []int
+		values  [][]int
+		content []byte
+	}
+
+	data := make([]t, precision)
+	for idx := range data {
+		data[idx] = t{
+			size:    0,
+			bits:    make([]int, len(properties)),
+			values:  make([][]int, 0),
+			content: make([]byte, 0),
+		}
+
+		for v := 0; v < len(properties); v++ {
+			data[idx].values = append(data[idx].values, make([]int, 0))
+		}
+	}
+
+	for _, location := range locations {
+		set, exist := collection.sets[location]
+		if !exist {
+			continue
+		}
+
+		for key, value := range set.list {
+			idxColon := strings.IndexByte(key, ':')
+			if idxColon >= 0 {
+				key = key[:precision]
+			}
+
+			l := len(key) - 1
+
+			data[l].size++
+			data[l].content = append(data[l].content, []byte(key)...)
+
+			for idx, property := range properties {
+				p := property(value)
+				data[l].values[idx] = append(data[l].values[idx], p)
+				if p > data[l].bits[idx] {
+					data[l].bits[idx] = p
+				}
+			}
+		}
+	}
+
+	bitsNeeded := func(n int) int {
+		if n <= 0 {
+			return 0
+		}
+		return bits.Len(uint(n))
+	}
+
+	for i := 0; i < precision; i++ {
+		if data[i].size == 0 {
+			continue
+		}
+
+		header := []byte{}
+		header = append(header, byte(i))
+
+		// Encode size as four bytes (Big Endian)
+		sizeBytes := make([]byte, 4)
+		binary.BigEndian.PutUint32(sizeBytes, uint32(data[i].size))
+		header = append(header, sizeBytes...)
+
+		content := data[i].content
+
+		for j := 0; j < len(properties); j++ {
+			bitCount := bitsNeeded(data[i].bits[j])
+			header = append(header, byte(bitCount))
+			content = append(content, encodeBits(data[i].values[j], bitCount)...)
+		}
+
+		result = append(result, header...)
+		result = append(result, content...)
+	}
+
+	return result
 }
 
 func (c *Collections) Set(collection *Collection) {

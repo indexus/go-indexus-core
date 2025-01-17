@@ -52,6 +52,7 @@ type Service interface {
 	Random(domain.Peer) (domain.Contact, error)
 	Transfer(domain.Peer, domain.Key, []*domain.Item) error
 	Get(string, string) (domain.Contact, *domain.Set, error)
+	GetMultiple(string, []string) []byte
 	New(*domain.Item, string, string) error
 }
 
@@ -85,6 +86,7 @@ func (h *Handler) Serve(lis net.Listener) error {
 
 	// Client
 	mux.HandleFunc("/set", h.Get)
+	mux.HandleFunc("/sets", h.Gets)
 	mux.HandleFunc("/item", h.New)
 
 	// Configure CORS
@@ -284,6 +286,32 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, body)
+}
+
+// Get handles the /set endpoint -- ADAPTED for one collection, multiple locations
+func (h *Handler) Gets(w http.ResponseWriter, r *http.Request) {
+	// We expect a single collection
+	collection := r.URL.Query().Get("collection")
+	if collection == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "collection parameter is required"})
+		return
+	}
+
+	// Potentially multiple locations (comma-separated)
+	locationsParam := r.URL.Query().Get("location")
+	if locationsParam == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "location parameter is required"})
+		return
+	}
+
+	// Split the location(s) on commas
+	locations := strings.Split(locationsParam, ",")
+	sets := h.Service.GetMultiple(collection, locations)
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	if _, writeErr := w.Write(sets); writeErr != nil {
+		log.Println("Error writing response:", writeErr)
+	}
 }
 
 // New handles the /item endpoint
