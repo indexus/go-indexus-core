@@ -9,15 +9,37 @@ import (
 )
 
 type Collections struct {
-	mu   *sync.Mutex
-	data map[string]*Collection
+	mu              *sync.Mutex
+	data            map[string]*Collection
+	settings        *Settings
+	operationBuffer []*CollectionOperation
+	bufferMu        *sync.Mutex
+	stopFlusher     chan struct{}
 }
 
-func NewCollections() *Collections {
-	return &Collections{
+type Settings struct {
+	setLength  int
+	delegation int
+	dataDir    string
+}
+
+func NewCollections(delegation int, dataDir string) *Collections {
+	c := &Collections{
 		mu:   &sync.Mutex{},
 		data: make(map[string]*Collection),
+		settings: &Settings{
+			delegation: delegation,
+			dataDir:    dataDir,
+		},
+		operationBuffer: make([]*CollectionOperation, 0, 1000),
+		bufferMu:        &sync.Mutex{},
+		stopFlusher:     make(chan struct{}),
 	}
+
+	// Start background flusher
+	go c.periodicFlush()
+
+	return c
 }
 
 func (c *Collections) Get(name string) (*Collection, bool) {

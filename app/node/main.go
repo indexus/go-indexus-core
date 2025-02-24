@@ -14,7 +14,6 @@ import (
 
 	"github.com/indexus/go-indexus-core/core"
 	"github.com/indexus/go-indexus-core/domain"
-	"github.com/indexus/go-indexus-core/encoding"
 	"github.com/indexus/go-indexus-core/http/monitoring"
 	"github.com/indexus/go-indexus-core/http/p2p"
 	"github.com/indexus/go-indexus-core/peer"
@@ -42,13 +41,12 @@ const (
 
 // Config holds the configuration parsed from command-line flags
 type Config struct {
-	BootstrapFlag      string
+	Bootstraps         []domain.Contact
 	NameFlag           string
 	MonitoringPortFlag int
 	P2pPortFlag        int
-	ClientPortFlag     int
 	SSLStorageFlag     string
-	Bootstraps         []domain.Contact
+	DataDirFlag        string
 }
 
 func displayContacts(contacts []domain.Contact) string {
@@ -78,7 +76,7 @@ func main() {
 // parseFlags handles command-line flag parsing and returns a Config struct
 func parseFlags() Config {
 
-	name, err := encoding.BASE64.RandomName()
+	name, err := domain.BASE64.RandomName()
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -88,7 +86,7 @@ func parseFlags() Config {
 	monitoringPortFlagPtr := flag.Int("monitoringPort", 19000, "Port number of the node for the monitoring service")
 	p2pPortFlagPtr := flag.Int("p2pPort", 21000, "Port number of the node for the peer to peer network")
 	sslStorageFlagPtr := flag.String("sslStorage", "", "Path to the ssl certificates")
-
+	dataDirFlagPtr := flag.String("dataDir", ".data", "Path to the data directory")
 	flag.Parse()
 
 	bootstraps := make([]domain.Contact, 0)
@@ -103,7 +101,7 @@ func parseFlags() Config {
 				log.Fatal(err)
 			}
 
-			name, err := encoding.BASE64.RandomName()
+			name, err := domain.BASE64.RandomName()
 			if err != nil {
 				log.Fatal(err)
 			}
@@ -113,12 +111,12 @@ func parseFlags() Config {
 	}
 
 	return Config{
-		BootstrapFlag:      *bootstrapFlagPtr,
+		Bootstraps:         bootstraps,
 		NameFlag:           *nameFlagPtr,
 		MonitoringPortFlag: *monitoringPortFlagPtr,
 		P2pPortFlag:        *p2pPortFlagPtr,
 		SSLStorageFlag:     *sslStorageFlagPtr,
-		Bootstraps:         bootstraps,
+		DataDirFlag:        *dataDirFlagPtr,
 	}
 }
 
@@ -136,12 +134,14 @@ func displayMessages(config Config) {
 	fmt.Println("Name:", config.NameFlag)
 	fmt.Println("Monitoring, P2P Ports:", config.MonitoringPortFlag, config.P2pPortFlag)
 	fmt.Println("Bootstrap Nodes:", displayContacts(config.Bootstraps))
+	fmt.Println("SSL Storage Path:", config.SSLStorageFlag)
+	fmt.Println("Data Directory:", config.DataDirFlag)
 	fmt.Println()
 }
 
 // startProcess initializes and starts the core components of the application
 func startProcess(config Config) {
-	settings, err := core.NewSettings(config.NameFlag, config.P2pPortFlag, 10*time.Second, 5*time.Minute, domain.DelegationTreshold())
+	settings, err := core.NewSettings(config.NameFlag, config.P2pPortFlag, 10*time.Second, 5*time.Minute, domain.DelegationTreshold(), config.DataDirFlag)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -192,9 +192,7 @@ func startProcess(config Config) {
 		log.Printf("Received signal: %s", sig)
 	}
 
+	// Clean up resources
 	monitoringListener.Close()
 	p2pListener.Close()
-	workerInstance.Close()
-
-	log.Println("Node gracefully stopped")
 }

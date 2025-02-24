@@ -1,11 +1,9 @@
-package encoding
+package domain
 
 import (
 	"crypto/rand"
 	"fmt"
 	"math"
-
-	"github.com/indexus/go-indexus-core/domain"
 )
 
 type Base struct {
@@ -173,7 +171,7 @@ func (b *Base) Decode(s string) ([]byte, error) {
 	return output, nil
 }
 
-func MergeEncodings(encoder1 domain.Encoder, encoder2 domain.Encoder, encodedStr1 string, encodedStr2 string) ([]byte, error) {
+func MergeEncodings(encoder1 Encoder, encoder2 Encoder, encodedStr1 string, encodedStr2 string) ([]byte, error) {
 	bytes1, err := encoder1.Decode(encodedStr1)
 	if err != nil {
 		return nil, fmt.Errorf("error converting first encoded string to bits: %v", err)
