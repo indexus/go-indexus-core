@@ -86,13 +86,7 @@ func (n *Node) Refresh() error {
 		}
 	}
 
-	// n.Snapshot()
-	err := n.storage.Save([]string{})
-	if err != nil {
-		return err
-	}
-
-	err = n.clean()
+	err := n.clean()
 	if err != nil {
 		return err
 	}
