@@ -438,12 +438,12 @@ func (h *Handler) FeedNetwork(w http.ResponseWriter, r *http.Request) {
 			bootstraps = append(bootstraps, NewContact(random.Name(), random.IPs(), random.Port()))
 		}
 
-		settings, err := core.NewSettings(domain.EncodeId(domain.RandomId()), len(network.nodes), 1*time.Second, 5*time.Minute, domain.DelegationTreshold(), domain.IdLength())
+		settings, err := core.NewSettings(domain.EncodeId(domain.RandomId()), len(network.nodes), 1*time.Second, 5*time.Minute, domain.DelegationTreshold(), domain.IdLength(), ".data")
 		if err != nil {
 			log.Fatal(err)
 		}
 
-		node, err := core.NewNode(settings, NewContact, bootstraps, NewStorage())
+		node, err := core.NewNode(settings, NewContact, bootstraps)
 		if err != nil {
 			log.Fatal(err)
 		}

@@ -17,9 +17,10 @@ type Settings struct {
 	expiration time.Duration
 	delegation int
 	setLength  int
+	dataDir    string
 }
 
-func NewSettings(name string, port int, delay, expiration time.Duration, delegation int, setLength int) (*Settings, error) {
+func NewSettings(name string, port int, delay, expiration time.Duration, delegation int, setLength int, dataDir string) (*Settings, error) {
 
 	id, err := domain.DecodeName(name)
 	if err != nil {
@@ -36,6 +37,7 @@ func NewSettings(name string, port int, delay, expiration time.Duration, delegat
 		expiration: expiration,
 		delegation: delegation,
 		setLength:  setLength,
+		dataDir:    dataDir,
 	}, nil
 }
 

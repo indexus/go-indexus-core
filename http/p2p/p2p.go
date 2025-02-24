@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/indexus/go-indexus-core/domain"
+	"github.com/indexus/go-indexus-core/peer"
 
 	"github.com/rs/cors"
 )
@@ -64,6 +65,9 @@ type Handler struct {
 
 // New - Create a HTTP handler
 func NewHttpHandler(sslStorage string, service Service, newContact func(string, map[string]any, int) domain.Contact) *Handler {
+	// Set HTTPS flag based on SSL storage configuration
+	peer.SetHTTPS(len(sslStorage) > 0)
+
 	return &Handler{
 		SSLStorage: sslStorage,
 		Service:    service,
@@ -119,17 +123,20 @@ func writeJSON(w http.ResponseWriter, code int, data interface{}) {
 
 // Ping handles the /ping endpoint
 func (h *Handler) Ping(w http.ResponseWriter, r *http.Request) {
+	log.Printf("[P2P] POST /ping from %s", r.RemoteAddr)
 
 	var bodyReq = struct {
 		Origin Contact `json:"origin"`
 	}{}
 	if err := json.NewDecoder(r.Body).Decode(&bodyReq); err != nil {
+		log.Printf("[P2P] Error decoding ping request: %v", err)
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
 		return
 	}
 
 	ips, err := getClientIPs(r)
 	if err != nil {
+		log.Printf("[P2P] Error getting client IPs: %v", err)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
 	}
@@ -145,14 +152,18 @@ func (h *Handler) Ping(w http.ResponseWriter, r *http.Request) {
 
 	contact, err := h.Service.Ping(origin)
 	if err != nil {
+		log.Printf("[P2P] Error processing ping: %v", err)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
 	}
 
 	if contact == nil {
+		log.Printf("[P2P] No contact found for ping from %s", origin.Name())
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
+
+	log.Printf("[P2P] Successful ping from %s to %s", origin.Name(), contact.Name())
 
 	var bodyResp = struct {
 		Contact Contact `json:"contact"`
@@ -168,18 +179,23 @@ func (h *Handler) Ping(w http.ResponseWriter, r *http.Request) {
 
 // Neighbors handles the /neighbors endpoint
 func (h *Handler) Neighbors(w http.ResponseWriter, r *http.Request) {
+	log.Printf("[P2P] GET /neighbors from %s", r.RemoteAddr)
 
 	origin, err := NewPeer(r.URL.Query().Get("origin"))
 	if err != nil {
+		log.Printf("[P2P] Error creating peer: %v", err)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
 	}
 
 	contacts, err := h.Service.Neighbors(origin)
 	if err != nil {
+		log.Printf("[P2P] Error getting neighbors: %v", err)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
 	}
+
+	log.Printf("[P2P] Found %d neighbors for %s", len(contacts), origin.Name())
 
 	var body = struct {
 		Neighbors []Contact `json:"neighbors"`
@@ -199,23 +215,29 @@ func (h *Handler) Neighbors(w http.ResponseWriter, r *http.Request) {
 
 // Random handles the /random endpoint
 func (h *Handler) Random(w http.ResponseWriter, r *http.Request) {
+	log.Printf("[P2P] GET /random from %s", r.RemoteAddr)
 
 	origin, err := NewPeer(r.URL.Query().Get("origin"))
 	if err != nil {
+		log.Printf("[P2P] Error creating peer: %v", err)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
 	}
 
 	random, err := h.Service.Random(origin)
 	if err != nil {
+		log.Printf("[P2P] Error getting random peer: %v", err)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
 	}
 
 	if random == nil {
+		log.Printf("[P2P] No random peer found for %s", origin.Name())
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
+
+	log.Printf("[P2P] Found random peer %s for %s", random.Name(), origin.Name())
 
 	var body = struct {
 		Random Contact `json:"random"`
@@ -232,6 +254,7 @@ func (h *Handler) Random(w http.ResponseWriter, r *http.Request) {
 
 // Transfer handles the /transfer endpoint
 func (h *Handler) Transfer(w http.ResponseWriter, r *http.Request) {
+	log.Printf("[P2P] POST /transfer from %s", r.RemoteAddr)
 
 	var body struct {
 		Origin string         `json:"origin"`
@@ -239,17 +262,23 @@ func (h *Handler) Transfer(w http.ResponseWriter, r *http.Request) {
 		Items  []*domain.Item `json:"items"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		log.Printf("[P2P] Error decoding transfer request: %v", err)
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
 		return
 	}
 
 	origin, err := NewPeer(body.Origin)
 	if err != nil {
+		log.Printf("[P2P] Error creating peer: %v", err)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
 	}
 
+	log.Printf("[P2P] Transferring %d items from %s for collection %s at location %s",
+		len(body.Items), origin.Name(), body.Key.Collection, body.Key.Location)
+
 	if err := h.Service.Transfer(origin, body.Key, body.Items); err != nil {
+		log.Printf("[P2P] Error during transfer: %v", err)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
 	}
@@ -260,9 +289,11 @@ func (h *Handler) Transfer(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	collection := r.URL.Query().Get("collection")
 	location := r.URL.Query().Get("location")
+	log.Printf("[P2P] GET /set from %s for collection %s at location %s", r.RemoteAddr, collection, location)
 
 	contact, set, err := h.Service.Get(collection, location)
 	if err != nil {
+		log.Printf("[P2P] Error getting set: %v", err)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
 	}
@@ -270,6 +301,9 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	var list map[string]*domain.Abelian
 	if set != nil {
 		list = set.List()
+		log.Printf("[P2P] Found set with %d items", len(list))
+	} else {
+		log.Printf("[P2P] No set found")
 	}
 
 	var body = struct {
@@ -288,29 +322,34 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, body)
 }
 
-// Get handles the /set endpoint -- ADAPTED for one collection, multiple locations
+// Get handles the /sets endpoint
 func (h *Handler) Gets(w http.ResponseWriter, r *http.Request) {
-	// We expect a single collection
 	collection := r.URL.Query().Get("collection")
+	locationsParam := r.URL.Query().Get("location")
+	log.Printf("[P2P] GET /sets from %s for collection %s", r.RemoteAddr, collection)
+
 	if collection == "" {
+		log.Printf("[P2P] Error: missing collection parameter")
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "collection parameter is required"})
 		return
 	}
 
-	// Potentially multiple locations (comma-separated)
-	locationsParam := r.URL.Query().Get("location")
 	if locationsParam == "" {
+		log.Printf("[P2P] Error: missing location parameter")
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "location parameter is required"})
 		return
 	}
 
-	// Split the location(s) on commas
 	locations := strings.Split(locationsParam, ",")
+	log.Printf("[P2P] Retrieving data for %d locations", len(locations))
+
 	sets := h.Service.GetMultiple(collection, locations)
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	if _, writeErr := w.Write(sets); writeErr != nil {
-		log.Println("Error writing response:", writeErr)
+		log.Printf("[P2P] Error writing response: %v", writeErr)
+	} else {
+		log.Printf("[P2P] Successfully wrote %d bytes of data", len(sets))
 	}
 }
 

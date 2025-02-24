@@ -20,11 +20,10 @@ type Node struct {
 	owned        *domain.BST[map[domain.Key]any]
 	cache        *domain.Cache
 	queue        *domain.Queue[*Element]
-	storage      domain.Storage
 	ready        bool
 }
 
-func NewNode(settings *Settings, newContact func(string, map[string]any, int) domain.Contact, bootstraps []domain.Contact, storage domain.Storage) (*Node, error) {
+func NewNode(settings *Settings, newContact func(string, map[string]any, int) domain.Contact, bootstraps []domain.Contact) (*Node, error) {
 	node := &Node{
 		settings:     settings,
 		newContact:   newContact,
@@ -32,22 +31,21 @@ func NewNode(settings *Settings, newContact func(string, map[string]any, int) do
 		routing:      domain.NewBST[domain.Peer](),
 		registered:   domain.NewBST[domain.Contact](),
 		acknowledged: domain.NewBST[domain.Contact](),
-		collections:  domain.NewCollections(),
+		collections:  domain.NewCollections(settings.setLength, settings.delegation, settings.dataDir),
 		owned:        domain.NewBST[map[domain.Key]any](),
 		cache:        domain.NewCache(),
 		queue:        domain.NewQueue[*Element](),
-		storage:      storage,
 	}
 
+	// Register self and acknowledge bootstraps
 	node.register([]domain.Contact{node})
 	node.acknowledge(bootstraps)
 
-	if err := node.Restore(); err != nil {
-		fmt.Printf("issue when restoring the node from backup: %v", err)
-
-		if err := node.storage.Reset(); err != nil {
-			return nil, fmt.Errorf("issue when resetting the storage: %v", err)
-		}
+	// Load collections from disk
+	if err := node.LoadCollections(); err != nil {
+		log.Printf("Warning: Error loading collections: %v", err)
+	} else {
+		log.Println("Successfully loaded collections from disk")
 	}
 
 	node.ready = true
@@ -166,6 +164,20 @@ func (n *Node) GetMultiple(collection string, locations []string) []byte {
 }
 
 func (n *Node) New(item *domain.Item, root, current string) error {
+	// Write to WAL before processing
+	op := &domain.CollectionOperation{
+		Type:       domain.OpAddItem,
+		Collection: item.Collection,
+		Location:   item.Location,
+		ID:         item.Id,
+		Count:      1,
+		Metrics:    item.Metrics,
+		Timestamp:  time.Now().UnixNano(),
+	}
+	if err := n.collections.WriteOperation(op); err != nil {
+		log.Printf("Warning: Failed to write operation to WAL: %v", err)
+	}
+
 	n.queue.Add(NewElement(item, root, current))
 	return nil
 }
@@ -308,7 +320,7 @@ func (n *Node) insert(item *domain.Item, root, current string) error {
 		n.create(item.Collection, root)
 	}
 
-	if n.add(item) {
+	if n.process(item, root, current) {
 		return nil
 	}
 
@@ -339,17 +351,13 @@ func (n *Node) create(col, root string) {
 	n.collections.Set(collection)
 }
 
-func (n *Node) add(item *domain.Item) bool {
-
+func (n *Node) process(item *domain.Item, root, current string) bool {
 	collection, exist := n.collections.Get(item.Collection)
 	if !exist || !collection.Allowing(item.Location) {
 		return false
 	}
 
 	areas := collection.Add(item.Location, item.Id, item.Metrics, n.settings.setLength, n.settings.delegation)
-	if n.ready {
-		n.storage.Append(item.Content())
-	}
 
 	if len(areas) > 0 {
 		n.own(collection, areas)
