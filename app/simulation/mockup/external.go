@@ -509,7 +509,7 @@ func (h *Handler) FeedNetwork(w http.ResponseWriter, r *http.Request) {
 			log.Fatal(err)
 		}
 
-		node, err := core.NewNode(settings, NewContact, bootstraps, NewStorage())
+		node, err := core.NewNode(settings, NewContact, bootstraps)
 		if err != nil {
 			log.Fatal(err)
 		}

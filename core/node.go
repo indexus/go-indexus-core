@@ -22,11 +22,10 @@ type Node struct {
 	owned        *domain.BST[map[domain.Key]any]
 	cache        *domain.Cache
 	queue        *domain.Queue[*Element]
-	storage      domain.Storage
 	ready        bool
 }
 
-func NewNode(settings *Settings, newContact func(string, map[string]any, int) domain.Contact, bootstraps []domain.Contact, storage domain.Storage) (*Node, error) {
+func NewNode(settings *Settings, newContact func(string, map[string]any, int) domain.Contact, bootstraps []domain.Contact) (*Node, error) {
 	node := &Node{
 		settings:     settings,
 		newContact:   newContact,
@@ -38,21 +37,10 @@ func NewNode(settings *Settings, newContact func(string, map[string]any, int) do
 		owned:        domain.NewBST[map[domain.Key]any](),
 		cache:        domain.NewCache(),
 		queue:        domain.NewQueue[*Element](),
-		storage:      storage,
 	}
 
 	node.register([]domain.Contact{node})
 	node.acknowledge(bootstraps)
-
-	if err := node.Restore(); err != nil {
-		fmt.Printf("issue when restoring the node from backup: %v", err)
-
-		if err := node.storage.Reset(); err != nil {
-			return nil, fmt.Errorf("issue when resetting the storage: %v", err)
-		}
-	}
-
-	node.ready = true
 
 	return node, nil
 }
@@ -355,10 +343,6 @@ func (n *Node) add(item *domain.Item) bool {
 	areas := collection.Add(item.Location, item.Id, item.Metrics, n.settings.delegation)
 	if areas == nil {
 		return false
-	}
-
-	if n.ready {
-		n.storage.Append(item.Content())
 	}
 
 	if len(areas) > 0 {
