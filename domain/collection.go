@@ -1,7 +1,9 @@
 package domain
 
 import (
+	"encoding/binary"
 	"fmt"
+	"math/bits"
 	"strings"
 	"sync"
 )
@@ -53,14 +55,16 @@ func (c *Collections) List() []*Collection {
 
 type Collection struct {
 	name  string
+	base  Encoder
 	sets  map[string]*Set
 	owned Ownership
 	mu    *sync.Mutex
 }
 
-func NewCollection(name string, root string) *Collection {
+func NewCollection(name string, root string, base Encoder) *Collection {
 	return &Collection{
 		name:  name,
+		base:  base,
 		sets:  map[string]*Set{root: NewSet()},
 		owned: map[string]Delegation{root: {}},
 		mu:    &sync.Mutex{},
@@ -71,11 +75,15 @@ func (c *Collection) Name() string {
 	return c.name
 }
 
+func (c *Collection) Base() Encoder {
+	return c.base
+}
+
 func (c *Collection) Allowing(location string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	for child, parent := "", location; parent != ""; child, parent = parent, Parent(parent) {
+	for child, parent := "", location; parent != ""; child, parent = parent, c.base.Parent(parent) {
 		if delegation, owned := c.owned[parent]; owned {
 			_, delegated := delegation[child]
 			return !delegated
@@ -99,6 +107,19 @@ func (c *Collection) New(location string) {
 	defer c.mu.Unlock()
 
 	c.sets[location] = NewSet()
+
+	parent := c.base.Parent(location)
+
+	if parent == "" {
+		return
+	}
+
+	set, ok := c.sets[parent]
+	if !ok {
+		return
+	}
+
+	set.Put(location, c.sets[location].abelian())
 }
 
 func (c *Collection) Get(location string) (*Set, bool) {
@@ -109,6 +130,127 @@ func (c *Collection) Get(location string) (*Set, bool) {
 	return set, ok
 }
 
+// EncodeBits encodes a list of values into a compact byte slice using the specified number of bits per value.
+func encodeBits(values []int, bitsPerValue int) []byte {
+	var buffer uint64
+	var bufferBits uint
+	result := make([]byte, 0, (len(values)*bitsPerValue+7)/8)
+
+	for _, value := range values {
+		buffer = (buffer << bitsPerValue) | uint64(value)
+		bufferBits += uint(bitsPerValue)
+
+		for bufferBits >= 8 {
+			byteValue := byte(buffer >> (bufferBits - 8))
+			result = append(result, byteValue)
+			bufferBits -= 8
+			buffer &= (1 << bufferBits) - 1 // Mask remaining bits
+		}
+	}
+
+	// Flush remaining bits
+	for bufferBits > 0 {
+		if bufferBits >= 8 {
+			byteValue := byte(buffer >> (bufferBits - 8))
+			result = append(result, byteValue)
+			bufferBits -= 8
+			buffer &= (1 << bufferBits) - 1
+		} else {
+			byteValue := byte(buffer << (8 - bufferBits))
+			result = append(result, byteValue)
+			bufferBits = 0
+		}
+	}
+
+	return result
+}
+
+func (c *Collection) GetMultiple(locations []string, precision int, properties []func(*Abelian) int) ([]byte, error) {
+	var result []byte
+
+	type t struct {
+		size    int
+		bits    []int
+		values  [][]int
+		content []byte
+	}
+
+	data := make([]t, precision)
+	for idx := range data {
+		data[idx] = t{
+			size:    0,
+			bits:    make([]int, len(properties)),
+			values:  make([][]int, 0),
+			content: make([]byte, 0),
+		}
+
+		for v := 0; v < len(properties); v++ {
+			data[idx].values = append(data[idx].values, make([]int, 0))
+		}
+	}
+
+	for _, location := range locations {
+		set, exist := c.sets[location]
+		if !exist {
+			continue
+		}
+
+		for key, value := range set.list {
+			idxColon := strings.IndexByte(key, ':')
+			if idxColon >= 0 {
+				key = key[:precision]
+			}
+
+			l := len(key) - 1
+
+			data[l].size++
+			data[l].content = append(data[l].content, []byte(key)...)
+
+			for idx, property := range properties {
+				p := property(value)
+				data[l].values[idx] = append(data[l].values[idx], p)
+				if p > data[l].bits[idx] {
+					data[l].bits[idx] = p
+				}
+			}
+		}
+	}
+
+	bitsNeeded := func(n int) int {
+		if n <= 0 {
+			return 0
+		}
+		return bits.Len(uint(n))
+	}
+
+	for i := 0; i < precision; i++ {
+		if data[i].size == 0 {
+			continue
+		}
+
+		header := []byte{}
+		header = append(header, byte(i))
+
+		// Encode size as four bytes (Big Endian)
+		sizeBytes := make([]byte, 4)
+		binary.BigEndian.PutUint32(sizeBytes, uint32(data[i].size))
+		header = append(header, sizeBytes...)
+
+		content := data[i].content
+
+		for j := 0; j < len(properties); j++ {
+			bitCount := bitsNeeded(data[i].bits[j])
+			header = append(header, byte(bitCount))
+			content = append(content, encodeBits(data[i].values[j], bitCount)...)
+		}
+
+		result = append(result, header...)
+		result = append(result, content...)
+	}
+
+	return result, nil
+}
+
 func (c *Collection) List() map[string]*Set {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -116,9 +258,21 @@ func (c *Collection) List() map[string]*Set {
 	return c.sets
 }
 
-func (c *Collection) Add(location, id string, metrics []float64, setLength, delegation int) Ownership {
+func (c *Collection) Add(location string, id string, metrics []float64, delegation int) Ownership {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	delegated := true
+	for child, parent := "", location; parent != ""; child, parent = parent, c.base.Parent(parent) {
+		if delegation, owned := c.owned[parent]; owned {
+			_, delegated = delegation[child]
+			break
+		}
+	}
+
+	if delegated {
+		return nil
+	}
 
 	added, areas := false, Ownership{}
 	entry := fmt.Sprintf("%s:%s", location, id)
@@ -127,15 +281,19 @@ func (c *Collection) Add(location, id string, metrics []float64, setLength, dele
 	child, parent := "", location
 
 	for len(parent) > 0 {
-		child, parent = parent, Parent(parent)
+		child, parent = parent, c.base.Parent(parent)
 
 		set, ok := c.sets[parent]
 		if !ok {
 			continue
 		}
 
-		if !added && set.Add(entry, abelian, setLength) {
-			set.Shrink(c.sets, parent, setLength)
+		if added && set.list[child] == nil {
+			fmt.Println("HERE")
+		}
+
+		if !added && set.Add(entry, abelian, c.base.Length()) {
+			set.Shrink(c.base, c.sets, parent, c.base.Length())
 		} else if added && set.Incr(child, abelian).Count() == delegation {
 			areas[child] = Delegation{}
 		}
@@ -143,7 +301,7 @@ func (c *Collection) Add(location, id string, metrics []float64, setLength, dele
 	}
 
 	for area := range areas {
-		parent := Parent(area)
+		parent := c.base.Parent(area)
 		if parent == "" {
 			continue
 		}
@@ -158,9 +316,11 @@ func (c *Collection) Add(location, id string, metrics []float64, setLength, dele
 	return areas
 }
 
-func (c *Collection) Update(location, sublocation string, abelian *Abelian) {
+func (c *Collection) Update(sublocation string, abelian *Abelian) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	location := c.base.Parent(sublocation)
 
 	set, exist := c.sets[location]
 	if !exist {
@@ -179,7 +339,7 @@ func (c *Collection) Update(location, sublocation string, abelian *Abelian) {
 
 	parent, child := location, sublocation
 	for {
-		parent, child = Parent(parent), parent
+		parent, child = c.base.Parent(parent), parent
 
 		set, ok := c.sets[parent]
 		if !ok {
@@ -209,14 +369,14 @@ func (c *Collection) Complete(root string) Ownership {
 	areas := Ownership{root: {}}
 	for key := range c.owned {
 
-		if key == root || (root != Root() && !strings.Contains(key, root)) {
+		if key == root || (root != c.base.Root() && strings.Index(key, root) != 0) {
 			continue
 		}
 
 		parent, previous := key, ""
 		for parent != root {
 
-			parent, previous = Parent(parent), parent
+			parent, previous = c.base.Parent(parent), parent
 
 			_, exist := c.sets[parent]
 			if !exist {
@@ -245,9 +405,11 @@ func (c *Collection) Delegate(location string) ([]*Item, bool) {
 		items = append(items, &Item{Collection: c.name, Location: location, Id: id, Metrics: abelian.Metrics()})
 	})
 
-	_, exist := c.owned[Parent(location)]
+	parent := c.base.Parent(location)
+
+	_, exist := c.owned[parent]
 	if exist {
-		c.owned[Parent(location)][location] = nil
+		c.owned[parent][location] = nil
 	}
 
 	delete(c.owned, location)
@@ -299,7 +461,7 @@ func (c *Collection) clean(parent string, processSet func(string, *Abelian), pro
 			arr := strings.Split(key, ":")
 
 			k := arr[0][:len(parent)]
-			if parent != Root() {
+			if parent != c.base.Root() {
 				k = arr[0][:len(parent)+1]
 			}
 

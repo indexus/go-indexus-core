@@ -8,11 +8,13 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/indexus/go-indexus-core/core"
 	"github.com/indexus/go-indexus-core/domain"
+	"github.com/indexus/go-indexus-core/encoding"
 	"github.com/indexus/go-indexus-core/worker"
 )
 
@@ -58,6 +60,7 @@ func (h *Handler) Serve(lis net.Listener) error {
 
 	// Client
 	mux.HandleFunc("/set", h.Get)
+	mux.HandleFunc("/sets", h.GetMultiple)
 	mux.HandleFunc("/item", h.New)
 
 	// Monitoring
@@ -211,25 +214,83 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var list map[string]*domain.Abelian
-	if set != nil {
-		list = set.List()
-	}
-
 	var body = struct {
 		Contact Contact                    `json:"contact"`
 		Set     map[string]*domain.Abelian `json:"set"`
-	}{
-		Contact: Contact{
+	}{}
+
+	if contact != nil {
+		body.Contact = Contact{
 			Name: contact.Name(),
 			IPs:  contact.IPs(),
 			Port: contact.Port(),
 			IP:   contact.IP(),
-		},
-		Set: list,
+		}
+	}
+
+	if set != nil {
+		body.Set = set.List()
 	}
 
 	writeJSON(w, http.StatusOK, body)
+}
+
+// Get handles the /sets endpoint
+func (h *Handler) GetMultiple(w http.ResponseWriter, r *http.Request) {
+	h.randomDelay() // Introduce latency
+
+	destination := r.Header.Get("Destination")
+
+	node, ok := network.nodes[destination]
+	if !ok {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	// We expect a single collection
+	collection := r.URL.Query().Get("collection")
+	if collection == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "collection parameter is required"})
+		return
+	}
+
+	// Potentially multiple locations (comma-separated)
+	locationsParam := r.URL.Query().Get("locations")
+	if locationsParam == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "location parameter is required"})
+		return
+	}
+
+	// Split the location(s) on commas
+	locations := strings.Split(locationsParam, ",")
+
+	precision := 6
+
+	properties := [](func(*domain.Abelian) int){
+		func(a *domain.Abelian) int {
+			return a.Count()
+		},
+		func(a *domain.Abelian) int {
+			return int(a.Metrics()[2])
+		},
+		func(a *domain.Abelian) int {
+			return int(1_000_000 * a.Metrics()[3])
+		},
+		func(a *domain.Abelian) int {
+			return int(1_000_000 * a.Metrics()[4])
+		},
+	}
+
+	sets, err := node.GetMultiple(collection, locations, precision, properties)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	if _, writeErr := w.Write(sets); writeErr != nil {
+		log.Println("Error writing response:", writeErr)
+	}
 }
 
 // New handles the /item endpoint
@@ -438,7 +499,12 @@ func (h *Handler) FeedNetwork(w http.ResponseWriter, r *http.Request) {
 			bootstraps = append(bootstraps, NewContact(random.Name(), random.IPs(), random.Port()))
 		}
 
-		settings, err := core.NewSettings(domain.EncodeId(domain.RandomId()), len(network.nodes), 1*time.Second, 5*time.Minute, domain.DelegationTreshold(), domain.IdLength())
+		name, err := encoding.BASE64.RandomName()
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		settings, err := core.NewSettings(name, len(network.nodes), 1*time.Second, 5*time.Minute, domain.DelegationTreshold())
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -458,7 +524,7 @@ func (h *Handler) FeedNetwork(w http.ResponseWriter, r *http.Request) {
 			h.errChan <- workerInstance.Start()
 		}()
 
-		if network.Length() == 0 || rand.Intn(10) < 3 {
+		if network.Length() == 0 || rand.Intn(10) < 3 || true {
 			network.Join(node)
 		} else {
 			network.Unreachable(node)
@@ -484,13 +550,20 @@ func (h *Handler) FeedCollection(w http.ResponseWriter, r *http.Request) {
 
 	go func() {
 		for i := 0; i < c; i++ {
+
+			location, err := encoding.BASE64.RandomName()
+			if err != nil {
+				log.Fatal(err)
+			}
+
 			item := &domain.Item{
 				Collection: collectionId,
-				Location:   domain.EncodeId(domain.RandomId()),
+				Location:   location,
 				Id:         fmt.Sprintf("%d", i),
-				Metrics:    []float64{rand.Float64(), rand.Float64()},
+				Metrics:    []float64{rand.Float64(), rand.Float64(), rand.Float64(), rand.Float64(), rand.Float64()},
 			}
-			err := network.Random().New(item, domain.Root(), item.Location)
+
+			err = network.Random().New(item, encoding.BASE64.Root(), item.Location)
 			if err != nil {
 				log.Println(err)
 			}

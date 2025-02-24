@@ -7,12 +7,13 @@ import (
 	"strings"
 
 	"github.com/indexus/go-indexus-core/domain"
+	"github.com/indexus/go-indexus-core/encoding"
 )
 
 func (n *Node) Snapshot() []string {
 	snapshot := make([]string, 0)
 
-	n.routing.Traverse(0, make([]byte, domain.IdLength()), func(i int, b []byte, p domain.Peer) {
+	n.routing.Traverse(0, encoding.BASE64.NewID(), func(i int, b []byte, p domain.Peer) {
 		c, exist := n.registered.Get(0, p.ID())
 		if exist {
 			arr := make([]string, 0)
@@ -70,7 +71,7 @@ func (n *Node) Restore() error {
 			if err != nil {
 				continue
 			}
-			n.acknowledged.Insert(0, make([]byte, domain.IdLength()), n.newContact(name, mIps, port))
+			n.acknowledged.Insert(0, encoding.BASE64.NewID(), n.newContact(name, mIps, port))
 		case "collection":
 			collection = arr[1]
 		case "ownership":

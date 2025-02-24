@@ -1,12 +1,14 @@
 package core
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"math/rand"
 	"time"
 
 	"github.com/indexus/go-indexus-core/domain"
+	"github.com/indexus/go-indexus-core/encoding"
 )
 
 type Node struct {
@@ -94,7 +96,7 @@ func (n *Node) Ping(origin domain.Contact) (domain.Contact, error) {
 
 func (n *Node) Neighbors(origin domain.Peer) ([]domain.Contact, error) {
 
-	id, err := domain.DecodeName(origin.Name())
+	id, err := encoding.BASE64.Decode(origin.Name())
 	if err != nil {
 		return nil, err
 	}
@@ -123,7 +125,6 @@ func (n *Node) Random(origin domain.Peer) (domain.Contact, error) {
 }
 
 func (n *Node) Transfer(origin domain.Peer, key domain.Key, items []*domain.Item) error {
-
 	for _, item := range items {
 		n.New(item, key.Location, key.Location)
 	}
@@ -133,20 +134,20 @@ func (n *Node) Transfer(origin domain.Peer, key domain.Key, items []*domain.Item
 
 func (n *Node) Get(collection, location string) (domain.Contact, *domain.Set, error) {
 
-	name := collection
-	if location != domain.Root() {
-		name = location + collection[len(location):]
-	}
-
-	id, err := domain.DecodeName(name)
+	id, err := encoding.MergeEncodings(
+		encoding.BASE64,
+		encoding.BASE64,
+		location,
+		collection,
+	)
 	if err != nil {
-		return nil, nil, err
+		log.Println("Error decoding: ", err)
 	}
 
 	nearest := n.registered.Nearest(0, id)
 
-	if collection, exist := n.collections.Get(collection); exist {
-		set, ok := collection.Get(location)
+	if c, exist := n.collections.Get(collection); exist {
+		set, ok := c.Get(location)
 		if ok {
 			return nearest, set, nil
 		}
@@ -161,31 +162,13 @@ func (n *Node) Get(collection, location string) (domain.Contact, *domain.Set, er
 	return nearest, nil, nil
 }
 
-func (n *Node) GetMultiple(collection string, locations []string) []byte {
+func (n *Node) GetMultiple(collection string, locations []string, precision int, properties []func(*domain.Abelian) int) ([]byte, error) {
+	c, ok := n.collections.Get(collection)
+	if !ok {
+		return nil, errors.New("no collection")
+	}
 
-	var start = time.Now()
-	encoded := n.collections.GetMultiple(collection, locations)
-	fmt.Println(time.Now().Sub(start))
-
-	// // Decode the encoded data
-	// decoded, err := domain.DecodeMultiple(encoded)
-	// if err != nil {
-	// 	fmt.Printf("Decoding failed: %v\n", err)
-	// 	return encoded
-	// }
-
-	// // Print decoded data
-	// i := 0
-	// for key, abelian := range decoded {
-	// 	fmt.Println(key, abelian.Count, abelian.Metrics)
-
-	// 	i++
-	// 	if i > 10 {
-	// 		break
-	// 	}
-	// }
-
-	return encoded
+	return c.GetMultiple(locations, precision, properties)
 }
 
 func (n *Node) New(item *domain.Item, root, current string) error {
@@ -250,14 +233,14 @@ func (n *Node) subscribe(contacts []domain.Contact) {
 
 func (n *Node) find(collection, location string) (domain.Contact, error) {
 
-	name := collection
-	if location != domain.Root() {
-		name = location + collection[len(location):]
-	}
-
-	id, err := domain.DecodeName(name)
+	id, err := encoding.MergeEncodings(
+		encoding.BASE64,
+		encoding.BASE64,
+		location,
+		collection,
+	)
 	if err != nil {
-		return nil, err
+		log.Println("Error decoding: ", err)
 	}
 
 	if nearest := n.registered.Nearest(0, id); nearest != nil {
@@ -268,7 +251,7 @@ func (n *Node) find(collection, location string) (domain.Contact, error) {
 
 func (n *Node) traverseAcknowledged(self bool) []domain.Contact {
 	contacts := make([]domain.Contact, 0)
-	n.acknowledged.Traverse(0, make([]byte, domain.IdLength()), func(i int, b []byte, c domain.Contact) {
+	n.acknowledged.Traverse(0, encoding.BASE64.NewID(), func(i int, b []byte, c domain.Contact) {
 		if !self && n.Name() == c.Name() {
 			return
 		}
@@ -279,7 +262,7 @@ func (n *Node) traverseAcknowledged(self bool) []domain.Contact {
 
 func (n *Node) traverseRegistered(self bool) []domain.Contact {
 	contacts := make([]domain.Contact, 0)
-	n.registered.Traverse(0, make([]byte, domain.IdLength()), func(i int, b []byte, c domain.Contact) {
+	n.registered.Traverse(0, encoding.BASE64.NewID(), func(i int, b []byte, c domain.Contact) {
 		if !self && n.Name() == c.Name() {
 			return
 		}
@@ -290,7 +273,7 @@ func (n *Node) traverseRegistered(self bool) []domain.Contact {
 
 func (n *Node) traverseRouting(self bool) []domain.Contact {
 	contacts := make([]domain.Contact, 0)
-	n.routing.Traverse(0, make([]byte, domain.IdLength()), func(i int, b []byte, p domain.Peer) {
+	n.routing.Traverse(0, encoding.BASE64.NewID(), func(i int, b []byte, p domain.Peer) {
 		if !self && n.Name() == p.Name() {
 			return
 		}
@@ -335,7 +318,7 @@ func (n *Node) insert(item *domain.Item, root, current string) error {
 		return nil
 	}
 
-	current = domain.Parent(current)
+	current = encoding.BASE64.Parent(current)
 
 	if len(current) == 0 {
 		n.New(item, root, item.Location)
@@ -349,7 +332,7 @@ func (n *Node) create(col, root string) {
 
 	collection, exist := n.collections.Get(col)
 	if !exist {
-		collection = domain.NewCollection(col, root)
+		collection = domain.NewCollection(col, root, encoding.BASE64)
 	}
 
 	_, exist = collection.Get(root)
@@ -365,11 +348,15 @@ func (n *Node) create(col, root string) {
 func (n *Node) add(item *domain.Item) bool {
 
 	collection, exist := n.collections.Get(item.Collection)
-	if !exist || !collection.Allowing(item.Location) {
+	if !exist {
 		return false
 	}
 
-	areas := collection.Add(item.Location, item.Id, item.Metrics, n.settings.setLength, n.settings.delegation)
+	areas := collection.Add(item.Location, item.Id, item.Metrics, n.settings.delegation)
+	if areas == nil {
+		return false
+	}
+
 	if n.ready {
 		n.storage.Append(item.Content())
 	}
@@ -385,7 +372,12 @@ func (n *Node) own(collection *domain.Collection, owned domain.Ownership) {
 
 	for location, delegation := range owned {
 
-		id, err := domain.DecodeLocation(collection.Name(), location)
+		id, err := encoding.MergeEncodings(
+			encoding.BASE64,
+			encoding.BASE64,
+			location,
+			collection.Name(),
+		)
 		if err != nil {
 			log.Println("Error decoding: ", err)
 		}
@@ -403,7 +395,8 @@ func (n *Node) control() map[domain.Contact]map[domain.Key][]*domain.Item {
 	transferable := make(map[domain.Contact]map[domain.Key][]*domain.Item)
 	for _, candidate := range n.traverseRouting(false) {
 
-		n.owned.Range(0, n.ID(), candidate.ID(), make([]byte, domain.IdLength()), func(idx int, id []byte, sets map[domain.Key]any) {
+		n.owned.Range(0, n.ID(), candidate.ID(), encoding.BASE64.NewID(), func(idx int, id []byte, sets map[domain.Key]any) {
+
 			for key := range sets {
 
 				_, exist := transferable[candidate]
@@ -423,5 +416,6 @@ func (n *Node) control() map[domain.Contact]map[domain.Key][]*domain.Item {
 		})
 		n.owned.Truncate(0, n.ID(), candidate.ID())
 	}
+
 	return transferable
 }

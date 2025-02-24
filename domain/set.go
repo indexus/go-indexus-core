@@ -93,11 +93,11 @@ func (s *Set) Expired(expiration time.Duration) bool {
 	return time.Since(s.last) > expiration
 }
 
-func (s *Set) Shrink(sets map[string]*Set, key string, max int) {
+func (s *Set) Shrink(base Encoder, sets map[string]*Set, key string, max int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.shrink(sets, key, max)
+	s.shrink(base, sets, key, max)
 }
 
 func (s *Set) traverse(process func(string, *Abelian)) {
@@ -151,7 +151,7 @@ func (s *Set) incr(value string, delta *Abelian) *Abelian {
 	return s.list[value]
 }
 
-func (s *Set) shrink(sets map[string]*Set, key string, max int) {
+func (s *Set) shrink(base Encoder, sets map[string]*Set, key string, max int) {
 
 	type tmp struct {
 		key     string
@@ -161,7 +161,7 @@ func (s *Set) shrink(sets map[string]*Set, key string, max int) {
 	exist := make(map[string]tmp)
 
 	child, precision := "", len(key)
-	if key == root {
+	if key == base.Root() {
 		precision = 0
 	}
 
@@ -179,7 +179,7 @@ func (s *Set) shrink(sets map[string]*Set, key string, max int) {
 			list[child].Sum(abelian)
 
 			if full {
-				set.shrink(sets, child, max)
+				set.shrink(base, sets, child, max)
 			}
 		} else if first, ok2 := exist[child]; ok2 {
 			set := NewSet()

@@ -61,11 +61,33 @@ func (n *Node) Refresh() error {
 
 	for candidate, keys := range n.control() {
 		for key, items := range keys {
+
+			if len(items) == 0 {
+				continue
+			}
+
+			collection, _ := n.collections.Get(key.Collection)
+
+			parent := key.Location
+			for {
+				k := domain.Key{
+					Collection: key.Collection,
+					Location:   parent,
+				}
+				if _, ok := keys[k]; !ok {
+					break
+				}
+				if parent == collection.Base().Root() {
+					break
+				}
+				key.Location, parent = parent, collection.Base().Parent(parent)
+			}
 			candidate.Transfer(n, key, items)
 		}
 	}
 
-	err := n.storage.Save(n.Snapshot())
+	// n.Snapshot()
+	err := n.storage.Save([]string{})
 	if err != nil {
 		return err
 	}
@@ -116,7 +138,7 @@ func (n *Node) Update() error {
 			n.cache.Set(collection, location, set)
 
 			if c, exist := n.collections.Get(collection); exist {
-				c.Update(domain.Parent(location), location, set.Abelian())
+				c.Update(location, set.Abelian())
 			}
 		}
 	}

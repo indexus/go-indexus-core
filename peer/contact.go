@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/indexus/go-indexus-core/domain"
+	"github.com/indexus/go-indexus-core/encoding"
 )
 
 var HttpClient = &http.Client{
@@ -66,7 +67,7 @@ func NewContact(name string, ips map[string]any, port int) domain.Contact {
 }
 
 func (c *Contact) ID() []byte {
-	id, err := domain.DecodeName(c.name)
+	id, err := encoding.BASE64.Decode(c.name)
 	if err != nil {
 		panic(err)
 	}
@@ -111,7 +112,7 @@ func (c *Contact) ping(origin domain.Contact, ip string) (domain.Contact, error)
 		ip = fmt.Sprintf("[%s]", ip)
 	}
 
-	url := fmt.Sprintf("https://%s:%d/ping", ip, c.port)
+	url := fmt.Sprintf("http://%s:%d/ping", ip, c.port)
 	reqBody := struct {
 		Origin *Contact `json:"origin"`
 	}{
@@ -165,7 +166,7 @@ func (c *Contact) Neighbors(origin domain.Peer) ([]domain.Contact, error) {
 		ip = fmt.Sprintf("[%s]", ip)
 	}
 
-	url := fmt.Sprintf("https://%s:%d/neighbors?origin=%s", ip, c.port, origin.Name())
+	url := fmt.Sprintf("http://%s:%d/neighbors?origin=%s", ip, c.port, origin.Name())
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -206,7 +207,7 @@ func (c *Contact) Random(origin domain.Peer) (domain.Contact, error) {
 		ip = fmt.Sprintf("[%s]", ip)
 	}
 
-	url := fmt.Sprintf("https://%s:%d/random?origin=%s", ip, c.port, origin.Name())
+	url := fmt.Sprintf("http://%s:%d/random?origin=%s", ip, c.port, origin.Name())
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -241,7 +242,7 @@ func (c *Contact) Transfer(origin domain.Peer, key domain.Key, items []*domain.I
 		ip = fmt.Sprintf("[%s]", ip)
 	}
 
-	url := fmt.Sprintf("https://%s:%d/transfer", ip, c.port)
+	url := fmt.Sprintf("http://%s:%d/transfer", ip, c.port)
 	body := struct {
 		Origin string         `json:"origin"`
 		Key    domain.Key     `json:"key"`
@@ -283,7 +284,7 @@ func (c *Contact) Get(collection string, location string) (domain.Contact, *doma
 		ip = fmt.Sprintf("[%s]", ip)
 	}
 
-	url := fmt.Sprintf("https://%s:%d/set?collection=%s&location=%s", ip, c.port, collection, location)
+	url := fmt.Sprintf("http://%s:%d/set?collection=%s&location=%s", ip, c.port, collection, location)
 	resp, err := HttpClient.Get(url)
 	if err != nil {
 		return nil, nil, err
@@ -318,7 +319,7 @@ func (c *Contact) New(item *domain.Item, root string, current string) error {
 		ip = fmt.Sprintf("[%s]", ip)
 	}
 
-	url := fmt.Sprintf("https://%s:%d/item", ip, c.port)
+	url := fmt.Sprintf("http://%s:%d/item", ip, c.port)
 	body := struct {
 		Item    *domain.Item `json:"item"`
 		Root    string       `json:"root"`
