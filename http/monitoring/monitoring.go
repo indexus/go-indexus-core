@@ -63,8 +63,10 @@ func writeJSON(w http.ResponseWriter, code int, data interface{}) {
 
 // Acknowledged handles the /acknowledged endpoint
 func (h *Handler) Acknowledged(w http.ResponseWriter, r *http.Request) {
+	log.Printf("[Monitoring] GET /acknowledged from %s", r.RemoteAddr)
 	contacts, err := h.Service.Acknowledged()
 	if err != nil {
+		log.Printf("[Monitoring] Error in /acknowledged: %v", err)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
 	}
@@ -82,8 +84,10 @@ func (h *Handler) Acknowledged(w http.ResponseWriter, r *http.Request) {
 
 // Registered handles the /registered endpoint
 func (h *Handler) Registered(w http.ResponseWriter, r *http.Request) {
+	log.Printf("[Monitoring] GET /registered from %s", r.RemoteAddr)
 	contacts, err := h.Service.Registered()
 	if err != nil {
+		log.Printf("[Monitoring] Error in /registered: %v", err)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
 	}
@@ -101,8 +105,10 @@ func (h *Handler) Registered(w http.ResponseWriter, r *http.Request) {
 
 // Routing handles the /routing endpoint
 func (h *Handler) Routing(w http.ResponseWriter, r *http.Request) {
+	log.Printf("[Monitoring] GET /routing from %s", r.RemoteAddr)
 	contacts, err := h.Service.Routing()
 	if err != nil {
+		log.Printf("[Monitoring] Error in /routing: %v", err)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
 	}
@@ -120,8 +126,10 @@ func (h *Handler) Routing(w http.ResponseWriter, r *http.Request) {
 
 // Ownership handles the /ownership endpoint
 func (h *Handler) Ownership(w http.ResponseWriter, r *http.Request) {
+	log.Printf("[Monitoring] GET /ownership from %s", r.RemoteAddr)
 	body, err := h.Service.Ownership()
 	if err != nil {
+		log.Printf("[Monitoring] Error in /ownership: %v", err)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
 	}
@@ -130,6 +138,7 @@ func (h *Handler) Ownership(w http.ResponseWriter, r *http.Request) {
 
 // Queue handles the /queue endpoint
 func (h *Handler) Queue(w http.ResponseWriter, r *http.Request) {
+	log.Printf("[Monitoring] GET /queue from %s", r.RemoteAddr)
 	writeJSON(w, http.StatusOK, struct {
 		Pending int `json:"pending"`
 	}{

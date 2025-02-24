@@ -14,7 +14,6 @@ import (
 
 	"github.com/indexus/go-indexus-core/core"
 	"github.com/indexus/go-indexus-core/domain"
-	"github.com/indexus/go-indexus-core/encoding"
 	"github.com/indexus/go-indexus-core/worker"
 )
 
@@ -499,12 +498,12 @@ func (h *Handler) FeedNetwork(w http.ResponseWriter, r *http.Request) {
 			bootstraps = append(bootstraps, NewContact(random.Name(), random.IPs(), random.Port()))
 		}
 
-		name, err := encoding.BASE64.RandomName()
+		name, err := domain.BASE64.RandomName()
 		if err != nil {
 			log.Fatal(err)
 		}
 
-		settings, err := core.NewSettings(name, len(network.nodes), 1*time.Second, 5*time.Minute, domain.DelegationTreshold())
+		settings, err := core.NewSettings(name, len(network.nodes), 1*time.Second, 5*time.Minute, domain.DelegationTreshold(), ".data")
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -551,7 +550,7 @@ func (h *Handler) FeedCollection(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		for i := 0; i < c; i++ {
 
-			location, err := encoding.BASE64.RandomName()
+			location, err := domain.BASE64.RandomName()
 			if err != nil {
 				log.Fatal(err)
 			}
@@ -563,7 +562,7 @@ func (h *Handler) FeedCollection(w http.ResponseWriter, r *http.Request) {
 				Metrics:    []float64{rand.Float64(), rand.Float64(), rand.Float64(), rand.Float64(), rand.Float64()},
 			}
 
-			err = network.Random().New(item, encoding.BASE64.Root(), item.Location)
+			err = network.Random().New(item, domain.BASE64.Root(), item.Location)
 			if err != nil {
 				log.Println(err)
 			}

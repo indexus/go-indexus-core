@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/indexus/go-indexus-core/domain"
-	"github.com/indexus/go-indexus-core/encoding"
 )
 
 type Node struct {
@@ -33,14 +32,24 @@ func NewNode(settings *Settings, newContact func(string, map[string]any, int) do
 		routing:      domain.NewBST[domain.Peer](),
 		registered:   domain.NewBST[domain.Contact](),
 		acknowledged: domain.NewBST[domain.Contact](),
-		collections:  domain.NewCollections(),
+		collections:  domain.NewCollections(settings.delegation, settings.dataDir),
 		owned:        domain.NewBST[map[domain.Key]any](),
 		cache:        domain.NewCache(),
 		queue:        domain.NewQueue[*Element](),
 	}
 
+	// Register self and acknowledge bootstraps
 	node.register([]domain.Contact{node})
 	node.acknowledge(bootstraps)
+
+	// Load collections from disk
+	if err := node.LoadCollections(); err != nil {
+		log.Printf("Warning: Error loading collections: %v", err)
+	} else {
+		log.Println("Successfully loaded collections from disk")
+	}
+
+	node.ready = true
 
 	return node, nil
 }
@@ -84,7 +93,7 @@ func (n *Node) Ping(origin domain.Contact) (domain.Contact, error) {
 
 func (n *Node) Neighbors(origin domain.Peer) ([]domain.Contact, error) {
 
-	id, err := encoding.BASE64.Decode(origin.Name())
+	id, err := domain.BASE64.Decode(origin.Name())
 	if err != nil {
 		return nil, err
 	}
@@ -122,9 +131,9 @@ func (n *Node) Transfer(origin domain.Peer, key domain.Key, items []*domain.Item
 
 func (n *Node) Get(collection, location string) (domain.Contact, *domain.Set, error) {
 
-	id, err := encoding.MergeEncodings(
-		encoding.BASE64,
-		encoding.BASE64,
+	id, err := domain.MergeEncodings(
+		domain.BASE64,
+		domain.BASE64,
 		location,
 		collection,
 	)
@@ -160,6 +169,20 @@ func (n *Node) GetMultiple(collection string, locations []string, precision int,
 }
 
 func (n *Node) New(item *domain.Item, root, current string) error {
+	// Write to WAL before processing
+	op := &domain.CollectionOperation{
+		Type:       domain.OpAddItem,
+		Collection: item.Collection,
+		Location:   item.Location,
+		ID:         item.Id,
+		Count:      1,
+		Metrics:    item.Metrics,
+		Timestamp:  time.Now().UnixNano(),
+	}
+	if err := n.collections.WriteOperation(op); err != nil {
+		log.Printf("Warning: Failed to write operation to WAL: %v", err)
+	}
+
 	n.queue.Add(NewElement(item, root, current))
 	return nil
 }
@@ -221,9 +244,9 @@ func (n *Node) subscribe(contacts []domain.Contact) {
 
 func (n *Node) find(collection, location string) (domain.Contact, error) {
 
-	id, err := encoding.MergeEncodings(
-		encoding.BASE64,
-		encoding.BASE64,
+	id, err := domain.MergeEncodings(
+		domain.BASE64,
+		domain.BASE64,
 		location,
 		collection,
 	)
@@ -239,7 +262,7 @@ func (n *Node) find(collection, location string) (domain.Contact, error) {
 
 func (n *Node) traverseAcknowledged(self bool) []domain.Contact {
 	contacts := make([]domain.Contact, 0)
-	n.acknowledged.Traverse(0, encoding.BASE64.NewID(), func(i int, b []byte, c domain.Contact) {
+	n.acknowledged.Traverse(0, domain.BASE64.NewID(), func(i int, b []byte, c domain.Contact) {
 		if !self && n.Name() == c.Name() {
 			return
 		}
@@ -250,7 +273,7 @@ func (n *Node) traverseAcknowledged(self bool) []domain.Contact {
 
 func (n *Node) traverseRegistered(self bool) []domain.Contact {
 	contacts := make([]domain.Contact, 0)
-	n.registered.Traverse(0, encoding.BASE64.NewID(), func(i int, b []byte, c domain.Contact) {
+	n.registered.Traverse(0, domain.BASE64.NewID(), func(i int, b []byte, c domain.Contact) {
 		if !self && n.Name() == c.Name() {
 			return
 		}
@@ -261,7 +284,7 @@ func (n *Node) traverseRegistered(self bool) []domain.Contact {
 
 func (n *Node) traverseRouting(self bool) []domain.Contact {
 	contacts := make([]domain.Contact, 0)
-	n.routing.Traverse(0, encoding.BASE64.NewID(), func(i int, b []byte, p domain.Peer) {
+	n.routing.Traverse(0, domain.BASE64.NewID(), func(i int, b []byte, p domain.Peer) {
 		if !self && n.Name() == p.Name() {
 			return
 		}
@@ -302,11 +325,11 @@ func (n *Node) insert(item *domain.Item, root, current string) error {
 		n.create(item.Collection, root)
 	}
 
-	if n.add(item) {
+	if n.process(item, root, current) {
 		return nil
 	}
 
-	current = encoding.BASE64.Parent(current)
+	current = domain.BASE64.Parent(current)
 
 	if len(current) == 0 {
 		n.New(item, root, item.Location)
@@ -320,7 +343,7 @@ func (n *Node) create(col, root string) {
 
 	collection, exist := n.collections.Get(col)
 	if !exist {
-		collection = domain.NewCollection(col, root, encoding.BASE64)
+		collection = domain.NewCollection(col, root, domain.BASE64)
 	}
 
 	_, exist = collection.Get(root)
@@ -333,8 +356,7 @@ func (n *Node) create(col, root string) {
 	n.collections.Set(collection)
 }
 
-func (n *Node) add(item *domain.Item) bool {
-
+func (n *Node) process(item *domain.Item, root, current string) bool {
 	collection, exist := n.collections.Get(item.Collection)
 	if !exist {
 		return false
@@ -356,9 +378,9 @@ func (n *Node) own(collection *domain.Collection, owned domain.Ownership) {
 
 	for location, delegation := range owned {
 
-		id, err := encoding.MergeEncodings(
-			encoding.BASE64,
-			encoding.BASE64,
+		id, err := domain.MergeEncodings(
+			domain.BASE64,
+			domain.BASE64,
 			location,
 			collection.Name(),
 		)
@@ -379,7 +401,7 @@ func (n *Node) control() map[domain.Contact]map[domain.Key][]*domain.Item {
 	transferable := make(map[domain.Contact]map[domain.Key][]*domain.Item)
 	for _, candidate := range n.traverseRouting(false) {
 
-		n.owned.Range(0, n.ID(), candidate.ID(), encoding.BASE64.NewID(), func(idx int, id []byte, sets map[domain.Key]any) {
+		n.owned.Range(0, n.ID(), candidate.ID(), domain.BASE64.NewID(), func(idx int, id []byte, sets map[domain.Key]any) {
 
 			for key := range sets {
 

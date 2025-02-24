@@ -6,7 +6,6 @@ import (
 
 	"github.com/indexus/go-indexus-core/core"
 	"github.com/indexus/go-indexus-core/domain"
-	"github.com/indexus/go-indexus-core/encoding"
 )
 
 var network = NewNetwork()
@@ -64,7 +63,7 @@ func NewContact(name string, ips map[string]any, port int) domain.Contact {
 }
 
 func (p *Peer) ID() []byte {
-	id, err := encoding.BASE64.Decode(p.name)
+	id, err := domain.BASE64.Decode(p.name)
 	if err != nil {
 		panic(err)
 	}

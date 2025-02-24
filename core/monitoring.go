@@ -4,7 +4,6 @@ import (
 	"fmt"
 
 	"github.com/indexus/go-indexus-core/domain"
-	"github.com/indexus/go-indexus-core/encoding"
 )
 
 func (n *Node) Routing() ([]domain.Contact, error) {
@@ -40,7 +39,7 @@ func (n *Node) Ownership() (map[string]map[string]map[string]any, error) {
 func (n *Node) Count() (int, error) {
 	total := 0
 
-	n.owned.Traverse(0, encoding.BASE64.NewID(), func(i int, b []byte, keys map[domain.Key]any) {
+	n.owned.Traverse(0, domain.BASE64.NewID(), func(i int, b []byte, keys map[domain.Key]any) {
 		for key := range keys {
 			collection, exist := n.collections.Get(key.Collection)
 			if !exist {
@@ -63,9 +62,9 @@ func (n *Node) Check() []string {
 		collection.Browse(
 			func(ownership string) {
 
-				id, err := encoding.MergeEncodings(
-					encoding.BASE64,
-					encoding.BASE64,
+				id, err := domain.MergeEncodings(
+					domain.BASE64,
+					domain.BASE64,
 					ownership,
 					collection.Name(),
 				)
@@ -82,7 +81,7 @@ func (n *Node) Check() []string {
 		)
 	}
 
-	n.owned.Traverse(0, encoding.BASE64.NewID(), func(i int, b []byte, keys map[domain.Key]any) {
+	n.owned.Traverse(0, domain.BASE64.NewID(), func(i int, b []byte, keys map[domain.Key]any) {
 		for key := range keys {
 			collection, ok := n.collections.Get(key.Collection)
 			if !ok {
