@@ -12,13 +12,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/indexus/go-indexus-core/app/simulation/mockup"
 	"github.com/indexus/go-indexus-core/core"
 	"github.com/indexus/go-indexus-core/domain"
 	"github.com/indexus/go-indexus-core/http/monitoring"
 	"github.com/indexus/go-indexus-core/http/p2p"
 	"github.com/indexus/go-indexus-core/peer"
-	"github.com/indexus/go-indexus-core/storage"
 	"github.com/indexus/go-indexus-core/worker"
 )
 
@@ -43,15 +41,12 @@ const (
 
 // Config holds the configuration parsed from command-line flags
 type Config struct {
-	BootstrapFlag         string
-	NameFlag              string
-	MonitoringPortFlag    int
-	P2pPortFlag           int
-	ClientPortFlag        int
-	ArchiveStorageDirFlag string
-	StorageFlag           string
-	SSLStorageFlag        string
-	Bootstraps            []domain.Contact
+	Bootstraps         []domain.Contact
+	NameFlag           string
+	MonitoringPortFlag int
+	P2pPortFlag        int
+	SSLStorageFlag     string
+	DataDirFlag        string
 }
 
 func displayContacts(contacts []domain.Contact) string {
@@ -84,10 +79,8 @@ func parseFlags() Config {
 	nameFlagPtr := flag.String("name", domain.EncodeId(domain.RandomId()), "Name of the node")
 	monitoringPortFlagPtr := flag.Int("monitoringPort", 19000, "Port number of the node for the monitoring service")
 	p2pPortFlagPtr := flag.Int("p2pPort", 21000, "Port number of the node for the peer to peer network")
-	storageFlagPtr := flag.String("storage", ".data/backup", "Path to the backup file")
-	archiveStorageDirFlagPtr := flag.String("archive", ".data/archive", "Path to the backup file")
 	sslStorageFlagPtr := flag.String("sslStorage", "", "Path to the ssl certificates")
-
+	dataDirFlagPtr := flag.String("dataDir", ".data", "Path to the data directory")
 	flag.Parse()
 
 	bootstraps := make([]domain.Contact, 0)
@@ -106,14 +99,12 @@ func parseFlags() Config {
 	}
 
 	return Config{
-		BootstrapFlag:         *bootstrapFlagPtr,
-		NameFlag:              *nameFlagPtr,
-		MonitoringPortFlag:    *monitoringPortFlagPtr,
-		P2pPortFlag:           *p2pPortFlagPtr,
-		ArchiveStorageDirFlag: *archiveStorageDirFlagPtr,
-		StorageFlag:           *storageFlagPtr,
-		SSLStorageFlag:        *sslStorageFlagPtr,
-		Bootstraps:            bootstraps,
+		Bootstraps:         bootstraps,
+		NameFlag:           *nameFlagPtr,
+		MonitoringPortFlag: *monitoringPortFlagPtr,
+		P2pPortFlag:        *p2pPortFlagPtr,
+		SSLStorageFlag:     *sslStorageFlagPtr,
+		DataDirFlag:        *dataDirFlagPtr,
 	}
 }
 
@@ -131,25 +122,19 @@ func displayMessages(config Config) {
 	fmt.Println("Name:", config.NameFlag)
 	fmt.Println("Monitoring, P2P Ports:", config.MonitoringPortFlag, config.P2pPortFlag)
 	fmt.Println("Bootstrap Nodes:", displayContacts(config.Bootstraps))
-	fmt.Println("Archive Path:", config.ArchiveStorageDirFlag)
-	fmt.Println("Storage Path:", config.StorageFlag)
+	fmt.Println("SSL Storage Path:", config.SSLStorageFlag)
+	fmt.Println("Data Directory:", config.DataDirFlag)
 	fmt.Println()
 }
 
 // startProcess initializes and starts the core components of the application
 func startProcess(config Config) {
-	settings, err := core.NewSettings(config.NameFlag, config.P2pPortFlag, 10*time.Second, 5*time.Minute, domain.DelegationTreshold(), domain.IdLength())
+	settings, err := core.NewSettings(config.NameFlag, config.P2pPortFlag, 10*time.Second, 5*time.Minute, domain.DelegationTreshold(), domain.IdLength(), config.DataDirFlag)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	var storageInstance domain.Storage
-	if len(config.StorageFlag) > 0 {
-		storageInstance = storage.NewStorage(config.ArchiveStorageDirFlag, config.StorageFlag)
-	} else {
-		storageInstance = mockup.NewStorage()
-	}
-	node, err := core.NewNode(settings, peer.NewContact, config.Bootstraps, storageInstance)
+	node, err := core.NewNode(settings, peer.NewContact, config.Bootstraps)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -170,11 +155,6 @@ func startProcess(config Config) {
 
 	errChan := make(chan error, 3)
 
-	go func() {
-		if len(config.StorageFlag) > 0 {
-			errChan <- storageInstance.(*storage.Storage).Start()
-		}
-	}()
 	go func() {
 		errChan <- monitoringHttpHandler.Serve(monitoringListener)
 	}()
@@ -202,10 +182,6 @@ func startProcess(config Config) {
 	}
 
 	// Clean up resources
-	// storageInstance.Close()
 	monitoringListener.Close()
 	p2pListener.Close()
-	workerInstance.Close()
-
-	log.Println("Node gracefully stopped")
 }

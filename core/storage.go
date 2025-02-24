@@ -1,102 +1,82 @@
 package core
 
 import (
-	"errors"
 	"fmt"
-	"strconv"
+	"log"
+	"os"
 	"strings"
 
 	"github.com/indexus/go-indexus-core/domain"
 )
 
-func (n *Node) Snapshot() []string {
-	snapshot := make([]string, 0)
+func (n *Node) SaveCollections() error {
+	collectionsDir := n.settings.dataDir + "/collections"
 
-	n.routing.Traverse(0, make([]byte, domain.IdLength()), func(i int, b []byte, p domain.Peer) {
-		c, exist := n.registered.Get(0, p.ID())
-		if exist {
-			arr := make([]string, 0)
-			for ip := range c.IPs() {
-				arr = append(arr, ip)
-			}
-			snapshot = append(snapshot, fmt.Sprintf("contact|%s|%s|%d", c.Name(), strings.Join(arr, ","), c.Port()))
-		}
-	})
-
-	for _, collection := range n.collections.List() {
-		snapshot = append(snapshot, fmt.Sprintf("collection|%s", collection.Name()))
-
-		collection.Browse(
-			func(ownership string) {
-				snapshot = append(snapshot, fmt.Sprintf("ownership|%s", ownership))
-			},
-			func(ownership, delegation string) {
-				snapshot = append(snapshot, fmt.Sprintf("delegation|%s", delegation))
-			},
-		)
+	// Create collections directory if it doesn't exist
+	if err := os.MkdirAll(collectionsDir, 0755); err != nil {
+		return fmt.Errorf("failed to create collections directory: %w", err)
 	}
-	return snapshot
+
+	// Save each collection to a binary file
+	for _, collection := range n.collections.List() {
+		filename := fmt.Sprintf("%s/%s.bin", collectionsDir, collection.Name())
+		if err := collection.SaveToBinary(filename); err != nil {
+			log.Printf("Error saving collection %s: %v", collection.Name(), err)
+			continue
+		}
+	}
+
+	return nil
 }
 
-func (n *Node) Restore() error {
-	if !n.storage.Exist() {
+func (n *Node) LoadCollections() error {
+	collectionsDir := n.settings.dataDir + "/collections"
+
+	// Check if collections directory exists
+	if _, err := os.Stat(collectionsDir); os.IsNotExist(err) {
+		log.Println("No collections directory found, starting with empty collections")
 		return nil
 	}
 
-	commands, err := n.storage.Load()
+	// Read directory entries
+	entries, err := os.ReadDir(collectionsDir)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to read collections directory: %w", err)
 	}
 
-	var collection, ownership, delegation string
-	for _, command := range commands {
-		arr := strings.Split(command, "|")
-		if len(arr) == 0 {
-			return errors.New("backup file is corrupted and cannot be restored")
-		}
+	// Load each collection file
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".bin") {
+			filename := fmt.Sprintf("%s/%s", collectionsDir, entry.Name())
 
-		switch arr[0] {
-		case "contact":
-			if len(arr) != 4 {
-				continue
-			}
-			name := arr[1]
-			ips := strings.Split(arr[2], ",")
-			mIps := make(map[string]any)
-			for _, ip := range ips {
-				mIps[ip] = nil
-			}
-			port, err := strconv.Atoi(arr[3])
+			// Try to load the collection
+			collection, err := domain.LoadFromBinary(filename)
 			if err != nil {
-				continue
+				return fmt.Errorf("error loading collection from %s: %w", filename, err)
 			}
-			n.acknowledged.Insert(0, make([]byte, domain.IdLength()), n.newContact(name, mIps, port))
-		case "collection":
-			collection = arr[1]
-		case "ownership":
-			ownership = arr[1]
-			n.create(collection, ownership)
-		case "delegation":
-			delegation = arr[1]
-			c, _ := n.collections.Get(collection)
-			c.Delegate(delegation)
-		default:
-			return errors.New("backup file is corrupted and cannot be restored")
+			n.collections.Set(collection)
 		}
 	}
 
-	stream := n.storage.Stream(0)
-	for log := range stream {
-		arr := strings.Split(log, "|")
-		item := &domain.Item{
-			Collection: arr[0],
-			Location:   arr[1],
-			Id:         arr[2],
-		}
-		if _, exist := n.collections.Get(item.Collection); exist {
-			n.add(item)
-		}
-	}
+	return nil
+}
 
+func (n *Node) ClearOperationsLog() error {
+	return n.collections.ClearOperationsLog()
+}
+
+func (n *Node) ReplayOperations() error {
+	return n.collections.ReplayOperations()
+}
+
+func (n *Node) CompleteOwnership() error {
+	// Iterate through all collections
+	for _, collection := range n.collections.List() {
+		// Get all areas that need to be owned
+		areas := collection.Complete(domain.Root())
+
+		// Update the node's owned BST
+		n.own(collection, areas)
+	}
 	return nil
 }

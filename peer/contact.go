@@ -12,7 +12,15 @@ import (
 )
 
 var HttpClient = &http.Client{
-	Timeout: 200 * time.Millisecond,
+	Timeout: 1 * time.Second,
+}
+
+// useHTTPS determines if HTTPS should be used based on SSL storage configuration
+var useHTTPS = false
+
+// SetHTTPS sets whether to use HTTPS for peer connections
+func SetHTTPS(https bool) {
+	useHTTPS = https
 }
 
 type Contact struct {
@@ -111,7 +119,12 @@ func (c *Contact) ping(origin domain.Contact, ip string) (domain.Contact, error)
 		ip = fmt.Sprintf("[%s]", ip)
 	}
 
-	url := fmt.Sprintf("https://%s:%d/ping", ip, c.port)
+	scheme := "http"
+	if useHTTPS {
+		scheme = "https"
+	}
+
+	url := fmt.Sprintf("%s://%s:%d/ping", scheme, ip, c.port)
 	reqBody := struct {
 		Origin *Contact `json:"origin"`
 	}{
@@ -165,7 +178,12 @@ func (c *Contact) Neighbors(origin domain.Peer) ([]domain.Contact, error) {
 		ip = fmt.Sprintf("[%s]", ip)
 	}
 
-	url := fmt.Sprintf("https://%s:%d/neighbors?origin=%s", ip, c.port, origin.Name())
+	scheme := "http"
+	if useHTTPS {
+		scheme = "https"
+	}
+
+	url := fmt.Sprintf("%s://%s:%d/neighbors?origin=%s", scheme, ip, c.port, origin.Name())
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -206,7 +224,12 @@ func (c *Contact) Random(origin domain.Peer) (domain.Contact, error) {
 		ip = fmt.Sprintf("[%s]", ip)
 	}
 
-	url := fmt.Sprintf("https://%s:%d/random?origin=%s", ip, c.port, origin.Name())
+	scheme := "http"
+	if useHTTPS {
+		scheme = "https"
+	}
+
+	url := fmt.Sprintf("%s://%s:%d/random?origin=%s", scheme, ip, c.port, origin.Name())
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -241,7 +264,12 @@ func (c *Contact) Transfer(origin domain.Peer, key domain.Key, items []*domain.I
 		ip = fmt.Sprintf("[%s]", ip)
 	}
 
-	url := fmt.Sprintf("https://%s:%d/transfer", ip, c.port)
+	scheme := "http"
+	if useHTTPS {
+		scheme = "https"
+	}
+
+	url := fmt.Sprintf("%s://%s:%d/transfer", scheme, ip, c.port)
 	body := struct {
 		Origin string         `json:"origin"`
 		Key    domain.Key     `json:"key"`
@@ -283,7 +311,12 @@ func (c *Contact) Get(collection string, location string) (domain.Contact, *doma
 		ip = fmt.Sprintf("[%s]", ip)
 	}
 
-	url := fmt.Sprintf("https://%s:%d/set?collection=%s&location=%s", ip, c.port, collection, location)
+	scheme := "http"
+	if useHTTPS {
+		scheme = "https"
+	}
+
+	url := fmt.Sprintf("%s://%s:%d/set?collection=%s&location=%s", scheme, ip, c.port, collection, location)
 	resp, err := HttpClient.Get(url)
 	if err != nil {
 		return nil, nil, err
@@ -318,7 +351,12 @@ func (c *Contact) New(item *domain.Item, root string, current string) error {
 		ip = fmt.Sprintf("[%s]", ip)
 	}
 
-	url := fmt.Sprintf("https://%s:%d/item", ip, c.port)
+	scheme := "http"
+	if useHTTPS {
+		scheme = "https"
+	}
+
+	url := fmt.Sprintf("%s://%s:%d/item", scheme, ip, c.port)
 	body := struct {
 		Item    *domain.Item `json:"item"`
 		Root    string       `json:"root"`
