@@ -81,7 +81,7 @@ func startProcess(config Config) {
 
 	var errChan = make(chan error, 1)
 
-	httpHandler := mockup.NewHttpHandler(errChan, peer.NewContact, 100, 200)
+	httpHandler := mockup.NewHttpHandler(errChan, peer.NewContact, 0, 0)
 
 	listener, err := net.Listen("tcp", fmt.Sprintf("localhost:%d", config.PortFlag))
 	if err != nil {

@@ -15,6 +15,7 @@ import (
 	"github.com/indexus/go-indexus-core/app/simulation/mockup"
 	"github.com/indexus/go-indexus-core/core"
 	"github.com/indexus/go-indexus-core/domain"
+	"github.com/indexus/go-indexus-core/encoding"
 	"github.com/indexus/go-indexus-core/http/monitoring"
 	"github.com/indexus/go-indexus-core/http/p2p"
 	"github.com/indexus/go-indexus-core/peer"
@@ -80,8 +81,14 @@ func main() {
 
 // parseFlags handles command-line flag parsing and returns a Config struct
 func parseFlags() Config {
+
+	name, err := encoding.BASE64.RandomName()
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	bootstrapFlagPtr := flag.String("bootstrap", "", "Host of the bootstrap peers")
-	nameFlagPtr := flag.String("name", domain.EncodeId(domain.RandomId()), "Name of the node")
+	nameFlagPtr := flag.String("name", name, "Name of the node")
 	monitoringPortFlagPtr := flag.Int("monitoringPort", 19000, "Port number of the node for the monitoring service")
 	p2pPortFlagPtr := flag.Int("p2pPort", 21000, "Port number of the node for the peer to peer network")
 	storageFlagPtr := flag.String("storage", ".data/backup", "Path to the backup file")
@@ -101,7 +108,13 @@ func parseFlags() Config {
 			if err != nil {
 				log.Fatal(err)
 			}
-			bootstraps = append(bootstraps, peer.NewContact(domain.EncodeId(make([]byte, domain.IdLength())), map[string]any{ip: nil}, port))
+
+			name, err := encoding.BASE64.RandomName()
+			if err != nil {
+				log.Fatal(err)
+			}
+
+			bootstraps = append(bootstraps, peer.NewContact(name, map[string]any{ip: nil}, port))
 		}
 	}
 
@@ -138,7 +151,7 @@ func displayMessages(config Config) {
 
 // startProcess initializes and starts the core components of the application
 func startProcess(config Config) {
-	settings, err := core.NewSettings(config.NameFlag, config.P2pPortFlag, 10*time.Second, 5*time.Minute, domain.DelegationTreshold(), domain.IdLength())
+	settings, err := core.NewSettings(config.NameFlag, config.P2pPortFlag, 10*time.Second, 5*time.Minute, domain.DelegationTreshold())
 	if err != nil {
 		log.Fatal(err)
 	}

@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/indexus/go-indexus-core/domain"
+	"github.com/indexus/go-indexus-core/encoding"
 
 	"github.com/rs/cors"
 )
@@ -27,7 +28,8 @@ type Peer struct {
 }
 
 func NewPeer(name string) (*Peer, error) {
-	id, err := domain.DecodeName(name)
+
+	id, err := encoding.BASE64.Decode(name)
 	if err != nil {
 		return nil, err
 	}
@@ -52,7 +54,7 @@ type Service interface {
 	Random(domain.Peer) (domain.Contact, error)
 	Transfer(domain.Peer, domain.Key, []*domain.Item) error
 	Get(string, string) (domain.Contact, *domain.Set, error)
-	GetMultiple(string, []string) []byte
+	GetMultiple(string, []string, int, []func(*domain.Abelian) int) ([]byte, error)
 	New(*domain.Item, string, string) error
 }
 
@@ -86,7 +88,7 @@ func (h *Handler) Serve(lis net.Listener) error {
 
 	// Client
 	mux.HandleFunc("/set", h.Get)
-	mux.HandleFunc("/sets", h.Gets)
+	mux.HandleFunc("/sets", h.GetMultiple)
 	mux.HandleFunc("/item", h.New)
 
 	// Configure CORS
@@ -288,8 +290,8 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, body)
 }
 
-// Get handles the /set endpoint -- ADAPTED for one collection, multiple locations
-func (h *Handler) Gets(w http.ResponseWriter, r *http.Request) {
+// Get handles the /sets endpoint -- ADAPTED for one collection, multiple locations
+func (h *Handler) GetMultiple(w http.ResponseWriter, r *http.Request) {
 	// We expect a single collection
 	collection := r.URL.Query().Get("collection")
 	if collection == "" {
@@ -298,7 +300,7 @@ func (h *Handler) Gets(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Potentially multiple locations (comma-separated)
-	locationsParam := r.URL.Query().Get("location")
+	locationsParam := r.URL.Query().Get("locations")
 	if locationsParam == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "location parameter is required"})
 		return
@@ -306,7 +308,29 @@ func (h *Handler) Gets(w http.ResponseWriter, r *http.Request) {
 
 	// Split the location(s) on commas
 	locations := strings.Split(locationsParam, ",")
-	sets := h.Service.GetMultiple(collection, locations)
+
+	precision := 6
+
+	properties := [](func(*domain.Abelian) int){
+		func(a *domain.Abelian) int {
+			return a.Count()
+		},
+		func(a *domain.Abelian) int {
+			return int(a.Metrics()[2])
+		},
+		func(a *domain.Abelian) int {
+			return int(1_000_000 * a.Metrics()[3])
+		},
+		func(a *domain.Abelian) int {
+			return int(1_000_000 * a.Metrics()[4])
+		},
+	}
+
+	sets, err := h.Service.GetMultiple(collection, locations, precision, properties)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	if _, writeErr := w.Write(sets); writeErr != nil {

@@ -4,7 +4,7 @@ import (
 	"net"
 	"time"
 
-	"github.com/indexus/go-indexus-core/domain"
+	"github.com/indexus/go-indexus-core/encoding"
 )
 
 type Settings struct {
@@ -16,12 +16,11 @@ type Settings struct {
 	delay      time.Duration
 	expiration time.Duration
 	delegation int
-	setLength  int
 }
 
-func NewSettings(name string, port int, delay, expiration time.Duration, delegation int, setLength int) (*Settings, error) {
+func NewSettings(name string, port int, delay, expiration time.Duration, delegation int) (*Settings, error) {
 
-	id, err := domain.DecodeName(name)
+	id, err := encoding.BASE64.Decode(name)
 	if err != nil {
 		return nil, err
 	}
@@ -35,7 +34,6 @@ func NewSettings(name string, port int, delay, expiration time.Duration, delegat
 		delay:      delay,
 		expiration: expiration,
 		delegation: delegation,
-		setLength:  setLength,
 	}, nil
 }
 
