@@ -73,9 +73,9 @@ func (w *Worker) Start() error {
 			if err := w.Service.Refresh(); err != nil {
 				return err
 			}
-			if err := w.Service.Update(); err != nil {
-				return err
-			}
+			// if err := w.Service.Update(); err != nil {
+			// 	return err
+			// }
 		}
 	}
 }

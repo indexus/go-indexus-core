@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/indexus/go-indexus-core/domain"
@@ -257,7 +259,7 @@ func (c *Contact) Random(origin domain.Peer) (domain.Contact, error) {
 	return body.Contact, nil
 }
 
-func (c *Contact) Transfer(origin domain.Peer, key domain.Key, items []*domain.Item) error {
+func (c *Contact) Transfer(origin domain.Peer, key domain.Key, ownership domain.Delegation, items []*domain.Item, metricSize int) error {
 	ip, parsedIP := c.ip, net.ParseIP(c.ip)
 
 	if parsedIP != nil && parsedIP.To4() == nil {
@@ -271,13 +273,17 @@ func (c *Contact) Transfer(origin domain.Peer, key domain.Key, items []*domain.I
 
 	url := fmt.Sprintf("%s://%s:%d/transfer", scheme, ip, c.port)
 	body := struct {
-		Origin string         `json:"origin"`
-		Key    domain.Key     `json:"key"`
-		Items  []*domain.Item `json:"items"`
+		Origin     string            `json:"origin"`
+		Key        domain.Key        `json:"key"`
+		Ownership  domain.Delegation `json:"ownership"`
+		Items      []*domain.Item    `json:"items"`
+		MetricSize int               `json:"metricSize"`
 	}{
-		Origin: origin.Name(),
-		Key:    key,
-		Items:  items,
+		Origin:     origin.Name(),
+		Key:        key,
+		Ownership:  ownership,
+		Items:      items,
+		MetricSize: metricSize,
 	}
 
 	jsonData, err := json.Marshal(body)
@@ -389,4 +395,74 @@ func (c *Contact) New(item *domain.Item, root string, current string) error {
 	}
 
 	return nil
+}
+
+type remoteContact struct {
+	Name     string         `json:"name"`
+	IPs      map[string]any `json:"ips"`
+	Port     int            `json:"port"`
+	IP       string         `json:"ip"`
+	Location string         `json:"location"`
+}
+
+func (c *Contact) GetMultiple(collection string, locations []string, precision int, properties []func(*domain.Abelian) int) (*domain.MultiGetResponse, error) {
+	ip, parsedIP := c.ip, net.ParseIP(c.ip)
+
+	if parsedIP != nil && parsedIP.To4() == nil {
+		ip = fmt.Sprintf("[%s]", ip)
+	}
+
+	scheme := "http"
+	if useHTTPS {
+		scheme = "https"
+	}
+
+	locationsStr := strings.Join(locations, ",")
+	url := fmt.Sprintf("%s://%s:%d/sets?collection=%s&location=%s", scheme, ip, c.port, collection, locationsStr)
+	resp, err := HttpClient.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("error code: %d", resp.StatusCode)
+	}
+
+	// Check content type to determine response format
+	contentType := resp.Header.Get("Content-Type")
+	if contentType == "application/octet-stream" {
+		// Direct binary response (only local data)
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, err
+		}
+		return &domain.MultiGetResponse{
+			LocalData:       data,
+			RemoteLocations: nil,
+		}, nil
+	}
+
+	// JSON response with both local data and remote contacts
+	var body struct {
+		LocalData      []byte          `json:"local_data"`
+		RemoteContacts []remoteContact `json:"remote_contacts"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, err
+	}
+
+	// Convert remote contacts to RemoteLocations
+	remoteLocations := make([]domain.RemoteLocation, len(body.RemoteContacts))
+	for i, contact := range body.RemoteContacts {
+		remoteLocations[i] = domain.RemoteLocation{
+			Location: contact.Location,
+			Contact:  NewContact(contact.Name, contact.IPs, contact.Port),
+		}
+	}
+
+	return &domain.MultiGetResponse{
+		LocalData:       body.LocalData,
+		RemoteLocations: remoteLocations,
+	}, nil
 }

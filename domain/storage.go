@@ -270,7 +270,7 @@ func (c *Collections) ReplayOperations() error {
 		// Apply the operation
 		collection, exists := c.Get(collectionName)
 		if !exists {
-			collection = NewCollection(collectionName, collection.Base().Root(), BASE64)
+			collection = NewCollection(collectionName, collection.Base().Root(), BASE64, len(metrics))
 			c.Set(collection)
 		}
 
@@ -305,59 +305,6 @@ func (c *Collection) SaveToBinary(filePath string) error {
 		return fmt.Errorf("invalid collection: nil sets")
 	}
 
-	// Determine the metrics size for this collection
-	var collectionMetricsSize int
-	for _, set := range c.sets {
-		if set == nil {
-			continue
-		}
-		for _, abelian := range set.list {
-			if abelian != nil && abelian.metrics != nil {
-				collectionMetricsSize = len(abelian.metrics)
-				break
-			}
-		}
-		if collectionMetricsSize > 0 {
-			break
-		}
-	}
-	if collectionMetricsSize == 0 {
-		collectionMetricsSize = 5 // Default size if no metrics found
-	}
-
-	// Pre-validate all data before writing
-	for location, set := range c.sets {
-		if set == nil {
-			return fmt.Errorf("invalid set at location %s: nil set", location)
-		}
-		for key, abelian := range set.list {
-			if abelian == nil {
-				return fmt.Errorf("invalid abelian at %s/%s: nil abelian", location, key)
-			}
-			if abelian.metrics == nil {
-				return fmt.Errorf("invalid metrics at %s/%s: nil metrics", location, key)
-			}
-			if len(abelian.metrics) != collectionMetricsSize {
-				// Try to fix the metrics if possible
-				if len(abelian.metrics) < collectionMetricsSize {
-					newMetrics := make([]float64, collectionMetricsSize)
-					copy(newMetrics, abelian.metrics)
-					abelian.metrics = newMetrics
-					// Log that we fixed the metrics
-					log.Printf("Fixed metrics array size for %s/%s from %d to %d", location, key, len(abelian.metrics), collectionMetricsSize)
-				} else {
-					return fmt.Errorf("inconsistent metrics length at %s/%s: got %d, expected %d (collection standard)",
-						location, key, len(abelian.metrics), collectionMetricsSize)
-				}
-			}
-			for i, metric := range abelian.metrics {
-				if math.IsNaN(metric) || math.IsInf(metric, 0) {
-					return fmt.Errorf("invalid metric value at %s/%s index %d: %f", location, key, i, metric)
-				}
-			}
-		}
-	}
-
 	// Create a temporary file first
 	tempFile := filePath + ".tmp"
 	file, err := os.Create(tempFile)
@@ -384,7 +331,7 @@ func (c *Collection) SaveToBinary(filePath string) error {
 	}
 
 	// Write metrics size for this collection
-	if err := binary.Write(file, binary.LittleEndian, uint32(collectionMetricsSize)); err != nil {
+	if err := binary.Write(file, binary.LittleEndian, uint32(c.MetricSize())); err != nil {
 		return fmt.Errorf("failed to write metrics size: %w", err)
 	}
 
@@ -562,10 +509,12 @@ func LoadFromBinary(filePath string) (*Collection, error) {
 
 	// Create new collection
 	collection := &Collection{
-		name:  name,
-		sets:  make(map[string]*Set),
-		owned: make(Ownership),
-		mu:    &sync.Mutex{},
+		name:       name,
+		base:       BASE64,
+		metricSize: int(metricsSize),
+		sets:       make(map[string]*Set),
+		owned:      make(Ownership),
+		mu:         &sync.Mutex{},
 	}
 
 	// Read sets count

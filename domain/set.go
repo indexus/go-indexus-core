@@ -65,11 +65,11 @@ func (s *Set) Count() int {
 	return s.count()
 }
 
-func (s *Set) Abelian() *Abelian {
+func (s *Set) Abelian(size int) *Abelian {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	return s.abelian()
+	return s.abelian(size)
 }
 
 func (s *Set) Incr(value string, abelian *Abelian) *Abelian {
@@ -93,11 +93,11 @@ func (s *Set) Expired(expiration time.Duration) bool {
 	return time.Since(s.last) > expiration
 }
 
-func (s *Set) Shrink(base Encoder, sets map[string]*Set, key string, max int) {
+func (s *Set) Shrink(base Encoder, sets map[string]*Set, key string, max int, metricSize int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.shrink(base, sets, key, max)
+	s.shrink(base, sets, key, max, metricSize)
 }
 
 func (s *Set) traverse(process func(string, *Abelian)) {
@@ -128,16 +128,13 @@ func (s *Set) count() int {
 	return count
 }
 
-func (s *Set) abelian() *Abelian {
+func (s *Set) abelian(size int) *Abelian {
 	var count int
-	var metrics []float64
+	var metrics = make([]float64, size)
 
 	for _, elm := range s.list {
 		count += elm.Count()
 
-		if metrics == nil {
-			metrics = make([]float64, len(elm.Metrics()))
-		}
 		for idx, value := range elm.Metrics() {
 			metrics[idx] += value
 		}
@@ -151,7 +148,7 @@ func (s *Set) incr(value string, delta *Abelian) *Abelian {
 	return s.list[value]
 }
 
-func (s *Set) shrink(base Encoder, sets map[string]*Set, key string, max int) {
+func (s *Set) shrink(base Encoder, sets map[string]*Set, key string, max int, metricSize int) {
 
 	type tmp struct {
 		key     string
@@ -179,7 +176,7 @@ func (s *Set) shrink(base Encoder, sets map[string]*Set, key string, max int) {
 			list[child].Sum(abelian)
 
 			if full {
-				set.shrink(base, sets, child, max)
+				set.shrink(base, sets, child, max, metricSize)
 			}
 		} else if first, ok2 := exist[child]; ok2 {
 			set := NewSet()
@@ -187,7 +184,7 @@ func (s *Set) shrink(base Encoder, sets map[string]*Set, key string, max int) {
 			set.add(current, abelian, max)
 
 			sets[child] = set
-			list[child] = set.Abelian()
+			list[child] = set.Abelian(metricSize)
 			delete(exist, child)
 		} else {
 			exist[child] = tmp{

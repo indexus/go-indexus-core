@@ -46,7 +46,6 @@ func (n *Node) Observe() error {
 }
 
 func (n *Node) Refresh() error {
-
 	toRegister := make([]domain.Contact, 0)
 
 	for _, contact := range n.traverseRouting(false) {
@@ -58,32 +57,10 @@ func (n *Node) Refresh() error {
 	}
 
 	n.register(toRegister)
+	n.control()
 
-	for candidate, keys := range n.control() {
-		for key, items := range keys {
-
-			if len(items) == 0 {
-				continue
-			}
-
-			collection, _ := n.collections.Get(key.Collection)
-
-			parent := key.Location
-			for {
-				k := domain.Key{
-					Collection: key.Collection,
-					Location:   parent,
-				}
-				if _, ok := keys[k]; !ok {
-					break
-				}
-				if parent == collection.Base().Root() {
-					break
-				}
-				key.Location, parent = parent, collection.Base().Parent(parent)
-			}
-			candidate.Transfer(n, key, items)
-		}
+	if err := n.processPendingTransfers(); err != nil {
+		return err
 	}
 
 	err := n.clean()
@@ -132,7 +109,7 @@ func (n *Node) Update() error {
 			n.cache.Set(collection, location, set)
 
 			if c, exist := n.collections.Get(collection); exist {
-				c.Update(location, set.Abelian())
+				c.Update(location, set.Abelian(c.MetricSize()))
 			}
 		}
 	}

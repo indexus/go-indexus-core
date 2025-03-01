@@ -144,14 +144,14 @@ func (p *Peer) Random(origin domain.Peer) (domain.Contact, error) {
 	return NewContact(random.Name(), random.IPs(), random.Port()), nil
 }
 
-func (p *Peer) Transfer(origin domain.Peer, key domain.Key, items []*domain.Item) error {
+func (p *Peer) Transfer(origin domain.Peer, key domain.Key, ownership domain.Delegation, items []*domain.Item, metricSize int) error {
 
 	distant, ok := network.nodes[p.Name()]
 	if !ok {
 		return fmt.Errorf("error code: 404")
 	}
 
-	err := distant.Transfer(origin, key, items)
+	err := distant.Transfer(origin, key, ownership, items, metricSize)
 	if err != nil {
 		return fmt.Errorf("error making request: %s", err.Error())
 	}

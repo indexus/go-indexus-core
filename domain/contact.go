@@ -11,7 +11,7 @@ type Contact interface {
 	Ping(Contact) (Contact, error)
 	Neighbors(Peer) ([]Contact, error)
 	Random(Peer) (Contact, error)
-	Transfer(Peer, Key, []*Item) error
+	Transfer(Peer, Key, Delegation, []*Item, int) error
 	Get(string, string) (Contact, *Set, error)
 	New(*Item, string, string) error
 }
