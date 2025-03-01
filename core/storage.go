@@ -55,6 +55,8 @@ func (n *Node) LoadCollections() error {
 				return fmt.Errorf("error loading collection from %s: %w", filename, err)
 			}
 			n.collections.Set(collection)
+
+			n.own(collection, collection.Ownership())
 		}
 	}
 

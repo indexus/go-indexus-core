@@ -11,31 +11,33 @@ import (
 )
 
 type Node struct {
-	settings     *Settings
-	newContact   func(string, map[string]any, int) domain.Contact
-	bootstraps   []domain.Contact
-	routing      *domain.BST[domain.Peer]
-	registered   *domain.BST[domain.Contact]
-	acknowledged *domain.BST[domain.Contact]
-	collections  *domain.Collections
-	owned        *domain.BST[map[domain.Key]any]
-	cache        *domain.Cache
-	queue        *domain.Queue[*Element]
-	ready        bool
+	settings         *Settings
+	newContact       func(string, map[string]any, int) domain.Contact
+	bootstraps       []domain.Contact
+	routing          *domain.BST[domain.Peer]
+	registered       *domain.BST[domain.Contact]
+	acknowledged     *domain.BST[domain.Contact]
+	collections      *domain.Collections
+	owned            *domain.BST[map[domain.Key]any]
+	cache            *domain.Cache
+	queue            *domain.Queue[*Element]
+	pendingTransfers []domain.PendingTransfer
+	ready            bool
 }
 
 func NewNode(settings *Settings, newContact func(string, map[string]any, int) domain.Contact, bootstraps []domain.Contact) (*Node, error) {
 	node := &Node{
-		settings:     settings,
-		newContact:   newContact,
-		bootstraps:   bootstraps,
-		routing:      domain.NewBST[domain.Peer](),
-		registered:   domain.NewBST[domain.Contact](),
-		acknowledged: domain.NewBST[domain.Contact](),
-		collections:  domain.NewCollections(settings.delegation, settings.dataDir),
-		owned:        domain.NewBST[map[domain.Key]any](),
-		cache:        domain.NewCache(),
-		queue:        domain.NewQueue[*Element](),
+		settings:         settings,
+		newContact:       newContact,
+		bootstraps:       bootstraps,
+		routing:          domain.NewBST[domain.Peer](),
+		registered:       domain.NewBST[domain.Contact](),
+		acknowledged:     domain.NewBST[domain.Contact](),
+		collections:      domain.NewCollections(settings.delegation, settings.dataDir),
+		owned:            domain.NewBST[map[domain.Key]any](),
+		cache:            domain.NewCache(),
+		queue:            domain.NewQueue[*Element](),
+		pendingTransfers: make([]domain.PendingTransfer, 0),
 	}
 
 	// Register self and acknowledge bootstraps
@@ -121,7 +123,19 @@ func (n *Node) Random(origin domain.Peer) (domain.Contact, error) {
 	return contacts[rand.Intn(len(contacts))], nil
 }
 
-func (n *Node) Transfer(origin domain.Peer, key domain.Key, items []*domain.Item) error {
+func (n *Node) Transfer(origin domain.Peer, key domain.Key, ownership domain.Delegation, items []*domain.Item, metricSize int) error {
+	collection, exists := n.collections.Get(key.Collection)
+	if !exists {
+		collection = domain.NewCollection(key.Collection, key.Location, domain.BASE64, metricSize)
+		n.collections.Set(collection)
+	}
+
+	collection.New(key.Location)
+
+	n.own(collection, domain.Ownership{
+		key.Location: ownership,
+	})
+
 	for _, item := range items {
 		n.New(item, key.Location, key.Location)
 	}
@@ -159,13 +173,49 @@ func (n *Node) Get(collection, location string) (domain.Contact, *domain.Set, er
 	return nearest, nil, nil
 }
 
-func (n *Node) GetMultiple(collection string, locations []string, precision int, properties []func(*domain.Abelian) int) ([]byte, error) {
-	c, ok := n.collections.Get(collection)
-	if !ok {
-		return nil, errors.New("no collection")
+func (n *Node) GetMultiple(collection string, locations []string, precision int, properties []func(*domain.Abelian) int) (*domain.MultiGetResponse, error) {
+	// Split locations into local and remote
+	localLocations := make([]string, 0)
+	remoteLocations := make([]domain.RemoteLocation, 0)
+
+	for _, location := range locations {
+		// Find the nearest node for this location
+		contact, err := n.find(collection, location)
+		if err != nil {
+			return nil, err
+		}
+
+		if contact.Name() == n.Name() {
+			// Location is managed by current node
+			localLocations = append(localLocations, location)
+		} else {
+			// Location is managed by another node
+			remoteLocations = append(remoteLocations, domain.RemoteLocation{
+				Location: location,
+				Contact:  contact,
+			})
+		}
 	}
 
-	return c.GetMultiple(locations, precision, properties)
+	// Get data for local locations
+	var localData []byte
+	if len(localLocations) > 0 {
+		c, ok := n.collections.Get(collection)
+		if !ok {
+			return nil, errors.New("no collection")
+		}
+
+		var err error
+		localData, err = c.GetMultiple(localLocations, precision, properties)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return &domain.MultiGetResponse{
+		LocalData:       localData,
+		RemoteLocations: remoteLocations,
+	}, nil
 }
 
 func (n *Node) New(item *domain.Item, root, current string) error {
@@ -322,7 +372,7 @@ func (n *Node) insert(item *domain.Item, root, current string) error {
 	}
 
 	if current == root {
-		n.create(item.Collection, root)
+		n.create(item.Collection, root, len(item.Metrics))
 	}
 
 	if n.process(item, root, current) {
@@ -339,11 +389,11 @@ func (n *Node) insert(item *domain.Item, root, current string) error {
 	return n.insert(item, root, current)
 }
 
-func (n *Node) create(col, root string) {
+func (n *Node) create(col, root string, metricSize int) {
 
 	collection, exist := n.collections.Get(col)
 	if !exist {
-		collection = domain.NewCollection(col, root, domain.BASE64)
+		collection = domain.NewCollection(col, root, domain.BASE64, metricSize)
 	}
 
 	_, exist = collection.Get(root)
@@ -396,32 +446,82 @@ func (n *Node) own(collection *domain.Collection, owned domain.Ownership) {
 	}
 }
 
-func (n *Node) control() map[domain.Contact]map[domain.Key][]*domain.Item {
+func (n *Node) control() {
+	// Map to store transfers by location depth
+	transfersByDepth := make(map[int][]domain.PendingTransfer)
+	maxDepth := 0
 
-	transferable := make(map[domain.Contact]map[domain.Key][]*domain.Item)
 	for _, candidate := range n.traverseRouting(false) {
-
 		n.owned.Range(0, n.ID(), candidate.ID(), domain.BASE64.NewID(), func(idx int, id []byte, sets map[domain.Key]any) {
-
 			for key := range sets {
 
-				_, exist := transferable[candidate]
-				if !exist {
-					transferable[candidate] = make(map[domain.Key][]*domain.Item, 0)
+				collection, exists := n.collections.Get(key.Collection)
+				if !exists {
+					continue
 				}
 
-				collection, _ := n.collections.Get(key.Collection)
-
-				items, empty := collection.Delegate(key.Location)
-				if empty {
-					n.collections.Delete(key.Collection)
+				transfer := domain.PendingTransfer{
+					Key:      key,
+					Receiver: candidate,
 				}
 
-				transferable[candidate][key] = items
+				if key.Location == collection.Base().Root() {
+					transfersByDepth[0] = append(transfersByDepth[0], transfer)
+				} else {
+					depth := len(key.Location)
+					transfersByDepth[depth] = append(transfersByDepth[depth], transfer)
+					if depth > maxDepth {
+						maxDepth = depth
+					}
+				}
 			}
 		})
 		n.owned.Truncate(0, n.ID(), candidate.ID())
 	}
 
-	return transferable
+	// Clear existing pending transfers
+	n.pendingTransfers = make([]domain.PendingTransfer, 0)
+
+	// Add transfers in order from array[0] to array[maxDepth]
+	for depth := 0; depth <= maxDepth; depth++ {
+		if transfers, exists := transfersByDepth[depth]; exists {
+			n.pendingTransfers = append(n.pendingTransfers, transfers...)
+		}
+	}
+}
+
+func (n *Node) processPendingTransfers() error {
+	if len(n.pendingTransfers) == 0 {
+		return nil
+	}
+
+	// Process each transfer individually
+	remainingTransfers := make([]domain.PendingTransfer, 0)
+
+	for _, transfer := range n.pendingTransfers {
+		collection, exists := n.collections.Get(transfer.Key.Collection)
+		if !exists {
+			continue
+		}
+
+		// Get ownership entry before delegating
+		ownership, exists := collection.Ownership()[transfer.Key.Location]
+		if !exists {
+			continue
+		}
+
+		items, empty := collection.Delegate(transfer.Key.Location)
+		if empty {
+			n.collections.Delete(transfer.Key.Collection)
+		}
+
+		if err := transfer.Receiver.Transfer(n, transfer.Key, ownership, items, collection.MetricSize()); err != nil {
+			log.Printf("Error transferring to %s: %v", transfer.Receiver.Name(), err)
+			remainingTransfers = append(remainingTransfers, transfer)
+		}
+	}
+
+	n.pendingTransfers = remainingTransfers
+
+	return nil
 }

@@ -16,10 +16,11 @@ import (
 )
 
 type Contact struct {
-	Name string         `json:"name"`
-	IPs  map[string]any `json:"ips"`
-	Port int            `json:"port"`
-	IP   string         `json:"ip"`
+	Name     string         `json:"name"`
+	IPs      map[string]any `json:"ips"`
+	Port     int            `json:"port"`
+	IP       string         `json:"ip"`
+	Location string         `json:"location,omitempty"`
 }
 
 type Peer struct {
@@ -52,9 +53,9 @@ type Service interface {
 	Ping(domain.Contact) (domain.Contact, error)
 	Neighbors(domain.Peer) ([]domain.Contact, error)
 	Random(domain.Peer) (domain.Contact, error)
-	Transfer(domain.Peer, domain.Key, []*domain.Item) error
+	Transfer(domain.Peer, domain.Key, domain.Delegation, []*domain.Item, int) error
 	Get(string, string) (domain.Contact, *domain.Set, error)
-	GetMultiple(string, []string, int, []func(*domain.Abelian) int) ([]byte, error)
+	GetMultiple(string, []string, int, []func(*domain.Abelian) int) (*domain.MultiGetResponse, error)
 	New(*domain.Item, string, string) error
 }
 
@@ -258,9 +259,11 @@ func (h *Handler) Transfer(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[P2P] POST /transfer from %s", r.RemoteAddr)
 
 	var body struct {
-		Origin string         `json:"origin"`
-		Key    domain.Key     `json:"key"`
-		Items  []*domain.Item `json:"items"`
+		Origin     string            `json:"origin"`
+		Key        domain.Key        `json:"key"`
+		Ownership  domain.Delegation `json:"ownership"`
+		Items      []*domain.Item    `json:"items"`
+		MetricSize int               `json:"metricSize"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		log.Printf("[P2P] Error decoding transfer request: %v", err)
@@ -278,7 +281,7 @@ func (h *Handler) Transfer(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[P2P] Transferring %d items from %s for collection %s at location %s",
 		len(body.Items), origin.Name(), body.Key.Collection, body.Key.Location)
 
-	if err := h.Service.Transfer(origin, body.Key, body.Items); err != nil {
+	if err := h.Service.Transfer(origin, body.Key, body.Ownership, body.Items, body.MetricSize); err != nil {
 		log.Printf("[P2P] Error during transfer: %v", err)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
@@ -327,18 +330,14 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) GetMultiple(w http.ResponseWriter, r *http.Request) {
 	// We expect a single collection
 	collection := r.URL.Query().Get("collection")
-	log.Printf("[P2P] GET /sets from %s for collection %s", r.RemoteAddr, collection)
-
 	if collection == "" {
-		log.Printf("[P2P] Error: missing collection parameter")
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "collection parameter is required"})
 		return
 	}
 
 	// Potentially multiple locations (comma-separated)
-	locationsParam := r.URL.Query().Get("locations")
+	locationsParam := r.URL.Query().Get("location")
 	if locationsParam == "" {
-		log.Printf("[P2P] Error: missing location parameter")
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "location parameter is required"})
 		return
 	}
@@ -362,18 +361,30 @@ func (h *Handler) GetMultiple(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	sets, err := h.Service.GetMultiple(collection, locations, precision, properties)
+	response, err := h.Service.GetMultiple(collection, locations, precision, properties)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/octet-stream")
-	if _, writeErr := w.Write(sets); writeErr != nil {
-		log.Printf("[P2P] Error writing response: %v", writeErr)
-	} else {
-		log.Printf("[P2P] Successfully wrote %d bytes of data", len(sets))
+	remoteContacts := make([]Contact, len(response.RemoteLocations))
+	for i, remote := range response.RemoteLocations {
+		remoteContacts[i] = Contact{
+			Name:     remote.Contact.Name(),
+			IPs:      remote.Contact.IPs(),
+			Port:     remote.Contact.Port(),
+			IP:       remote.Contact.IP(),
+			Location: remote.Location,
+		}
 	}
+
+	writeJSON(w, http.StatusOK, struct {
+		LocalData      []byte    `json:"local_data"`
+		RemoteContacts []Contact `json:"remote_contacts"`
+	}{
+		LocalData:      response.LocalData,
+		RemoteContacts: remoteContacts,
+	})
 }
 
 // New handles the /item endpoint

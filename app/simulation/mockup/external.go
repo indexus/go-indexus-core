@@ -18,10 +18,11 @@ import (
 )
 
 type Contact struct {
-	Name string         `json:"name"`
-	IPs  map[string]any `json:"ips"`
-	Port int            `json:"port"`
-	IP   string         `json:"ip"`
+	Name     string         `json:"name"`
+	IPs      map[string]any `json:"ips"`
+	Port     int            `json:"port"`
+	IP       string         `json:"ip"`
+	Location string         `json:"location"`
 }
 
 type Handler struct {
@@ -280,14 +281,38 @@ func (h *Handler) GetMultiple(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	sets, err := node.GetMultiple(collection, locations, precision, properties)
+	response, err := node.GetMultiple(collection, locations, precision, properties)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
 
+	// If we have remote locations, return them along with any local data
+	if len(response.RemoteLocations) > 0 {
+		remoteContacts := make([]Contact, len(response.RemoteLocations))
+		for i, remote := range response.RemoteLocations {
+			remoteContacts[i] = Contact{
+				Name:     remote.Contact.Name(),
+				IPs:      remote.Contact.IPs(),
+				Port:     remote.Contact.Port(),
+				IP:       remote.Contact.IP(),
+				Location: remote.Location,
+			}
+		}
+
+		writeJSON(w, http.StatusOK, struct {
+			LocalData      []byte    `json:"local_data"`
+			RemoteContacts []Contact `json:"remote_contacts"`
+		}{
+			LocalData:      response.LocalData,
+			RemoteContacts: remoteContacts,
+		})
+		return
+	}
+
+	// If we only have local data, return it directly as binary
 	w.Header().Set("Content-Type", "application/octet-stream")
-	if _, writeErr := w.Write(sets); writeErr != nil {
+	if _, writeErr := w.Write(response.LocalData); writeErr != nil {
 		log.Println("Error writing response:", writeErr)
 	}
 }

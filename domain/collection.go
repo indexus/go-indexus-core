@@ -18,7 +18,6 @@ type Collections struct {
 }
 
 type Settings struct {
-	setLength  int
 	delegation int
 	dataDir    string
 }
@@ -76,20 +75,22 @@ func (c *Collections) List() []*Collection {
 }
 
 type Collection struct {
-	name  string
-	base  Encoder
-	sets  map[string]*Set
-	owned Ownership
-	mu    *sync.Mutex
+	name       string
+	base       Encoder
+	metricSize int
+	sets       map[string]*Set
+	owned      Ownership
+	mu         *sync.Mutex
 }
 
-func NewCollection(name string, root string, base Encoder) *Collection {
+func NewCollection(name string, root string, base Encoder, metricSize int) *Collection {
 	return &Collection{
-		name:  name,
-		base:  base,
-		sets:  map[string]*Set{root: NewSet()},
-		owned: map[string]Delegation{root: {}},
-		mu:    &sync.Mutex{},
+		name:       name,
+		base:       base,
+		metricSize: metricSize,
+		sets:       map[string]*Set{root: NewSet()},
+		owned:      map[string]Delegation{root: {}},
+		mu:         &sync.Mutex{},
 	}
 }
 
@@ -99,6 +100,14 @@ func (c *Collection) Name() string {
 
 func (c *Collection) Base() Encoder {
 	return c.base
+}
+
+func (c *Collection) MetricSize() int {
+	return c.metricSize
+}
+
+func (c *Collection) Ownership() Ownership {
+	return c.owned
 }
 
 func (c *Collection) Allowing(location string) bool {
@@ -141,7 +150,7 @@ func (c *Collection) New(location string) {
 		return
 	}
 
-	set.Put(location, c.sets[location].abelian())
+	set.Put(location, c.sets[location].abelian(c.MetricSize()))
 }
 
 func (c *Collection) Get(location string) (*Set, bool) {
@@ -311,11 +320,12 @@ func (c *Collection) Add(location string, id string, metrics []float64, delegati
 		}
 
 		if added && set.list[child] == nil {
-			fmt.Println("HERE")
+			set.list[child] = abelian.Clone()
+			continue
 		}
 
 		if !added && set.Add(entry, abelian, c.base.Length()) {
-			set.Shrink(c.base, c.sets, parent, c.base.Length())
+			set.Shrink(c.base, c.sets, parent, c.base.Length(), c.MetricSize())
 		} else if added && set.Incr(child, abelian).Count() == delegation {
 			areas[child] = Delegation{}
 		}
@@ -405,7 +415,7 @@ func (c *Collection) Complete(root string) Ownership {
 				c.sets[parent] = NewSet()
 			}
 
-			c.sets[parent].Put(previous, c.sets[previous].Abelian())
+			c.sets[parent].Put(previous, c.sets[previous].Abelian(c.metricSize))
 
 			if _, exist := areas[parent]; !exist {
 				areas[parent] = Delegation{}
