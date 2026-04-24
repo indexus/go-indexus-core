@@ -288,10 +288,6 @@ func (c *Collection) Add(location string, id string, metrics []float64, delegati
 			continue
 		}
 
-		if added && set.list[child] == nil {
-			fmt.Println("HERE")
-		}
-
 		if !added && set.Add(entry, abelian, c.base.Length()) {
 			set.Shrink(c.base, c.sets, parent, c.base.Length())
 		} else if added && set.Incr(child, abelian).Count() == delegation {
