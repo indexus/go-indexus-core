@@ -86,7 +86,22 @@ func (s *Storage) Save(commands []string) error {
 }
 
 func (s *Storage) Load() ([]string, error) {
-	return nil, fmt.Errorf("error when loading the file resetting the in any case")
+	path := fmt.Sprintf("%s.snapshot", s.filename)
+
+	file, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("error opening snapshot file %q: %w", path, err)
+	}
+	defer file.Close()
+
+	var commands []string
+	if err := gob.NewDecoder(file).Decode(&commands); err != nil {
+		return nil, fmt.Errorf("error decoding snapshot %q: %w", path, err)
+	}
+	return commands, nil
 }
 
 func (s *Storage) Append(log string) {

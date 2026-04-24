@@ -71,7 +71,11 @@ func (n *Node) Restore() error {
 			if err != nil {
 				continue
 			}
-			n.acknowledged.Insert(0, encoding.BASE64.NewID(), n.newContact(name, mIps, port))
+			id, err := encoding.BASE64.Decode(name)
+			if err != nil {
+				continue
+			}
+			n.acknowledged.Insert(0, id, n.newContact(name, mIps, port))
 		case "collection":
 			collection = arr[1]
 		case "ownership":
