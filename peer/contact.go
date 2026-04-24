@@ -12,8 +12,18 @@ import (
 	"github.com/indexus/go-indexus-core/encoding"
 )
 
+// HttpClient is the default client used for short P2P RPCs (Ping,
+// Neighbors, Random, Get, New). The 2-second default is conservative
+// enough to absorb WAN jitter while still failing peers fast.
 var HttpClient = &http.Client{
-	Timeout: 200 * time.Millisecond,
+	Timeout: 2 * time.Second,
+}
+
+// TransferClient is used for /transfer, which can carry up to
+// `delegation` items in a single batch and therefore needs a much
+// larger budget than the discovery RPCs.
+var TransferClient = &http.Client{
+	Timeout: 30 * time.Second,
 }
 
 type Contact struct {
@@ -264,7 +274,7 @@ func (c *Contact) Transfer(origin domain.Peer, key domain.Key, items []*domain.I
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := HttpClient.Do(req)
+	resp, err := TransferClient.Do(req)
 	if err != nil {
 		return err
 	}
