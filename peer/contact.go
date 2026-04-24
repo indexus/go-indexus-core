@@ -18,6 +18,7 @@ var HttpClient = &http.Client{
 
 type Contact struct {
 	name string
+	id   []byte
 	ips  map[string]any
 	ip   string
 	port int
@@ -55,23 +56,22 @@ func (c *Contact) UnmarshalJSON(data []byte) error {
 	c.ips = aux.IPs
 	c.ip = aux.IP
 	c.port = aux.Port
+	c.id, _ = encoding.BASE64.Decode(aux.Name)
 	return nil
 }
 
 func NewContact(name string, ips map[string]any, port int) domain.Contact {
+	id, _ := encoding.BASE64.Decode(name)
 	return &Contact{
 		name: name,
+		id:   id,
 		ips:  ips,
 		port: port,
 	}
 }
 
 func (c *Contact) ID() []byte {
-	id, err := encoding.BASE64.Decode(c.name)
-	if err != nil {
-		panic(err)
-	}
-	return id
+	return c.id
 }
 
 func (c *Contact) Name() string {
