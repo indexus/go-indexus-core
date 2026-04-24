@@ -141,7 +141,7 @@ func (c *Contact) ping(origin domain.Contact, ip string) (domain.Contact, error)
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, err
+		return nil, fmt.Errorf("ping %s: unexpected status %d", url, resp.StatusCode)
 	}
 
 	var respBody struct {

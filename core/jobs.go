@@ -29,7 +29,7 @@ func (n *Node) Observe() error {
 		if node != nil {
 			toRegister = append(toRegister, node)
 		}
-		if err != nil || node.Name() != contact.Name() {
+		if err != nil || node == nil || node.Name() != contact.Name() {
 			toIgnore = append(toIgnore, contact)
 		}
 	}
