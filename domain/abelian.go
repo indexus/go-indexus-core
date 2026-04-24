@@ -66,12 +66,18 @@ func (a *Abelian) Clone() *Abelian {
 	copy(metrics, a.metrics)
 	return &Abelian{
 		count:   a.count,
-		metrics: a.metrics,
+		metrics: metrics,
 	}
 }
 
 func (a *Abelian) IsEqual(b *Abelian) bool {
+	if b == nil {
+		return false
+	}
 	if a.count != b.count {
+		return false
+	}
+	if len(a.metrics) != len(b.metrics) {
 		return false
 	}
 	for idx := range a.metrics {
