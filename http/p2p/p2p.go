@@ -300,7 +300,7 @@ func (h *Handler) GetMultiple(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Potentially multiple locations (comma-separated)
-	locationsParam := r.URL.Query().Get("locations")
+	locationsParam := r.URL.Query().Get("location")
 	if locationsParam == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "location parameter is required"})
 		return
