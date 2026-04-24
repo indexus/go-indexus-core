@@ -335,7 +335,9 @@ func (c *Collection) Update(sublocation string, abelian *Abelian) {
 	set.Put(sublocation, abelian)
 
 	delta := abelian.Clone()
-	delta.Substract(previous)
+	if previous != nil {
+		delta.Substract(previous)
+	}
 
 	parent, child := location, sublocation
 	for {
