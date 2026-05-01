@@ -6,18 +6,18 @@ import (
 
 type Queue[T any] struct {
 	cursor int
-	mu     *sync.Mutex
+	mu     sync.Mutex
 	cond   *sync.Cond
 	data   []T
 }
 
 func NewQueue[T any]() *Queue[T] {
-	mu := &sync.Mutex{}
-	return &Queue[T]{
-		mu:   mu,
-		cond: sync.NewCond(mu),
+	q := &Queue[T]{
 		data: make([]T, 0),
 	}
+	// cond holds a *Locker pointing into q.mu; *Queue must never be copied.
+	q.cond = sync.NewCond(&q.mu)
+	return q
 }
 
 func (q *Queue[T]) Add(e T) {

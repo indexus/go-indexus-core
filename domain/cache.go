@@ -6,13 +6,12 @@ import (
 )
 
 type Cache struct {
-	mu          *sync.Mutex
+	mu          sync.Mutex
 	collections map[string]map[string]*Set
 }
 
 func NewCache() *Cache {
 	return &Cache{
-		mu:          &sync.Mutex{},
 		collections: make(map[string]map[string]*Set),
 	}
 }

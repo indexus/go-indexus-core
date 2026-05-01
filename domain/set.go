@@ -8,14 +8,13 @@ import (
 type Set struct {
 	list map[string]*Abelian
 	last time.Time
-	mu   *sync.Mutex
+	mu   sync.Mutex
 }
 
 func NewSet() *Set {
 	return &Set{
 		list: make(map[string]*Abelian),
 		last: time.Now(),
-		mu:   &sync.Mutex{},
 	}
 }
 
@@ -83,6 +82,17 @@ func (s *Set) Reset() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	s.last = time.Now()
+}
+
+// SetList replaces the set's internal list with the provided map.
+// Used exclusively during cold restore from a snapshot header so that
+// the owner-level aggregates are available without loading item data.
+func (s *Set) SetList(list map[string]*Abelian) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.list = list
 	s.last = time.Now()
 }
 

@@ -54,25 +54,40 @@ func TestShardSnapshotAppendLoadRoundTrip(t *testing.T) {
 	s := NewStorage(filepath.Join(dir, "archive"), root)
 
 	key := domain.Key{Collection: "myColl", Location: "@"}
-	lines := []string{
-		"myColl|@|id1|1.000000:2.000000",
-		"myColl|ab|id2|3.000000",
+	header := map[string]*domain.Abelian{
+		"myColl|@|id1|1:2": domain.NewAbelian(1, []float64{1, 2}),
 	}
-	if err := s.SnapshotShard(key, lines); err != nil {
+	items := []string{
+		"myColl|@|id1|1:2",
+		"myColl|ab|id2|3",
+	}
+	if err := s.SnapshotShard(key, header, items); err != nil {
 		t.Fatalf("SnapshotShard: %v", err)
 	}
-	s.AppendShard(key, "myColl|ab|id3|0.000000")
+	s.AppendShard(key, "myColl|ab|id3|0")
 
-	snap, logs, err := s.LoadShard(key)
+	gotHeader, gotItems, gotLogs, err := s.LoadShard(key)
 	if err != nil {
 		t.Fatalf("LoadShard: %v", err)
 	}
-	if !reflect.DeepEqual(snap, lines) {
-		t.Fatalf("snapshot mismatch got=%v want=%v", snap, lines)
+	if !reflect.DeepEqual(gotItems, items) {
+		t.Fatalf("items mismatch got=%v want=%v", gotItems, items)
 	}
-	wantLogs := []string{"myColl|ab|id3|0.000000"}
-	if !reflect.DeepEqual(logs, wantLogs) {
-		t.Fatalf("logs mismatch got=%v want=%v", logs, wantLogs)
+	wantLogs := []string{"myColl|ab|id3|0"}
+	if !reflect.DeepEqual(gotLogs, wantLogs) {
+		t.Fatalf("logs mismatch got=%v want=%v", gotLogs, wantLogs)
+	}
+	if len(gotHeader) != len(header) {
+		t.Fatalf("header length mismatch got=%d want=%d", len(gotHeader), len(header))
+	}
+
+	// Verify LoadShardHeader returns only header without items.
+	hdrOnly, err := s.LoadShardHeader(key)
+	if err != nil {
+		t.Fatalf("LoadShardHeader: %v", err)
+	}
+	if len(hdrOnly) != len(header) {
+		t.Fatalf("LoadShardHeader length mismatch got=%d want=%d", len(hdrOnly), len(header))
 	}
 
 	keys, err := s.Shards()
@@ -90,19 +105,52 @@ func TestSnapshotShardTruncatesLog(t *testing.T) {
 	s := NewStorage(filepath.Join(dir, "archive"), root)
 	key := domain.Key{Collection: "c", Location: "@"}
 
-	s.AppendShard(key, "c|@|a|1.000000")
-	if err := s.SnapshotShard(key, []string{"c|@|a|1.000000"}); err != nil {
+	s.AppendShard(key, "c|@|a|1")
+	if err := s.SnapshotShard(key, nil, []string{"c|@|a|1"}); err != nil {
 		t.Fatal(err)
 	}
-	snap, logs, err := s.LoadShard(key)
+	_, items, logs, err := s.LoadShard(key)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(logs) != 0 {
 		t.Fatalf("log should be empty after snapshot, got %v", logs)
 	}
-	if len(snap) != 1 {
-		t.Fatalf("snapshot want 1 line got %v", snap)
+	if len(items) != 1 {
+		t.Fatalf("snapshot want 1 item got %v", items)
+	}
+}
+
+// TestShardHeaderRoundTrip verifies that a header with Abelian values
+// survives a gob encode / decode cycle with full precision.
+func TestShardHeaderRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	s := NewStorage(filepath.Join(dir, "archive"), filepath.Join(dir, "data"))
+
+	key := domain.Key{Collection: "col", Location: "1uA"}
+	header := map[string]*domain.Abelian{
+		"1uAx": domain.NewAbelian(42, []float64{1.23456789, 9.87654321}),
+		"1uAy": domain.NewAbelian(7, nil),
+	}
+	if err := s.SnapshotShard(key, header, nil); err != nil {
+		t.Fatalf("SnapshotShard: %v", err)
+	}
+
+	got, err := s.LoadShardHeader(key)
+	if err != nil {
+		t.Fatalf("LoadShardHeader: %v", err)
+	}
+	if len(got) != len(header) {
+		t.Fatalf("header length mismatch got=%d want=%d", len(got), len(header))
+	}
+	for k, wantA := range header {
+		gotA, ok := got[k]
+		if !ok {
+			t.Fatalf("missing key %q in header", k)
+		}
+		if !wantA.IsEqual(gotA) {
+			t.Fatalf("abelian mismatch for %q: got=%v want=%v", k, gotA, wantA)
+		}
 	}
 }
 
@@ -118,28 +166,28 @@ func TestShardCaseInsensitiveFSNoCollision(t *testing.T) {
 	upper := domain.Key{Collection: "DENjYsMTAyLDE2ME", Location: "1uA"}
 	lower := domain.Key{Collection: "DENjYsMTAyLDE2ME", Location: "1ua"}
 
-	upperLines := []string{"DENjYsMTAyLDE2ME|1uAxxx|idU|1"}
-	lowerLines := []string{"DENjYsMTAyLDE2ME|1uaxxx|idL|2"}
-	if err := s.SnapshotShard(upper, upperLines); err != nil {
+	upperItems := []string{"DENjYsMTAyLDE2ME|1uAxxx|idU|1"}
+	lowerItems := []string{"DENjYsMTAyLDE2ME|1uaxxx|idL|2"}
+	if err := s.SnapshotShard(upper, nil, upperItems); err != nil {
 		t.Fatalf("SnapshotShard upper: %v", err)
 	}
-	if err := s.SnapshotShard(lower, lowerLines); err != nil {
+	if err := s.SnapshotShard(lower, nil, lowerItems); err != nil {
 		t.Fatalf("SnapshotShard lower: %v", err)
 	}
 
-	gotUpper, _, err := s.LoadShard(upper)
+	_, gotUpperItems, _, err := s.LoadShard(upper)
 	if err != nil {
 		t.Fatalf("LoadShard upper: %v", err)
 	}
-	if !reflect.DeepEqual(gotUpper, upperLines) {
-		t.Fatalf("upper shard corrupted by case collision: got=%v want=%v", gotUpper, upperLines)
+	if !reflect.DeepEqual(gotUpperItems, upperItems) {
+		t.Fatalf("upper shard corrupted by case collision: got=%v want=%v", gotUpperItems, upperItems)
 	}
-	gotLower, _, err := s.LoadShard(lower)
+	_, gotLowerItems, _, err := s.LoadShard(lower)
 	if err != nil {
 		t.Fatalf("LoadShard lower: %v", err)
 	}
-	if !reflect.DeepEqual(gotLower, lowerLines) {
-		t.Fatalf("lower shard corrupted by case collision: got=%v want=%v", gotLower, lowerLines)
+	if !reflect.DeepEqual(gotLowerItems, lowerItems) {
+		t.Fatalf("lower shard corrupted by case collision: got=%v want=%v", gotLowerItems, lowerItems)
 	}
 
 	keys, err := s.Shards()
@@ -165,10 +213,10 @@ func TestDropShardArchivesFiles(t *testing.T) {
 	s := NewStorage(archive, root)
 	key := domain.Key{Collection: "c", Location: "@"}
 
-	if err := s.SnapshotShard(key, []string{"c|@|x|0.000000"}); err != nil {
+	if err := s.SnapshotShard(key, nil, []string{"c|@|x|0"}); err != nil {
 		t.Fatal(err)
 	}
-	s.AppendShard(key, "c|@|y|1.000000")
+	s.AppendShard(key, "c|@|y|1")
 
 	if err := s.DropShard(key); err != nil {
 		t.Fatalf("DropShard: %v", err)

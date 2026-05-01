@@ -48,6 +48,7 @@ type Storage struct {
 
 	mu          sync.Mutex
 	shardWrites map[string]*shardWriter // key: collection\x00location
+	flushEvery  time.Duration           // background flush interval; 0 disables
 	quit        chan struct{}
 	wg          sync.WaitGroup
 }
@@ -57,11 +58,18 @@ type shardWriter struct {
 	writer *bufio.Writer
 }
 
+// flushDefaultInterval bounds how long an item written via AppendShard can
+// stay in the bufio buffer before being durably written to the OS page cache.
+// Trade-off: larger = fewer syscalls / better throughput; smaller = lower
+// data-loss window on hard kill.
+const flushDefaultInterval = 200 * time.Millisecond
+
 func NewStorage(archiveDir, root string) *Storage {
 	return &Storage{
 		archiveDir:  archiveDir,
 		root:        root,
 		shardWrites: make(map[string]*shardWriter),
+		flushEvery:  flushDefaultInterval,
 		quit:        make(chan struct{}),
 	}
 }
@@ -242,7 +250,17 @@ func (s *Storage) Shards() ([]domain.Key, error) {
 	return out, nil
 }
 
-func readSnapshotFile(path string) ([]string, error) {
+// ShardSnapshot is the on-disk format for a shard .snapshot file.
+// Header holds the Set.list at the owner level (map from child key or
+// "location:id" to *Abelian), enabling fast cold-restore of aggregates
+// without replaying every item. Items holds the flat Item.Content() lines
+// so that a full reload can rebuild the deep-set hierarchy.
+type ShardSnapshot struct {
+	Header map[string]*domain.Abelian
+	Items  []string
+}
+
+func readShardSnapshot(path string) (*ShardSnapshot, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -251,11 +269,11 @@ func readSnapshotFile(path string) ([]string, error) {
 		return nil, err
 	}
 	defer f.Close()
-	var lines []string
-	if err := gob.NewDecoder(f).Decode(&lines); err != nil {
+	var ss ShardSnapshot
+	if err := gob.NewDecoder(f).Decode(&ss); err != nil {
 		return nil, err
 	}
-	return lines, nil
+	return &ss, nil
 }
 
 func readLogLines(path string) ([]string, error) {
@@ -275,22 +293,41 @@ func readLogLines(path string) ([]string, error) {
 	return lines, sc.Err()
 }
 
-func (s *Storage) LoadShard(k domain.Key) (snapshot []string, logs []string, err error) {
+func (s *Storage) LoadShardHeader(k domain.Key) (map[string]*domain.Abelian, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	snapPath := s.shardSnapshotPath(k)
-	logPath := s.shardLogPath(k)
+	ss, err := readShardSnapshot(s.shardSnapshotPath(k))
+	if err != nil {
+		return nil, fmt.Errorf("load shard header %v: %w", k, err)
+	}
+	if ss == nil {
+		return nil, nil
+	}
+	return ss.Header, nil
+}
 
-	snapshot, err = readSnapshotFile(snapPath)
+func (s *Storage) LoadShard(k domain.Key) (header map[string]*domain.Abelian, items []string, logs []string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Make sure any in-flight buffered WAL writes for this shard are visible
+	// to the reader; otherwise EnsureLoaded would replay a stale tail.
+	s.flushShardLocked(k)
+
+	ss, err := readShardSnapshot(s.shardSnapshotPath(k))
 	if err != nil {
-		return nil, nil, fmt.Errorf("load shard snapshot %v: %w", k, err)
+		return nil, nil, nil, fmt.Errorf("load shard snapshot %v: %w", k, err)
 	}
-	logs, err = readLogLines(logPath)
+	if ss != nil {
+		header = ss.Header
+		items = ss.Items
+	}
+	logs, err = readLogLines(s.shardLogPath(k))
 	if err != nil {
-		return nil, nil, fmt.Errorf("load shard log %v: %w", k, err)
+		return nil, nil, nil, fmt.Errorf("load shard log %v: %w", k, err)
 	}
-	return snapshot, logs, nil
+	return header, items, logs, nil
 }
 
 func (s *Storage) closeShardWriterLocked(sk string) {
@@ -321,6 +358,11 @@ func (s *Storage) getShardWriterLocked(k domain.Key) (*shardWriter, error) {
 	return sw, nil
 }
 
+// AppendShard writes a WAL line to the shard's bufio buffer. The buffer is
+// flushed to the OS by either: the periodic flusher (Start), the next read
+// of the same shard (LoadShard / LoadShardHeader), or a snapshot/drop/close.
+// We deliberately do NOT flush per-line — that turned every item insert into
+// a syscall and saturated I/O under load.
 func (s *Storage) AppendShard(k domain.Key, line string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -330,16 +372,34 @@ func (s *Storage) AppendShard(k domain.Key, line string) {
 		fmt.Printf("storage AppendShard %v: %v\n", k, err)
 		return
 	}
-	if _, err := sw.writer.WriteString(line + "\n"); err != nil {
+	if _, err := sw.writer.WriteString(line); err != nil {
 		fmt.Printf("storage AppendShard write %v: %v\n", k, err)
 		return
 	}
-	if err := sw.writer.Flush(); err != nil {
-		fmt.Printf("storage AppendShard flush %v: %v\n", k, err)
+	if err := sw.writer.WriteByte('\n'); err != nil {
+		fmt.Printf("storage AppendShard write %v: %v\n", k, err)
 	}
 }
 
-func (s *Storage) SnapshotShard(k domain.Key, items []string) error {
+// flushShardLocked flushes any buffered WAL data for the given shard so that
+// a subsequent reader observes a consistent view. Called by load helpers.
+func (s *Storage) flushShardLocked(k domain.Key) {
+	sw, ok := s.shardWrites[shardMapKey(k)]
+	if !ok {
+		return
+	}
+	_ = sw.writer.Flush()
+}
+
+// flushAllLocked flushes every open shard writer; used by the periodic
+// flusher to bound the in-buffer data-loss window.
+func (s *Storage) flushAllLocked() {
+	for _, sw := range s.shardWrites {
+		_ = sw.writer.Flush()
+	}
+}
+
+func (s *Storage) SnapshotShard(k domain.Key, header map[string]*domain.Abelian, items []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -347,13 +407,14 @@ func (s *Storage) SnapshotShard(k domain.Key, items []string) error {
 		return err
 	}
 
+	ss := ShardSnapshot{Header: header, Items: items}
 	snapPath := s.shardSnapshotPath(k)
 	tmp := snapPath + ".tmp"
 	f, err := os.Create(tmp)
 	if err != nil {
 		return fmt.Errorf("snapshot shard create temp: %w", err)
 	}
-	if err := gob.NewEncoder(f).Encode(&items); err != nil {
+	if err := gob.NewEncoder(f).Encode(&ss); err != nil {
 		_ = f.Close()
 		_ = os.Remove(tmp)
 		return fmt.Errorf("snapshot shard encode: %w", err)
@@ -422,23 +483,37 @@ func moveFileIfExists(src, dst string) error {
 	return os.Rename(src, dst)
 }
 
-// Start blocks until Close; on shutdown it flushes and closes open shard log writers.
+// Start runs the periodic flusher and blocks until Close. On shutdown it
+// flushes and closes every open shard log writer.
 func (s *Storage) Start() error {
 	s.wg.Add(1)
 	defer s.wg.Done()
 
-	<-s.quit
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	for sk := range s.shardWrites {
-		sw := s.shardWrites[sk]
-		_ = sw.writer.Flush()
-		_ = sw.file.Close()
-		delete(s.shardWrites, sk)
+	var ticker *time.Ticker
+	var tick <-chan time.Time
+	if s.flushEvery > 0 {
+		ticker = time.NewTicker(s.flushEvery)
+		defer ticker.Stop()
+		tick = ticker.C
 	}
-	return nil
+
+	for {
+		select {
+		case <-tick:
+			s.mu.Lock()
+			s.flushAllLocked()
+			s.mu.Unlock()
+		case <-s.quit:
+			s.mu.Lock()
+			for sk, sw := range s.shardWrites {
+				_ = sw.writer.Flush()
+				_ = sw.file.Close()
+				delete(s.shardWrites, sk)
+			}
+			s.mu.Unlock()
+			return nil
+		}
+	}
 }
 
 func (s *Storage) Close() {

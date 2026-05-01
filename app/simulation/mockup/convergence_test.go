@@ -36,7 +36,7 @@ func newConvergenceNode(t *testing.T, delegation int, bootstraps ...*core.Node) 
 		t.Fatalf("NewSettings: %v", err)
 	}
 
-	node, err := core.NewNode(settings, NewContact, contacts, NewStorage())
+	node, err := core.NewNode(settings, NewContact, contacts, NewStorage(), nil)
 	if err != nil {
 		t.Fatalf("NewNode: %v", err)
 	}

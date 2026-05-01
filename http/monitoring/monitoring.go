@@ -16,6 +16,7 @@ type Service interface {
 	Routing() ([]domain.Contact, error)
 	Ownership() (map[string]map[string]map[string]any, error)
 	Queue() int
+	CacheStats() map[string]int64
 }
 
 type Handler struct {
@@ -42,6 +43,7 @@ func (h *Handler) Serve(lis net.Listener) error {
 	mux.HandleFunc("/routing", h.Routing)
 	mux.HandleFunc("/ownership", h.Ownership)
 	mux.HandleFunc("/queue", h.Queue)
+	mux.HandleFunc("/cache", h.Cache)
 
 	s := &http.Server{Handler: mux}
 
@@ -135,4 +137,9 @@ func (h *Handler) Queue(w http.ResponseWriter, r *http.Request) {
 	}{
 		h.Service.Queue(),
 	})
+}
+
+// Cache handles the /cache endpoint — returns shard LRU cache statistics.
+func (h *Handler) Cache(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, h.Service.CacheStats())
 }

@@ -2,6 +2,7 @@ package core
 
 import (
 	"log"
+	"time"
 
 	"github.com/indexus/go-indexus-core/domain"
 )
@@ -111,11 +112,44 @@ func (n *Node) Refresh() error {
 		}
 	}
 
-	if err := n.storage.SaveCluster(n.Snapshot()); err != nil {
+	if _, err := n.SaveClusterIfDirty(); err != nil {
 		return err
 	}
-	if err := n.SnapshotShards(); err != nil {
-		return err
+
+	// Unified shard-snapshot + LRU-eviction pass. PlanWork returns disjoint
+	// sets: toSnapshot stays in RAM, toEvict gets snapshotted (if dirty)
+	// then removed from RAM.
+	toSnapshot, toEvict := n.shards.PlanWork(time.Now())
+
+	snapshot := func(key domain.Key, collection *domain.Collection) {
+		header, items := extractShard(collection, key.Location)
+		if header == nil && len(items) == 0 {
+			return
+		}
+		if err := n.storage.SnapshotShard(key, header, items); err == nil {
+			n.shards.MarkSnapshotted(key)
+		}
+	}
+
+	for _, key := range toSnapshot {
+		if collection, ok := n.collections.Get(key.Collection); ok {
+			snapshot(key, collection)
+		}
+	}
+
+	for _, key := range toEvict {
+		collection, ok := n.collections.Get(key.Collection)
+		if !ok {
+			n.shards.MarkEvicted(key)
+			continue
+		}
+		// Race-window cover: PlanWork may have skipped the dirty bit
+		// flip between its snapshot and our iteration here.
+		if n.shards.IsDirty(key) {
+			snapshot(key, collection)
+		}
+		collection.EvictShard(key.Location)
+		n.shards.MarkEvicted(key)
 	}
 
 	if err := n.clean(); err != nil {
@@ -171,13 +205,11 @@ func (n *Node) Update() error {
 }
 
 func (n *Node) Feed() error {
+	// queue.Consume blocks via sync.Cond until an item is available, so the
+	// loop never busy-spins.
 	for {
-		element, exist := n.queue.Consume()
-		if !exist {
-			continue
-		}
-		err := n.insert(element.item, element.root, element.current)
-		if err != nil {
+		element, _ := n.queue.Consume()
+		if err := n.insert(element.item, element.root, element.current); err != nil {
 			return err
 		}
 	}
