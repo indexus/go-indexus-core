@@ -89,15 +89,31 @@ func (a *Abelian) IsEqual(b *Abelian) bool {
 }
 
 func (a *Abelian) Sum(delta *Abelian) {
+	if delta == nil {
+		return
+	}
 	a.count += delta.count
-	for idx := range a.metrics {
-		a.metrics[idx] += delta.metrics[idx]
+	if len(delta.metrics) > len(a.metrics) {
+		grown := make([]float64, len(delta.metrics))
+		copy(grown, a.metrics)
+		a.metrics = grown
+	}
+	for idx, value := range delta.metrics {
+		a.metrics[idx] += value
 	}
 }
 
 func (a *Abelian) Substract(delta *Abelian) {
+	if delta == nil {
+		return
+	}
 	a.count -= delta.count
-	for idx := range a.metrics {
-		a.metrics[idx] -= delta.metrics[idx]
+	if len(delta.metrics) > len(a.metrics) {
+		grown := make([]float64, len(delta.metrics))
+		copy(grown, a.metrics)
+		a.metrics = grown
+	}
+	for idx, value := range delta.metrics {
+		a.metrics[idx] -= value
 	}
 }

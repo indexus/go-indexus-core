@@ -223,6 +223,16 @@ func (bst *BST[N]) Insert(idx int, id []byte, node N) {
 	bst.tree.Insert(idx, id, node)
 }
 
+// Reset clears the tree contents under the BST mutex. Use this instead of
+// reassigning the *BST pointer concurrently with readers; readers hold the
+// same mu, so they observe a consistent (empty) tree atomically.
+func (bst *BST[N]) Reset() {
+	bst.mu.Lock()
+	defer bst.mu.Unlock()
+
+	bst.tree = &tree[N]{}
+}
+
 func (bst *BST[N]) Update(idx int, id []byte, process func(int, []byte, N)) {
 	bst.mu.Lock()
 	defer bst.mu.Unlock()

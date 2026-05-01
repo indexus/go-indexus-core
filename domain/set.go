@@ -147,8 +147,16 @@ func (s *Set) abelian() *Abelian {
 }
 
 func (s *Set) incr(value string, delta *Abelian) *Abelian {
-	s.list[value].Sum(delta)
-	return s.list[value]
+	if delta == nil {
+		return s.list[value]
+	}
+	current, ok := s.list[value]
+	if !ok || current == nil {
+		s.list[value] = delta.Clone()
+		return s.list[value]
+	}
+	current.Sum(delta)
+	return current
 }
 
 func (s *Set) shrink(base Encoder, sets map[string]*Set, key string, max int) {
@@ -166,6 +174,16 @@ func (s *Set) shrink(base Encoder, sets map[string]*Set, key string, max int) {
 	}
 
 	for current, abelian := range s.list {
+		if abelian == nil {
+			continue
+		}
+
+		// Defensive guard: old/corrupted snapshots can contain unexpected keys
+		// that are not deeper than the current parent precision.
+		if len(current) <= precision {
+			list[current] = abelian
+			continue
+		}
 
 		if abelian.Count() > 1 {
 			list[current] = abelian
@@ -175,12 +193,19 @@ func (s *Set) shrink(base Encoder, sets map[string]*Set, key string, max int) {
 		child = current[:precision+1]
 
 		if set, ok1 := sets[child]; ok1 {
+			// Restore/shrink can encounter an already materialized child set
+			// before this loop has initialized list[child] for the new parent
+			// view; avoid nil dereference and recompute aggregate from child set.
+			if set == nil {
+				set = NewSet()
+				sets[child] = set
+			}
 			full := set.add(current, abelian, max)
-			list[child].Sum(abelian)
 
 			if full {
 				set.shrink(base, sets, child, max)
 			}
+			list[child] = set.Abelian()
 		} else if first, ok2 := exist[child]; ok2 {
 			set := NewSet()
 			set.add(first.key, first.abelian, max)

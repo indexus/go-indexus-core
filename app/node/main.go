@@ -91,8 +91,8 @@ func parseFlags() Config {
 	nameFlagPtr := flag.String("name", name, "Name of the node")
 	monitoringPortFlagPtr := flag.Int("monitoringPort", 19000, "Port number of the node for the monitoring service")
 	p2pPortFlagPtr := flag.Int("p2pPort", 21000, "Port number of the node for the peer to peer network")
-	storageFlagPtr := flag.String("storage", ".data/backup", "Path to the backup file")
-	archiveStorageDirFlagPtr := flag.String("archive", ".data/archive", "Path to the backup file")
+	storageFlagPtr := flag.String("storage", ".data/backup", "Directory for cluster.snapshot and shards/ (empty = in-memory mock)")
+	archiveStorageDirFlagPtr := flag.String("archive", ".data/archive", "Directory for archived or dropped shard data")
 	sslStorageFlagPtr := flag.String("sslStorage", "", "Path to the ssl certificates")
 
 	flag.Parse()
