@@ -274,17 +274,19 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		list = set.List()
 	}
 
-	var body = struct {
-		Contact Contact                    `json:"contact"`
+	body := struct {
+		Contact *Contact                   `json:"contact"`
 		Set     map[string]*domain.Abelian `json:"set"`
 	}{
-		Contact: Contact{
+		Set: list,
+	}
+	if contact != nil {
+		body.Contact = &Contact{
 			Name: contact.Name(),
 			IPs:  contact.IPs(),
 			Port: contact.Port(),
 			IP:   contact.IP(),
-		},
-		Set: list,
+		}
 	}
 
 	writeJSON(w, http.StatusOK, body)
@@ -310,19 +312,29 @@ func (h *Handler) GetMultiple(w http.ResponseWriter, r *http.Request) {
 	locations := strings.Split(locationsParam, ",")
 
 	precision := 6
+	metricInt := func(a *domain.Abelian, idx int, mul float64) int {
+		if a == nil {
+			return 0
+		}
+		metrics := a.Metrics()
+		if idx < 0 || idx >= len(metrics) {
+			return 0
+		}
+		return int(mul * metrics[idx])
+	}
 
 	properties := [](func(*domain.Abelian) int){
 		func(a *domain.Abelian) int {
 			return a.Count()
 		},
 		func(a *domain.Abelian) int {
-			return int(a.Metrics()[2])
+			return metricInt(a, 2, 1)
 		},
 		func(a *domain.Abelian) int {
-			return int(1_000_000 * a.Metrics()[3])
+			return metricInt(a, 3, 1_000_000)
 		},
 		func(a *domain.Abelian) int {
-			return int(1_000_000 * a.Metrics()[4])
+			return metricInt(a, 4, 1_000_000)
 		},
 	}
 

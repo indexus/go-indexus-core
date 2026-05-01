@@ -1,5 +1,7 @@
 package mockup
 
+import "github.com/indexus/go-indexus-core/domain"
+
 type Storage struct {
 }
 
@@ -11,28 +13,36 @@ func NewStorage() *Storage {
 }
 
 func (s *Storage) Exist() bool {
-	return true
+	return false
 }
 
 func (s *Storage) Reset() error {
 	return nil
 }
 
-func (s *Storage) Save(commands []string) error {
+func (s *Storage) SaveCluster([]string) error {
 	return nil
 }
 
-func (s *Storage) Load() ([]string, error) {
-	return []string{}, nil
+func (s *Storage) LoadCluster() ([]string, error) {
+	return nil, nil
 }
 
-func (s *Storage) Append(log string) {
+func (s *Storage) Shards() ([]domain.Key, error) {
+	return nil, nil
 }
 
-func (s *Storage) Stream(start int) <-chan string {
-	stream := make(chan string)
-	go func() {
-		defer close(stream)
-	}()
-	return stream
+func (s *Storage) LoadShard(domain.Key) ([]string, []string, error) {
+	return nil, nil, nil
+}
+
+func (s *Storage) SnapshotShard(domain.Key, []string) error {
+	return nil
+}
+
+func (s *Storage) AppendShard(domain.Key, string) {
+}
+
+func (s *Storage) DropShard(domain.Key) error {
+	return nil
 }

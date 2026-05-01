@@ -92,13 +92,80 @@ func (c *Collection) Allowing(location string) bool {
 	return false
 }
 
+// OwnerOf returns the ownership key (prefix in c.owned) under which location
+// is stored when Allowing(location) is true. Same walk as Allowing.
+func (c *Collection) OwnerOf(location string) (owner string, ok bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for child, parent := "", location; parent != ""; child, parent = parent, c.base.Parent(parent) {
+		if delegation, owned := c.owned[parent]; owned {
+			_, delegated := delegation[child]
+			if !delegated {
+				return parent, true
+			}
+			return "", false
+		}
+	}
+	return "", false
+}
+
 func (c *Collection) Browse(processOwnership func(string), processDelegation func(string, string)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	for ownership, delegations := range c.owned {
 		processOwnership(ownership)
 		for delegation := range delegations {
 			processDelegation(ownership, delegation)
 		}
+	}
+}
+
+// RestoreOwned ensures location is registered in c.owned (with empty delegation
+// if missing), creates a Set at location if missing, and materialises the
+// parent chain of sets up to the base root so traversals and aggregations work
+// after restore. Unlike Add/Complete, it never registers intermediate parents
+// as owned: each parent's ownership is governed exclusively by its own
+// `ownership|...` snapshot command. It also does NOT eagerly aggregate child
+// abelians into the parent (the child sets are still empty at this point);
+// aggregates are populated lazily by set.Incr as items are replayed.
+func (c *Collection) RestoreOwned(location string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if _, exist := c.sets[location]; !exist {
+		c.sets[location] = NewSet()
+	}
+	if _, exist := c.owned[location]; !exist {
+		c.owned[location] = Delegation{}
+	}
+
+	for prev := location; ; {
+		parent := c.base.Parent(prev)
+		if parent == "" {
+			return
+		}
+		if _, exist := c.sets[parent]; !exist {
+			c.sets[parent] = NewSet()
+		}
+		prev = parent
+	}
+}
+
+// AppendDelegation records a structural delegation from `child`'s base parent
+// to `child`. Non-destructive: it never removes anything from c.owned. Used
+// only during snapshot replay to rebuild c.owned[parent][child] = nil pairs.
+func (c *Collection) AppendDelegation(child string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	parent := c.base.Parent(child)
+	if parent == "" {
+		return
+	}
+	if d, ok := c.owned[parent]; ok {
+		d[child] = nil
 	}
 }
 
@@ -166,6 +233,9 @@ func encodeBits(values []int, bitsPerValue int) []byte {
 }
 
 func (c *Collection) GetMultiple(locations []string, precision int, properties []func(*Abelian) int) ([]byte, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	var result []byte
 
 	type t struct {
@@ -195,6 +265,7 @@ func (c *Collection) GetMultiple(locations []string, precision int, properties [
 			continue
 		}
 
+		set.mu.Lock()
 		for key, value := range set.list {
 			idxColon := strings.IndexByte(key, ':')
 			if idxColon >= 0 {
@@ -214,6 +285,7 @@ func (c *Collection) GetMultiple(locations []string, precision int, properties [
 				}
 			}
 		}
+		set.mu.Unlock()
 	}
 
 	bitsNeeded := func(n int) int {
@@ -255,7 +327,11 @@ func (c *Collection) List() map[string]*Set {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	return c.sets
+	out := make(map[string]*Set, len(c.sets))
+	for k, v := range c.sets {
+		out[k] = v
+	}
+	return out
 }
 
 func (c *Collection) Add(location string, id string, metrics []float64, delegation int) Ownership {
@@ -397,11 +473,15 @@ func (c *Collection) Delegate(location string) ([]*Item, bool) {
 	defer c.mu.Unlock()
 
 	items := make([]*Item, 0)
-	c.traverse(location, func(set string, abelian *Abelian) {
-		delete(c.sets, set)
-	}, func(parent, location, id string, abelian *Abelian) {
-		items = append(items, &Item{Collection: c.name, Location: location, Id: id, Metrics: abelian.Metrics()})
-	})
+	// Restore replays delegation markers before shard items may have created
+	// this location's *Set; skip traverse instead of panicking on nil.
+	if set, ok := c.sets[location]; ok && set != nil {
+		c.traverse(location, func(set string, abelian *Abelian) {
+			delete(c.sets, set)
+		}, func(parent, location, id string, abelian *Abelian) {
+			items = append(items, &Item{Collection: c.name, Location: location, Id: id, Metrics: abelian.Metrics()})
+		})
+	}
 
 	parent := c.base.Parent(location)
 
@@ -423,9 +503,13 @@ func (c *Collection) Traverse(parent string, processSet func(string, *Abelian), 
 }
 
 func (c *Collection) traverse(parent string, processSet func(string, *Abelian), processItem func(string, string, string, *Abelian)) {
+	set, ok := c.sets[parent]
+	if !ok || set == nil {
+		return
+	}
 
 	var total *Abelian
-	c.sets[parent].Traverse(func(key string, abelian *Abelian) {
+	set.Traverse(func(key string, abelian *Abelian) {
 
 		if total == nil {
 			total = NewAbelian(abelian.Count(), abelian.Metrics())
@@ -437,6 +521,12 @@ func (c *Collection) traverse(parent string, processSet func(string, *Abelian), 
 			return
 		}
 
+		if key == parent {
+			return
+		}
+		if c.sets[key] == nil {
+			return
+		}
 		if c.browsable(parent, key) {
 			c.traverse(key, processSet, processItem)
 		}
@@ -453,8 +543,12 @@ func (c *Collection) Clean(parent string, processSet func(string, *Abelian), pro
 }
 
 func (c *Collection) clean(parent string, processSet func(string, *Abelian), processItem func(string, string, string, *Abelian)) {
+	set, ok := c.sets[parent]
+	if !ok || set == nil {
+		return
+	}
 
-	c.sets[parent].Traverse(func(key string, abelian *Abelian) {
+	set.Traverse(func(key string, abelian *Abelian) {
 		if abelian.Count() == 1 {
 			arr := strings.Split(key, ":")
 
@@ -469,6 +563,9 @@ func (c *Collection) clean(parent string, processSet func(string, *Abelian), pro
 			return
 		}
 
+		if key == parent {
+			return
+		}
 		if !c.browsable(parent, key) && c.owned[key] == nil && c.sets[key] != nil {
 			c.traverse(key, processSet, processItem)
 		}

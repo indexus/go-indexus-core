@@ -120,7 +120,20 @@ The application accepts several command-line flags for configuration:
 - `-name`: Name of the node (defaults to a random ID).
 - `-monitoringPort`: Port number for the monitoring service (default: `19000`).
 - `-p2pPort`: Port number for the peer-to-peer network (default: `21000`).
-- `-storage`: Path to the storage directory (default: `.data/backup`).
+- `-storage`: Path to the storage **directory** for on-disk persistence (default: `.data/backup`). Ignored (in-memory mock) when empty.
+- `-archive`: Directory where rotated or dropped shard data is moved (default: `.data/archive`).
+
+### Backup layout (per owned subtree)
+
+Persistence uses **snapshot + append-only log per shard**: each shard is a `(collection, ownership_location)` subtree (the same units as the monitoring `ownership` view).
+
+Under `-storage`:
+
+- `cluster.snapshot` — gob-encoded replay commands for contacts, collections, ownership, and delegations (small global state).
+- `shards/<collection>/<location>.snapshot` — gob-encoded list of item lines (`item.Content()`) at last snapshot.
+- `shards/<collection>/<location>.log` — text lines appended since that snapshot.
+
+On each `Refresh` tick, the node writes `cluster.snapshot`, then per-shard snapshots (which **truncate** the corresponding `.log`). After a successful hand-off to another peer, that shard’s files are moved under `-archive`. **Restore** loads the cluster snapshot first, then replays each on-disk shard’s snapshot lines followed by log lines into `add()`.
 
 ### Example:
 
@@ -347,7 +360,7 @@ The `main.go` file is the entry point of the application. It performs the follow
 ## Notes
 
 - **Extensibility**: The architecture is designed to be modular, allowing developers to extend functionalities by integrating new dimensions or features.
-- **Data Storage**: The current storage implementation is a mockup for simulation purposes. In production, you should implement a robust storage solution.
+- **Data Storage**: The node binary uses the `storage` package (per-shard snapshot+WAL under `-storage`). The **simulation** app still uses an in-memory mock.
 - **Error Handling**: Proper error handling and logging are crucial for monitoring the health of your node.
 
 ---

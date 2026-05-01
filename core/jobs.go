@@ -66,34 +66,59 @@ func (n *Node) Refresh() error {
 				continue
 			}
 
-			collection, _ := n.collections.Get(key.Collection)
-
-			parent := key.Location
-			for {
-				k := domain.Key{
-					Collection: key.Collection,
-					Location:   parent,
+			// control() may have deleted the collection if every owned
+			// location was handed off; in that case there is no Base()
+			// to walk so we just transfer with the original location.
+			if collection, ok := n.collections.Get(key.Collection); ok {
+				parent := key.Location
+				for {
+					k := domain.Key{
+						Collection: key.Collection,
+						Location:   parent,
+					}
+					if _, ok := keys[k]; !ok {
+						break
+					}
+					if parent == collection.Base().Root() {
+						break
+					}
+					key.Location, parent = parent, collection.Base().Parent(parent)
 				}
-				if _, ok := keys[k]; !ok {
-					break
-				}
-				if parent == collection.Base().Root() {
-					break
-				}
-				key.Location, parent = parent, collection.Base().Parent(parent)
 			}
-			candidate.Transfer(n, key, items)
+			if err := candidate.Transfer(n, key, items); err != nil {
+				// Hand-off failed in transit. control() already removed
+				// these items from our local collection AND truncated
+				// our owned-key entry, so without a fallback they would
+				// be silently lost. Re-queue them through the normal
+				// insert path with the delegated subtree as their root
+				// — exactly as a successful receiver's Transfer would
+				// have done — so Feed will recreate the collection at
+				// the right scope and route each item to whoever is
+				// XOR-closest now (the same candidate, ourselves, or a
+				// third node that joined since). Transient transport
+				// failures therefore cost only an extra round; they no
+				// longer leak data.
+				log.Printf("transfer to %s for %s/%s failed: %v; re-enqueuing %d items",
+					candidate.Name(), key.Collection, key.Location, err, len(items))
+				for _, item := range items {
+					_ = n.New(item, key.Location, key.Location)
+				}
+			} else {
+				if err := n.storage.DropShard(key); err != nil {
+					log.Printf("DropShard after transfer %v: %v", key, err)
+				}
+			}
 		}
 	}
 
-	// n.Snapshot()
-	err := n.storage.Save([]string{})
-	if err != nil {
+	if err := n.storage.SaveCluster(n.Snapshot()); err != nil {
+		return err
+	}
+	if err := n.SnapshotShards(); err != nil {
 		return err
 	}
 
-	err = n.clean()
-	if err != nil {
+	if err := n.clean(); err != nil {
 		return err
 	}
 

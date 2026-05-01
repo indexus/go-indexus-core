@@ -292,7 +292,7 @@ func (n *Node) clean() error {
 		return err
 	}
 
-	n.routing = domain.NewBST[domain.Peer]()
+	n.routing.Reset()
 
 	n.subscribe(append(neighbors, n))
 	return nil
@@ -358,7 +358,9 @@ func (n *Node) add(item *domain.Item) bool {
 	}
 
 	if n.ready {
-		n.storage.Append(item.Content())
+		if owner, ok := collection.OwnerOf(item.Location); ok {
+			n.storage.AppendShard(domain.Key{Collection: item.Collection, Location: owner}, item.Content())
+		}
 	}
 
 	if len(areas) > 0 {
@@ -388,6 +390,27 @@ func (n *Node) own(collection *domain.Collection, owned domain.Ownership) {
 			collection.Own(location, delegation)
 		})
 	}
+}
+
+// registerOwnedLocation registers (collection, location) in the routing-side
+// `owned` BST without touching the collection's owned/delegation map. Used
+// during Restore where the collection state is rebuilt by RestoreOwned and
+// AppendDelegation.
+func (n *Node) registerOwnedLocation(collection *domain.Collection, location string) {
+	id, err := encoding.MergeEncodings(
+		encoding.BASE64,
+		encoding.BASE64,
+		location,
+		collection.Name(),
+	)
+	if err != nil {
+		log.Println("Error decoding: ", err)
+		return
+	}
+
+	n.owned.Upsert(0, id, map[domain.Key]any{}, func(i int, b []byte, m map[domain.Key]any) {
+		m[domain.Key{Collection: collection.Name(), Location: location}] = nil
+	})
 }
 
 func (n *Node) control() map[domain.Contact]map[domain.Key][]*domain.Item {

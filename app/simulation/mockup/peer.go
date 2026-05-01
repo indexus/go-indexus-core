@@ -3,6 +3,8 @@ package mockup
 import (
 	"fmt"
 	"math/rand"
+	"sync"
+	"sync/atomic"
 
 	"github.com/indexus/go-indexus-core/core"
 	"github.com/indexus/go-indexus-core/domain"
@@ -11,9 +13,47 @@ import (
 
 var network = NewNetwork()
 
+// ResetNetwork drops all known nodes from the in-process simulation.
+// Intended for tests that want a clean global before driving a new
+// topology.
+func ResetNetwork() {
+	network = NewNetwork()
+}
+
 type Network struct {
+	mu          sync.RWMutex
 	nodes       map[string]*core.Node
 	unreachable map[string]*core.Node
+
+	// transferDropPct is a 0..100 percentage. When non-zero, every
+	// Transfer call has that probability of returning a synthetic
+	// transport error WITHOUT dispatching to the receiver. Used by the
+	// fault-injection tests to exercise the lossy-handoff path.
+	transferDropPct atomic.Int32
+
+	// transferCounters track how many Transfer calls succeeded vs
+	// were dropped by fault injection. Useful to assert in tests.
+	transferOK      atomic.Uint64
+	transferDropped atomic.Uint64
+}
+
+// SetTransferDropRate sets the probability (0..100) that any given
+// Transfer call will fail with a synthetic transport error. Setting it
+// to 0 disables fault injection.
+func (n *Network) SetTransferDropRate(pct int) {
+	if pct < 0 {
+		pct = 0
+	}
+	if pct > 100 {
+		pct = 100
+	}
+	n.transferDropPct.Store(int32(pct))
+}
+
+// TransferStats returns (ok, dropped) Transfer counters since the
+// network was created.
+func (n *Network) TransferStats() (uint64, uint64) {
+	return n.transferOK.Load(), n.transferDropped.Load()
 }
 
 func NewNetwork() *Network {
@@ -24,18 +64,33 @@ func NewNetwork() *Network {
 }
 
 func (n *Network) Join(node *core.Node) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
 	n.nodes[node.Name()] = node
 }
 
 func (n *Network) Unreachable(node *core.Node) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
 	n.unreachable[node.Name()] = node
 }
 
 func (n *Network) Length() int {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
 	return len(n.nodes)
 }
 
+func (n *Network) Get(name string) (*core.Node, bool) {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	node, ok := n.nodes[name]
+	return node, ok
+}
+
 func (n *Network) Random() *core.Node {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
 	if len(n.nodes) > 0 {
 		stop := rand.Intn(len(n.nodes))
 		for _, node := range n.nodes {
@@ -93,7 +148,7 @@ func (p *Peer) Host() string {
 
 func (p *Peer) Ping(origin domain.Contact) (domain.Contact, error) {
 
-	distant, ok := network.nodes[p.Name()]
+	distant, ok := network.Get(p.Name())
 	if !ok {
 		return nil, fmt.Errorf("error code: 404")
 	}
@@ -108,7 +163,7 @@ func (p *Peer) Ping(origin domain.Contact) (domain.Contact, error) {
 
 func (p *Peer) Neighbors(origin domain.Peer) ([]domain.Contact, error) {
 
-	distant, ok := network.nodes[p.Name()]
+	distant, ok := network.Get(p.Name())
 	if !ok {
 		return nil, fmt.Errorf("error code: 404")
 	}
@@ -128,7 +183,7 @@ func (p *Peer) Neighbors(origin domain.Peer) ([]domain.Contact, error) {
 
 func (p *Peer) Random(origin domain.Peer) (domain.Contact, error) {
 
-	distant, ok := network.nodes[p.Name()]
+	distant, ok := network.Get(p.Name())
 	if !ok {
 		return nil, fmt.Errorf("error code: 404")
 	}
@@ -147,10 +202,18 @@ func (p *Peer) Random(origin domain.Peer) (domain.Contact, error) {
 
 func (p *Peer) Transfer(origin domain.Peer, key domain.Key, items []*domain.Item) error {
 
-	distant, ok := network.nodes[p.Name()]
+	if pct := network.transferDropPct.Load(); pct > 0 {
+		if rand.Intn(100) < int(pct) {
+			network.transferDropped.Add(1)
+			return fmt.Errorf("simulated transfer drop")
+		}
+	}
+
+	distant, ok := network.Get(p.Name())
 	if !ok {
 		return fmt.Errorf("error code: 404")
 	}
+	network.transferOK.Add(1)
 
 	err := distant.Transfer(origin, key, items)
 	if err != nil {
@@ -162,7 +225,7 @@ func (p *Peer) Transfer(origin domain.Peer, key domain.Key, items []*domain.Item
 
 func (p *Peer) Get(collection string, location string) (domain.Contact, *domain.Set, error) {
 
-	distant, ok := network.nodes[p.Name()]
+	distant, ok := network.Get(p.Name())
 	if !ok {
 		return nil, nil, fmt.Errorf("error code: 404")
 	}
@@ -177,7 +240,7 @@ func (p *Peer) Get(collection string, location string) (domain.Contact, *domain.
 
 func (p *Peer) New(item *domain.Item, root string, current string) error {
 
-	distant, ok := network.nodes[p.Name()]
+	distant, ok := network.Get(p.Name())
 	if !ok {
 		return fmt.Errorf("error code: 404")
 	}
