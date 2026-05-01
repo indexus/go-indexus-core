@@ -122,18 +122,35 @@ The application accepts several command-line flags for configuration:
 - `-p2pPort`: Port number for the peer-to-peer network (default: `21000`).
 - `-storage`: Path to the storage **directory** for on-disk persistence (default: `.data/backup`). Ignored (in-memory mock) when empty.
 - `-archive`: Directory where rotated or dropped shard data is moved (default: `.data/archive`).
+- `-maxLoadedShards`: Maximum number of shards kept in RAM at once (default: `256`; `0` = unlimited). Oldest-accessed shards are evicted when the budget is exceeded.
+- `-shardIdleTTL`: Evict shards that have not been accessed for this duration (default: `0` = disabled). Example: `-shardIdleTTL 10m`.
 
 ### Backup layout (per owned subtree)
 
-Persistence uses **snapshot + append-only log per shard**: each shard is a `(collection, ownership_location)` subtree (the same units as the monitoring `ownership` view).
+Persistence uses **snapshot + append-only WAL per shard**: each shard is a `(collection, ownership_location)` subtree (the same units as the `/ownership` monitoring view). File names are hex-encoded to avoid case-collision on case-insensitive filesystems (APFS, NTFS).
 
 Under `-storage`:
 
-- `cluster.snapshot` — gob-encoded replay commands for contacts, collections, ownership, and delegations (small global state).
-- `shards/<collection>/<location>.snapshot` — gob-encoded list of item lines (`item.Content()`) at last snapshot.
-- `shards/<collection>/<location>.log` — text lines appended since that snapshot.
+- `cluster.snapshot` — gob-encoded replay commands for contacts, collections, ownership, and delegations.
+- `shards/<hex(collection)>/<hex(location)>.snapshot` — gob-encoded `ShardSnapshot{Header, Items}`. `Header` is the owner-level aggregate map (served immediately on cold restart). `Items` is the flat list of item content lines for full in-memory rebuilds.
+- `shards/<hex(collection)>/<hex(location)>.log` — text lines appended to the WAL since the last snapshot.
 
-On each `Refresh` tick, the node writes `cluster.snapshot`, then per-shard snapshots (which **truncate** the corresponding `.log`). After a successful hand-off to another peer, that shard’s files are moved under `-archive`. **Restore** loads the cluster snapshot first, then replays each on-disk shard’s snapshot lines followed by log lines into `add()`.
+On each `Refresh` tick the node: (1) writes `cluster.snapshot`, (2) snapshots dirty loaded shards (merging WAL → snapshot, truncating log), (3) evicts LRU shards over the `-maxLoadedShards` budget. Shards handed off to another peer are archived under `-archive`.
+
+### Shard cache (RAM hot-keys)
+
+The node maintains a **per-shard LRU cache** governed by `-maxLoadedShards` and `-shardIdleTTL`:
+
+- **Cold restore is instant** — only the `Header` (owner-level aggregates) is loaded from each `.snapshot` at startup. `/set` queries at an owned boundary are answered immediately from the header without loading item data.
+- **Deep reads** trigger a lazy load: `EnsureLoaded` reads `.snapshot` + `.log`, rebuilds the in-memory set hierarchy, and serves the response. Singleflight prevents duplicate concurrent loads for the same shard.
+- **Writes** always append to the WAL and mark the shard dirty, regardless of whether the shard is in RAM or evicted.
+- **Eviction**: in the `Refresh` tick, shards over budget are snapshotted first (if dirty) then removed from RAM. The owner-level `Set` (`c.sets[owner]`) is always preserved so aggregate queries remain fast without a reload.
+
+Monitor the cache via `GET /cache` on the monitoring port:
+
+```json
+{ "loaded": 64, "evicted": 139, "dirty": 0, "hits": 1234, "misses": 42, "loads": 42, "evictions": 165 }
+```
 
 ### Example:
 

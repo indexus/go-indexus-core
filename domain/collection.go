@@ -9,13 +9,12 @@ import (
 )
 
 type Collections struct {
-	mu   *sync.Mutex
+	mu   sync.Mutex
 	data map[string]*Collection
 }
 
 func NewCollections() *Collections {
 	return &Collections{
-		mu:   &sync.Mutex{},
 		data: make(map[string]*Collection),
 	}
 }
@@ -58,7 +57,7 @@ type Collection struct {
 	base  Encoder
 	sets  map[string]*Set
 	owned Ownership
-	mu    *sync.Mutex
+	mu    sync.Mutex
 }
 
 func NewCollection(name string, root string, base Encoder) *Collection {
@@ -67,7 +66,6 @@ func NewCollection(name string, root string, base Encoder) *Collection {
 		base:  base,
 		sets:  map[string]*Set{root: NewSet()},
 		owned: map[string]Delegation{root: {}},
-		mu:    &sync.Mutex{},
 	}
 }
 
@@ -79,21 +77,10 @@ func (c *Collection) Base() Encoder {
 	return c.base
 }
 
-func (c *Collection) Allowing(location string) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	for child, parent := "", location; parent != ""; child, parent = parent, c.base.Parent(parent) {
-		if delegation, owned := c.owned[parent]; owned {
-			_, delegated := delegation[child]
-			return !delegated
-		}
-	}
-	return false
-}
-
 // OwnerOf returns the ownership key (prefix in c.owned) under which location
-// is stored when Allowing(location) is true. Same walk as Allowing.
+// would be stored on this node, or ("", false) if no ancestor of location is
+// owned here (or the matching ancestor has delegated location's subtree).
+// This single walk replaces the former Allowing/OwnerOf pair.
 func (c *Collection) OwnerOf(location string) (owner string, ok bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -516,8 +503,9 @@ func (c *Collection) traverse(parent string, processSet func(string, *Abelian), 
 		}
 
 		if abelian.Count() == 1 {
-			arr := strings.Split(key, ":")
-			processItem(parent, arr[0], arr[1], abelian)
+			if i := strings.IndexByte(key, ':'); i >= 0 {
+				processItem(parent, key[:i], key[i+1:], abelian)
+			}
 			return
 		}
 
@@ -550,15 +538,20 @@ func (c *Collection) clean(parent string, processSet func(string, *Abelian), pro
 
 	set.Traverse(func(key string, abelian *Abelian) {
 		if abelian.Count() == 1 {
-			arr := strings.Split(key, ":")
+			i := strings.IndexByte(key, ':')
+			if i < 0 {
+				return
+			}
+			loc := key[:i]
+			id := key[i+1:]
 
-			k := arr[0][:len(parent)]
+			k := loc[:len(parent)]
 			if parent != c.base.Root() {
-				k = arr[0][:len(parent)+1]
+				k = loc[:len(parent)+1]
 			}
 
 			if !c.browsable(parent, k) {
-				processItem(parent, arr[0], arr[1], abelian)
+				processItem(parent, loc, id, abelian)
 			}
 			return
 		}
@@ -604,4 +597,110 @@ func (c *Collection) Refresh() map[string]any {
 	}
 
 	return result
+}
+
+// SetOwnerAggregate replaces c.sets[owner].list with the provided aggregate map.
+// Called during cold restore to inject the header from a .snapshot file so that
+// owner-level /set queries are served correctly without loading item data.
+func (c *Collection) SetOwnerAggregate(owner string, list map[string]*Abelian) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	s, ok := c.sets[owner]
+	if !ok || s == nil {
+		s = NewSet()
+		c.sets[owner] = s
+	}
+	s.SetList(list)
+}
+
+// EvictShard removes every c.sets[loc] whose key is strictly deeper than owner
+// (i.e. has owner as a true prefix or, for the root owner, is any key other
+// than owner itself). c.sets[owner] is preserved so that aggregate queries
+// continue to be served from the cached header.
+// Returns the number of sets removed.
+func (c *Collection) EvictShard(owner string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	count := 0
+	isRoot := owner == c.base.Root()
+	for loc := range c.sets {
+		if loc == owner {
+			continue
+		}
+		if isRoot || strings.HasPrefix(loc, owner) {
+			delete(c.sets, loc)
+			count++
+		}
+	}
+	return count
+}
+
+// LoadShardItems rebuilds the deep c.sets[*] chain under owner from a flat
+// list of items. It does NOT touch c.sets[owner] — the owner set's list must
+// already be populated (via SetOwnerAggregate) with the correct aggregates.
+// After rebuilding, the owner's aggregate entries are synced with the freshly
+// rebuilt deep sets to account for WAL items that post-date the last snapshot.
+func (c *Collection) LoadShardItems(owner string, items []*Item) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if _, ok := c.sets[owner]; !ok {
+		c.sets[owner] = NewSet()
+	}
+
+	for _, item := range items {
+		entry := item.Location + ":" + item.Id
+		abelian := NewAbelian(1, item.Metrics)
+
+		// Collect the path from item.Location's parent up to (but not including)
+		// owner. path[0] = direct parent of item (the set that stores it),
+		// path[len-1] = direct child of owner (topmost deep set we touch).
+		var path []string
+		cur := c.base.Parent(item.Location)
+		for cur != owner && cur != "" {
+			path = append(path, cur)
+			cur = c.base.Parent(cur)
+		}
+
+		if len(path) == 0 {
+			// Item's parent IS owner — it is already present in
+			// c.sets[owner].list via SetOwnerAggregate. Skip.
+			continue
+		}
+
+		for i, setKey := range path {
+			s, ok := c.sets[setKey]
+			if !ok {
+				s = NewSet()
+				c.sets[setKey] = s
+			}
+			if i == 0 {
+				// Direct parent: actually store the item.
+				if s.add(entry, abelian, c.base.Length()) {
+					s.shrink(c.base, c.sets, setKey, c.base.Length())
+				}
+			} else {
+				// Ancestor: aggregate the child below.
+				s.incr(path[i-1], abelian)
+			}
+		}
+	}
+
+	// Sync the owner's aggregate entries with the rebuilt deep sets.
+	// This corrects stale counts when WAL items were loaded that post-date
+	// the previous snapshot header.
+	if ownerSet := c.sets[owner]; ownerSet != nil {
+		for key := range ownerSet.list {
+			if strings.Contains(key, ":") {
+				continue // direct item entry — already correct
+			}
+			if deepSet, ok := c.sets[key]; ok {
+				ownerSet.list[key] = deepSet.abelian()
+			}
+		}
+	}
+
+	return nil
 }

@@ -1,6 +1,10 @@
 package domain
 
-import "encoding/json"
+import (
+	"bytes"
+	"encoding/gob"
+	"encoding/json"
+)
 
 type Abelian struct {
 	count   int
@@ -101,6 +105,34 @@ func (a *Abelian) Sum(delta *Abelian) {
 	for idx, value := range delta.metrics {
 		a.metrics[idx] += value
 	}
+}
+
+// GobEncode / GobDecode let *Abelian be embedded in gob-encoded structs
+// (the struct fields are unexported, so gob cannot reach them directly).
+func (a *Abelian) GobEncode() ([]byte, error) {
+	type wire struct {
+		Count   int
+		Metrics []float64
+	}
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(wire{a.count, a.metrics}); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func (a *Abelian) GobDecode(b []byte) error {
+	type wire struct {
+		Count   int
+		Metrics []float64
+	}
+	var w wire
+	if err := gob.NewDecoder(bytes.NewReader(b)).Decode(&w); err != nil {
+		return err
+	}
+	a.count = w.Count
+	a.metrics = w.Metrics
+	return nil
 }
 
 func (a *Abelian) Substract(delta *Abelian) {

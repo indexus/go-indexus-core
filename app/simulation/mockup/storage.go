@@ -32,11 +32,15 @@ func (s *Storage) Shards() ([]domain.Key, error) {
 	return nil, nil
 }
 
-func (s *Storage) LoadShard(domain.Key) ([]string, []string, error) {
-	return nil, nil, nil
+func (s *Storage) LoadShardHeader(domain.Key) (map[string]*domain.Abelian, error) {
+	return nil, nil
 }
 
-func (s *Storage) SnapshotShard(domain.Key, []string) error {
+func (s *Storage) LoadShard(domain.Key) (map[string]*domain.Abelian, []string, []string, error) {
+	return nil, nil, nil, nil
+}
+
+func (s *Storage) SnapshotShard(domain.Key, map[string]*domain.Abelian, []string) error {
 	return nil
 }
 

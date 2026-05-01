@@ -3,6 +3,7 @@ package core
 import (
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"strconv"
 	"strings"
 
@@ -14,6 +15,34 @@ func ownedKeyString(k domain.Key) string {
 	return k.Collection + "\x00" + k.Location
 }
 
+// hashCommands fingerprints a snapshot command list so we can skip writing
+// cluster.snapshot when it is identical to the previously saved version.
+func hashCommands(commands []string) uint64 {
+	h := fnv.New64a()
+	for _, c := range commands {
+		_, _ = h.Write([]byte(c))
+		_, _ = h.Write([]byte{0})
+	}
+	return h.Sum64()
+}
+
+// SaveClusterIfDirty writes cluster.snapshot only when the snapshot content
+// differs from the last successful save. Returns whether a write happened.
+func (n *Node) SaveClusterIfDirty() (bool, error) {
+	commands := n.Snapshot()
+	h := hashCommands(commands)
+	if h == n.lastClusterHash && n.lastClusterHash != 0 {
+		return false, nil
+	}
+	if err := n.storage.SaveCluster(commands); err != nil {
+		return false, err
+	}
+	n.lastClusterHash = h
+	return true, nil
+}
+
+// Snapshot serialises the cluster-level state (contacts, collections,
+// ownership, delegations) as a list of replay-able command strings.
 func (n *Node) Snapshot() []string {
 	snapshot := make([]string, 0)
 
@@ -43,40 +72,25 @@ func (n *Node) Snapshot() []string {
 	return snapshot
 }
 
-// SnapshotShard persists items under one owned subtree (collection + ownership location).
-func (n *Node) SnapshotShards() error {
-	var keys []domain.Key
-	n.owned.Traverse(0, encoding.BASE64.NewID(), func(i int, b []byte, sets map[domain.Key]any) {
-		for key := range sets {
-			keys = append(keys, key)
-		}
-	})
-
-	var firstErr error
-	for _, key := range keys {
-		collection, ok := n.collections.Get(key.Collection)
-		if !ok {
-			continue
-		}
-		if _, ok := collection.Get(key.Location); !ok {
-			// Some owned locations can be logical (delegation graph) without an
-			// instantiated set yet; skip snapshot for those.
-			continue
-		}
-		items := make([]string, 0, 256)
-		collection.Traverse(
-			key.Location,
-			func(s string, a *domain.Abelian) {},
-			func(s1, s2, s3 string, a *domain.Abelian) {
-				item := &domain.Item{Collection: collection.Name(), Location: s2, Id: s3, Metrics: a.Metrics()}
-				items = append(items, item.Content())
-			},
-		)
-		if err := n.storage.SnapshotShard(key, items); err != nil && firstErr == nil {
-			firstErr = err
-		}
+// extractShard returns the header (owner-level Set.List()) and the flat
+// item-content lines for the given owned subtree. Used by Refresh to build
+// the ShardSnapshot written to disk.
+func extractShard(collection *domain.Collection, owner string) (map[string]*domain.Abelian, []string) {
+	set, ok := collection.Get(owner)
+	if !ok {
+		return nil, nil
 	}
-	return firstErr
+	header := set.List()
+	items := make([]string, 0, 256)
+	name := collection.Name()
+	collection.Traverse(
+		owner,
+		func(_ string, _ *domain.Abelian) {},
+		func(_, loc, id string, a *domain.Abelian) {
+			items = append(items, domain.ItemContent(name, loc, id, a.Metrics()))
+		},
+	)
+	return header, items
 }
 
 func parseItemContentLine(line string) (*domain.Item, error) {
@@ -102,6 +116,38 @@ func parseItemContentLine(line string) (*domain.Item, error) {
 	}, nil
 }
 
+// loadShard fetches header + items + logs from storage and injects them into
+// the collection. Called by EnsureLoaded when a shard misses in RAM.
+func (n *Node) loadShard(k domain.Key) error {
+	c, ok := n.collections.Get(k.Collection)
+	if !ok {
+		return nil
+	}
+	header, snapLines, logLines, err := n.storage.LoadShard(k)
+	if err != nil {
+		return fmt.Errorf("load shard %v: %w", k, err)
+	}
+	if header != nil {
+		c.SetOwnerAggregate(k.Location, header)
+	}
+
+	allLines := append(snapLines, logLines...)
+	items := make([]*domain.Item, 0, len(allLines))
+	for _, line := range allLines {
+		item, err := parseItemContentLine(line)
+		if err != nil {
+			return fmt.Errorf("shard %v line parse: %w", k, err)
+		}
+		items = append(items, item)
+	}
+	return c.LoadShardItems(k.Location, items)
+}
+
+// Restore replays the cluster snapshot and then registers every on-disk shard
+// as Evicted in the ShardManager. Shard item data is NOT loaded eagerly —
+// only the header (owner-level aggregates) is injected so that /set queries
+// at the ownership boundary are served immediately. Deep items are loaded on
+// first access via EnsureLoaded.
 func (n *Node) Restore() error {
 	if !n.storage.Exist() {
 		return nil
@@ -112,14 +158,12 @@ func (n *Node) Restore() error {
 		return err
 	}
 
-	// Replay in two phases so the (non-deterministic) Browse() order in the
-	// snapshot can never cause a `delegation|Y` to clobber an `ownership|Y`
-	// that happens to be replayed first. Phase 1 only creates contacts,
-	// collections and owned subtrees; phase 2 attaches the structural
-	// delegations to their parent's owned map.
+	// Two-phase replay so that delegation markers never clobber owned subtrees
+	// that happen to be replayed first (map iteration is non-deterministic).
+	// Phase 1: contacts, collections, ownership.
+	// Phase 2: structural delegations.
 	var (
-		collection string
-		// (collection, location) pairs collected for phase 2.
+		collection         string
 		pendingDelegations []struct{ collection, location string }
 	)
 
@@ -155,8 +199,6 @@ func (n *Node) Restore() error {
 			ownership := arr[1]
 			c, exist := n.collections.Get(collection)
 			if !exist {
-				// First ownership for this collection bootstraps it via the
-				// usual constructor (root is always BASE64.Root()).
 				n.create(collection, encoding.BASE64.Root())
 				c, exist = n.collections.Get(collection)
 				if !exist {
@@ -180,13 +222,16 @@ func (n *Node) Restore() error {
 		c.AppendDelegation(p.location)
 	}
 
+	// Build the set of keys that this node owns so we can skip orphaned shards.
 	ownedKeys := make(map[string]struct{})
-	n.owned.Traverse(0, encoding.BASE64.NewID(), func(i int, b []byte, sets map[domain.Key]any) {
+	n.owned.Traverse(0, encoding.BASE64.NewID(), func(_ int, _ []byte, sets map[domain.Key]any) {
 		for key := range sets {
 			ownedKeys[ownedKeyString(key)] = struct{}{}
 		}
 	})
 
+	// For every shard on disk: inject the header into the collection and
+	// register as Evicted. Items are loaded lazily on first access.
 	shardKeys, err := n.storage.Shards()
 	if err != nil {
 		return err
@@ -196,28 +241,18 @@ func (n *Node) Restore() error {
 		if _, ok := ownedKeys[ownedKeyString(sk)]; !ok {
 			continue
 		}
-		snapLines, logLines, err := n.storage.LoadShard(sk)
+		header, err := n.storage.LoadShardHeader(sk)
 		if err != nil {
-			return err
+			return fmt.Errorf("shard %v header: %w", sk, err)
 		}
-		for _, line := range snapLines {
-			item, err := parseItemContentLine(line)
-			if err != nil {
-				return fmt.Errorf("shard %v snapshot line: %w", sk, err)
-			}
-			if _, exist := n.collections.Get(item.Collection); exist {
-				_ = n.add(item)
-			}
+		c, ok := n.collections.Get(sk.Collection)
+		if !ok {
+			continue
 		}
-		for _, line := range logLines {
-			item, err := parseItemContentLine(line)
-			if err != nil {
-				return fmt.Errorf("shard %v log line: %w", sk, err)
-			}
-			if _, exist := n.collections.Get(item.Collection); exist {
-				_ = n.add(item)
-			}
+		if header != nil {
+			c.SetOwnerAggregate(sk.Location, header)
 		}
+		n.shards.Register(sk)
 	}
 
 	return nil

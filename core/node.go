@@ -23,10 +23,18 @@ type Node struct {
 	cache        *domain.Cache
 	queue        *domain.Queue[*Element]
 	storage      domain.Storage
+	shards       *ShardManager
 	ready        bool
+
+	// lastClusterHash skips redundant cluster snapshot writes when the
+	// in-memory state has not changed since the last successful save.
+	lastClusterHash uint64
 }
 
-func NewNode(settings *Settings, newContact func(string, map[string]any, int) domain.Contact, bootstraps []domain.Contact, storage domain.Storage) (*Node, error) {
+func NewNode(settings *Settings, newContact func(string, map[string]any, int) domain.Contact, bootstraps []domain.Contact, storage domain.Storage, shards *ShardManager) (*Node, error) {
+	if shards == nil {
+		shards = NewShardManager(0, 0) // unlimited, no TTL eviction
+	}
 	node := &Node{
 		settings:     settings,
 		newContact:   newContact,
@@ -39,6 +47,7 @@ func NewNode(settings *Settings, newContact func(string, map[string]any, int) do
 		cache:        domain.NewCache(),
 		queue:        domain.NewQueue[*Element](),
 		storage:      storage,
+		shards:       shards,
 	}
 
 	node.register([]domain.Contact{node})
@@ -147,9 +156,22 @@ func (n *Node) Get(collection, location string) (domain.Contact, *domain.Set, er
 	nearest := n.registered.Nearest(0, id)
 
 	if c, exist := n.collections.Get(collection); exist {
-		set, ok := c.Get(location)
-		if ok {
+		// Fast path: shard already in RAM.
+		if set, ok := c.Get(location); ok {
+			if owner, ownerOk := c.OwnerOf(location); ownerOk {
+				n.shards.Touch(domain.Key{Collection: collection, Location: owner})
+			}
 			return nearest, set, nil
+		}
+		// Slow path: shard may be evicted — load it on demand.
+		if owner, ownerOk := c.OwnerOf(location); ownerOk {
+			sk := domain.Key{Collection: collection, Location: owner}
+			if err := n.shards.EnsureLoaded(sk, func() error { return n.loadShard(sk) }); err != nil {
+				return nearest, nil, err
+			}
+			if set, ok := c.Get(location); ok {
+				return nearest, set, nil
+			}
 		}
 	}
 
@@ -168,12 +190,44 @@ func (n *Node) GetMultiple(collection string, locations []string, precision int,
 		return nil, errors.New("no collection")
 	}
 
+	// Ensure each relevant shard is loaded before aggregating.
+	seen := make(map[domain.Key]bool)
+	for _, location := range locations {
+		if owner, ownerOk := c.OwnerOf(location); ownerOk {
+			sk := domain.Key{Collection: collection, Location: owner}
+			if !seen[sk] {
+				seen[sk] = true
+				if !n.shards.IsLoaded(sk) {
+					if err := n.shards.EnsureLoaded(sk, func() error { return n.loadShard(sk) }); err != nil {
+						return nil, err
+					}
+				} else {
+					n.shards.Touch(sk)
+				}
+			}
+		}
+	}
+
 	return c.GetMultiple(locations, precision, properties)
 }
 
 func (n *Node) New(item *domain.Item, root, current string) error {
 	n.queue.Add(NewElement(item, root, current))
 	return nil
+}
+
+// CacheStats returns a snapshot of shard cache counters for the /cache endpoint.
+func (n *Node) CacheStats() map[string]int64 {
+	s := n.shards.Stats()
+	return map[string]int64{
+		"loaded":    s.Loaded,
+		"evicted":   s.Evicted,
+		"dirty":     s.Dirty,
+		"hits":      s.Hits,
+		"misses":    s.Misses,
+		"loads":     s.Loads,
+		"evictions": s.Evictions,
+	}
 }
 
 func (n *Node) acknowledge(candidates []domain.Contact) {
@@ -359,7 +413,12 @@ func (n *Node) add(item *domain.Item) bool {
 
 	if n.ready {
 		if owner, ok := collection.OwnerOf(item.Location); ok {
-			n.storage.AppendShard(domain.Key{Collection: item.Collection, Location: owner}, item.Content())
+			sk := domain.Key{Collection: item.Collection, Location: owner}
+			n.shards.MarkDirty(sk)
+			n.storage.AppendShard(sk, item.Content())
+			// Propagate dirty to all ancestor ownership zones so that their
+			// shard headers remain in sync after this insert.
+			n.markAncestorsDirty(collection, owner)
 		}
 	}
 
@@ -389,6 +448,31 @@ func (n *Node) own(collection *domain.Collection, owned domain.Ownership) {
 
 			collection.Own(location, delegation)
 		})
+
+		// During normal operation (not restore), the new shard's data is
+		// already in RAM — mark it loaded so PlanWork can snapshot it.
+		if n.ready {
+			n.shards.MarkLoaded(domain.Key{Collection: collection.Name(), Location: location})
+		}
+	}
+}
+
+// markAncestorsDirty walks up the ownership tree from owner and marks every
+// ancestor shard dirty. This keeps parent shard headers consistent when items
+// are inserted into a child ownership zone.
+func (n *Node) markAncestorsDirty(collection *domain.Collection, owner string) {
+	current := owner
+	for current != "@" {
+		parentLoc := encoding.BASE64.Parent(current)
+		if len(parentLoc) == 0 {
+			break
+		}
+		parentOwner, ok := collection.OwnerOf(parentLoc)
+		if !ok || parentOwner == current {
+			break
+		}
+		n.shards.MarkDirty(domain.Key{Collection: collection.Name(), Location: parentOwner})
+		current = parentOwner
 	}
 }
 

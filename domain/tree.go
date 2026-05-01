@@ -30,6 +30,15 @@ func (t *tree[N]) Insert(idx int, id []byte, node N) {
 }
 
 func (t *tree[N]) Traverse(idx int, value []byte, process func(int, []byte, N)) {
+	// Guard: stop if we have consumed all bits in value. This prevents an
+	// out-of-bounds panic on tmp[idx/8] when idx == 8*len(value) at the
+	// maximum tree depth (e.g. idx=128 for 16-byte keys).
+	if idx/8 >= len(value) {
+		if t.left == nil && t.right == nil {
+			process(idx, value, t.node)
+		}
+		return
+	}
 
 	if t.left != nil {
 		tmp := make([]byte, len(value))
@@ -205,13 +214,12 @@ func (t *tree[N]) Extract(idx int, value []byte, routing *[160]N) {
 }
 
 type BST[N any] struct {
-	mu   *sync.Mutex
+	mu   sync.Mutex
 	tree *tree[N]
 }
 
 func NewBST[N any]() *BST[N] {
 	return &BST[N]{
-		mu:   &sync.Mutex{},
 		tree: &tree[N]{},
 	}
 }

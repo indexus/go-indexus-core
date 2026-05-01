@@ -52,6 +52,8 @@ type Config struct {
 	ArchiveStorageDirFlag string
 	StorageFlag           string
 	SSLStorageFlag        string
+	MaxLoadedShards       int
+	ShardIdleTTL          time.Duration
 	Bootstraps            []domain.Contact
 }
 
@@ -94,6 +96,8 @@ func parseFlags() Config {
 	storageFlagPtr := flag.String("storage", ".data/backup", "Directory for cluster.snapshot and shards/ (empty = in-memory mock)")
 	archiveStorageDirFlagPtr := flag.String("archive", ".data/archive", "Directory for archived or dropped shard data")
 	sslStorageFlagPtr := flag.String("sslStorage", "", "Path to the ssl certificates")
+	maxLoadedShardsFlagPtr := flag.Int("maxLoadedShards", 256, "Maximum number of shards kept in RAM (LRU budget; 0 = unlimited)")
+	shardIdleTTLFlagPtr := flag.Duration("shardIdleTTL", 0, "Evict shards idle longer than this duration (0 = disabled)")
 
 	flag.Parse()
 
@@ -126,6 +130,8 @@ func parseFlags() Config {
 		ArchiveStorageDirFlag: *archiveStorageDirFlagPtr,
 		StorageFlag:           *storageFlagPtr,
 		SSLStorageFlag:        *sslStorageFlagPtr,
+		MaxLoadedShards:       *maxLoadedShardsFlagPtr,
+		ShardIdleTTL:          *shardIdleTTLFlagPtr,
 		Bootstraps:            bootstraps,
 	}
 }
@@ -146,6 +152,8 @@ func displayMessages(config Config) {
 	fmt.Println("Bootstrap Nodes:", displayContacts(config.Bootstraps))
 	fmt.Println("Archive Path:", config.ArchiveStorageDirFlag)
 	fmt.Println("Storage Path:", config.StorageFlag)
+	fmt.Println("Max Loaded Shards:", config.MaxLoadedShards, "(0 = unlimited)")
+	fmt.Println("Shard Idle TTL:", config.ShardIdleTTL)
 	fmt.Println()
 }
 
@@ -162,7 +170,8 @@ func startProcess(config Config) {
 	} else {
 		storageInstance = mockup.NewStorage()
 	}
-	node, err := core.NewNode(settings, peer.NewContact, config.Bootstraps, storageInstance)
+	shardManager := core.NewShardManager(config.MaxLoadedShards, config.ShardIdleTTL)
+	node, err := core.NewNode(settings, peer.NewContact, config.Bootstraps, storageInstance, shardManager)
 	if err != nil {
 		log.Fatal(err)
 	}

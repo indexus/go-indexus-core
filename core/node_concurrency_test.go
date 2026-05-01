@@ -15,17 +15,22 @@ import (
 // import cycle since mockup depends on core).
 type noopStorage struct{}
 
-func (noopStorage) Exist() bool                  { return false }
-func (noopStorage) Reset() error                 { return nil }
-func (noopStorage) SaveCluster([]string) error   { return nil }
-func (noopStorage) LoadCluster() ([]string, error) { return nil, nil }
-func (noopStorage) Shards() ([]domain.Key, error) { return nil, nil }
-func (noopStorage) LoadShard(domain.Key) ([]string, []string, error) {
-	return nil, nil, nil
+func (noopStorage) Exist() bool                        { return false }
+func (noopStorage) Reset() error                       { return nil }
+func (noopStorage) SaveCluster([]string) error         { return nil }
+func (noopStorage) LoadCluster() ([]string, error)     { return nil, nil }
+func (noopStorage) Shards() ([]domain.Key, error)     { return nil, nil }
+func (noopStorage) LoadShardHeader(domain.Key) (map[string]*domain.Abelian, error) {
+	return nil, nil
 }
-func (noopStorage) SnapshotShard(domain.Key, []string) error { return nil }
-func (noopStorage) AppendShard(domain.Key, string)          {}
-func (noopStorage) DropShard(domain.Key) error               { return nil }
+func (noopStorage) LoadShard(domain.Key) (map[string]*domain.Abelian, []string, []string, error) {
+	return nil, nil, nil, nil
+}
+func (noopStorage) SnapshotShard(domain.Key, map[string]*domain.Abelian, []string) error {
+	return nil
+}
+func (noopStorage) AppendShard(domain.Key, string) {}
+func (noopStorage) DropShard(domain.Key) error     { return nil }
 
 func newTestNode(t *testing.T) *Node {
 	t.Helper()
@@ -38,7 +43,7 @@ func newTestNode(t *testing.T) *Node {
 	if err != nil {
 		t.Fatalf("NewSettings: %v", err)
 	}
-	node, err := NewNode(settings, peer.NewContact, nil, noopStorage{})
+	node, err := NewNode(settings, peer.NewContact, nil, noopStorage{}, nil)
 	if err != nil {
 		t.Fatalf("NewNode: %v", err)
 	}
