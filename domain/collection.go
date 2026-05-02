@@ -325,69 +325,13 @@ func (c *Collection) Add(location string, id string, metrics []float64, delegati
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	delegated := true
-	for child, parent := "", location; parent != ""; child, parent = parent, c.base.Parent(parent) {
-		if delegation, owned := c.owned[parent]; owned {
-			_, delegated = delegation[child]
-			break
-		}
-	}
-
-	if delegated {
+	if c.isDelegated(location) {
 		return nil
 	}
-
-	added, areas := false, Ownership{}
 	entry := fmt.Sprintf("%s:%s", location, id)
 	abelian := NewAbelian(1, metrics)
-
-	child, parent := "", location
-
-	for len(parent) > 0 {
-		child, parent = parent, c.base.Parent(parent)
-
-		set, ok := c.sets[parent]
-		if !ok {
-			continue
-		}
-
-		if !added {
-			// Idempotent insert at the deepest existing shard. If the
-			// entry already exists (same location:id pair was added
-			// before, e.g. because a forward timed out at the sender
-			// while actually being processed by the receiver and then
-			// got retried), we MUST NOT propagate Incrs to the parent
-			// chain — they would double-count this single physical
-			// item against the @ aggregate. Return a non-nil (but
-			// empty) Ownership so n.add treats the call as a successful
-			// no-op rather than a delegated rejection that would walk
-			// the parent chain back up and re-queue the item forever.
-			fresh, full := set.AddIfAbsent(entry, abelian, c.base.Length())
-			if !fresh {
-				return areas
-			}
-			if full {
-				set.Shrink(c.base, c.sets, parent, c.base.Length())
-			}
-		} else if set.Incr(child, abelian).Count() == delegation {
-			areas[child] = Delegation{}
-		}
-		added = true
-	}
-
-	for area := range areas {
-		parent := c.base.Parent(area)
-		if parent == "" {
-			continue
-		}
-		if _, exist := c.owned[parent]; exist {
-			c.owned[parent][area] = nil
-		}
-		if _, exist := areas[parent]; exist {
-			areas[parent][area] = nil
-		}
-	}
-
+	areas := c.walkAndAdd(location, entry, abelian, delegation)
+	c.propagateAreas(areas)
 	return areas
 }
 
@@ -569,55 +513,6 @@ func (c *Collection) traverse(parent string, processSet func(string, *Abelian), 
 	})
 
 	processSet(parent, total)
-}
-
-func (c *Collection) Clean(parent string, processSet func(string, *Abelian), processItem func(string, string, string, *Abelian)) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.clean(parent, processSet, processItem)
-}
-
-func (c *Collection) clean(parent string, processSet func(string, *Abelian), processItem func(string, string, string, *Abelian)) {
-	set, ok := c.sets[parent]
-	if !ok || set == nil {
-		return
-	}
-
-	set.Traverse(func(key string, abelian *Abelian) {
-		if abelian.Count() == 1 {
-			i := strings.IndexByte(key, ':')
-			if i < 0 {
-				return
-			}
-			loc := key[:i]
-			id := key[i+1:]
-
-			k := loc[:len(parent)]
-			if parent != c.base.Root() {
-				k = loc[:len(parent)+1]
-			}
-
-			if !c.browsable(parent, k) {
-				processItem(parent, loc, id, abelian)
-			}
-			return
-		}
-
-		if key == parent {
-			return
-		}
-		if !c.browsable(parent, key) && c.owned[key] == nil && c.sets[key] != nil {
-			c.traverse(key, processSet, processItem)
-		}
-	})
-}
-
-func (c *Collection) Browsable(parent string, key string) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	return c.browsable(parent, key)
 }
 
 func (c *Collection) browsable(parent string, key string) bool {

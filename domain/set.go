@@ -43,13 +43,6 @@ func (s *Set) Get(value string) (*Abelian, bool) {
 	return s.get(value)
 }
 
-func (s *Set) Add(value string, abelian *Abelian, max int) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	return s.add(value, abelian, max)
-}
-
 // AddIfAbsent inserts the entry only when value is not already present.
 // Returns (added, full): added=false means a duplicate was detected and
 // the caller MUST NOT propagate aggregate Incrs to parent levels (doing
@@ -158,26 +151,26 @@ func (s *Set) count() int {
 }
 
 func (s *Set) abelian() *Abelian {
+	metricLen := 0
+	for _, elm := range s.list {
+		if elm == nil {
+			continue
+		}
+		if em := elm.Metrics(); len(em) > metricLen {
+			metricLen = len(em)
+		}
+	}
+	metrics := make([]float64, metricLen)
 	var count int
-	var metrics []float64
-
 	for _, elm := range s.list {
 		if elm == nil {
 			continue
 		}
 		count += elm.Count()
-
-		em := elm.Metrics()
-		if len(em) > len(metrics) {
-			grown := make([]float64, len(em))
-			copy(grown, metrics)
-			metrics = grown
-		}
-		for idx, value := range em {
+		for idx, value := range elm.Metrics() {
 			metrics[idx] += value
 		}
 	}
-
 	return NewAbelian(count, metrics)
 }
 
