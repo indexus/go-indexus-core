@@ -1,11 +1,8 @@
 package peer
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -133,13 +130,7 @@ func (c *Contact) Ping(origin domain.Contact) (domain.Contact, error) {
 }
 
 func (c *Contact) ping(origin domain.Contact, ip string) (domain.Contact, error) {
-	parsedIP := net.ParseIP(c.ip)
-
-	if parsedIP != nil && parsedIP.To4() == nil {
-		ip = fmt.Sprintf("[%s]", ip)
-	}
-
-	url := fmt.Sprintf("http://%s:%d/ping", ip, c.port)
+	urlStr := c.httpBaseURL(ip) + "/ping"
 	reqBody := struct {
 		Origin *Contact `json:"origin"`
 	}{
@@ -149,128 +140,64 @@ func (c *Contact) ping(origin domain.Contact, ip string) (domain.Contact, error)
 			port: origin.Port(),
 		},
 	}
-
-	jsonData, err := json.Marshal(reqBody)
-	if err != nil {
-		return nil, err
-	}
-
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := HttpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("ping %s: unexpected status %d", url, resp.StatusCode)
-	}
-
 	var respBody struct {
 		Contact *Contact `json:"contact"`
 	}
-	decoder := json.NewDecoder(resp.Body)
-	if err := decoder.Decode(&respBody); err != nil {
+	st, err := jsonRoundTrip(HttpClient, "POST", urlStr, reqBody, &respBody)
+	if err != nil {
 		return nil, err
 	}
-
+	if st != http.StatusOK {
+		return nil, fmt.Errorf("ping %s: unexpected status %d", urlStr, st)
+	}
 	contact := respBody.Contact
 	contact.ips[ip] = nil
 	contact.ip = ip
-
 	return contact, nil
 }
 
 func (c *Contact) Neighbors(origin domain.Peer) ([]domain.Contact, error) {
-	ip, parsedIP := c.ip, net.ParseIP(c.ip)
-
-	if parsedIP != nil && parsedIP.To4() == nil {
-		ip = fmt.Sprintf("[%s]", ip)
-	}
-
-	url := fmt.Sprintf("http://%s:%d/neighbors?origin=%s", ip, c.port, origin.Name())
-
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("error creating request: %s", err.Error())
-	}
-
-	resp, err := HttpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("error making request: %s", err.Error())
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("error code: %d", resp.StatusCode)
-	}
-
+	q := url.Values{}
+	q.Set("origin", origin.Name())
+	urlStr := c.url("/neighbors", q)
 	var body struct {
 		Neighbors []*Contact `json:"neighbors"`
 	}
-	decoder := json.NewDecoder(resp.Body)
-	if err := decoder.Decode(&body); err != nil {
-		return nil, err
+	st, err := jsonRoundTrip(HttpClient, "GET", urlStr, nil, &body)
+	if err != nil {
+		return nil, fmt.Errorf("error making request: %s", err.Error())
 	}
-
+	if st != http.StatusOK {
+		return nil, fmt.Errorf("error code: %d", st)
+	}
 	for _, neighbor := range body.Neighbors {
 		if neighbor.Name() == c.Name() {
 			neighbor.ip = c.ip
 		}
 	}
-
 	return domain.ConvertToContactSlice(body.Neighbors), nil
 }
 
 func (c *Contact) Random(origin domain.Peer) (domain.Contact, error) {
-	ip, parsedIP := c.ip, net.ParseIP(c.ip)
-
-	if parsedIP != nil && parsedIP.To4() == nil {
-		ip = fmt.Sprintf("[%s]", ip)
-	}
-
-	url := fmt.Sprintf("http://%s:%d/random?origin=%s", ip, c.port, origin.Name())
-
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("error creating request: %s", err.Error())
-	}
-
-	resp, err := HttpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("error making request: %s", err.Error())
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("error code: %d", resp.StatusCode)
-	}
-
+	q := url.Values{}
+	q.Set("origin", origin.Name())
+	urlStr := c.url("/random", q)
 	var body struct {
 		Contact *Contact `json:"contact"`
 	}
-	decoder := json.NewDecoder(resp.Body)
-	if err := decoder.Decode(&body); err != nil {
-		return nil, err
+	st, err := jsonRoundTrip(HttpClient, "GET", urlStr, nil, &body)
+	if err != nil {
+		return nil, fmt.Errorf("error making request: %s", err.Error())
 	}
-
+	if st != http.StatusOK {
+		return nil, fmt.Errorf("error code: %d", st)
+	}
 	return body.Contact, nil
 }
 
 func (c *Contact) Transfer(origin domain.Peer, key domain.Key, items []*domain.Item) error {
-	ip, parsedIP := c.ip, net.ParseIP(c.ip)
-
-	if parsedIP != nil && parsedIP.To4() == nil {
-		ip = fmt.Sprintf("[%s]", ip)
-	}
-
-	url := fmt.Sprintf("http://%s:%d/transfer", ip, c.port)
-	body := struct {
+	urlStr := c.url("/transfer", nil)
+	reqBody := struct {
 		Origin string         `json:"origin"`
 		Key    domain.Key     `json:"key"`
 		Items  []*domain.Item `json:"items"`
@@ -279,62 +206,37 @@ func (c *Contact) Transfer(origin domain.Peer, key domain.Key, items []*domain.I
 		Key:    key,
 		Items:  items,
 	}
-
-	jsonData, err := json.Marshal(body)
+	st, err := jsonRoundTrip(TransferClient, "POST", urlStr, reqBody, nil)
 	if err != nil {
 		return err
 	}
-
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return err
+	if st != http.StatusCreated {
+		return fmt.Errorf("error code: %d", st)
 	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := TransferClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusCreated {
-		return fmt.Errorf("error code: %d", resp.StatusCode)
-	}
-
 	return nil
 }
 
 func (c *Contact) Get(collection string, location string) (domain.Contact, *domain.Set, error) {
-	ip, parsedIP := c.ip, net.ParseIP(c.ip)
-
-	if parsedIP != nil && parsedIP.To4() == nil {
-		ip = fmt.Sprintf("[%s]", ip)
-	}
-
 	// `local=1` tells the receiving peer to answer from its own state only
 	// instead of fanning the query out to other peers. Without it, two
 	// nodes that both lack the shard could ping-pong forever asking each
 	// other for it.
-	url := fmt.Sprintf("http://%s:%d/set?collection=%s&location=%s&local=1", ip, c.port, collection, location)
-	resp, err := HttpClient.Get(url)
-	if err != nil {
-		return nil, nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, nil, fmt.Errorf("error code: %d", resp.StatusCode)
-	}
-
+	q := url.Values{}
+	q.Set("collection", collection)
+	q.Set("location", location)
+	q.Set("local", "1")
+	urlStr := c.url("/set", q)
 	var body struct {
 		Contact *Contact                   `json:"contact"`
 		Set     map[string]*domain.Abelian `json:"set"`
 	}
-	decoder := json.NewDecoder(resp.Body)
-	if err := decoder.Decode(&body); err != nil {
+	st, err := jsonRoundTrip(HttpClient, "GET", urlStr, nil, &body)
+	if err != nil {
 		return nil, nil, err
 	}
-
+	if st != http.StatusOK {
+		return nil, nil, fmt.Errorf("error code: %d", st)
+	}
 	// Distinguish "peer doesn't have this set" (body.Set is nil) from
 	// "peer returned an empty set (zero entries)". The former must not
 	// overwrite a locally-cached aggregate with zero, otherwise the
@@ -346,49 +248,29 @@ func (c *Contact) Get(collection string, location string) (domain.Contact, *doma
 	for key, value := range body.Set {
 		set.Put(key, value)
 	}
-
 	return body.Contact, set, nil
 }
 
 func (c *Contact) GetMultiple(collection string, locations []string, precision int, properties []func(*domain.Abelian) int) ([]byte, error) {
-	ip, parsedIP := c.ip, net.ParseIP(c.ip)
-
-	if parsedIP != nil && parsedIP.To4() == nil {
-		ip = fmt.Sprintf("[%s]", ip)
-	}
-
-	query := url.Values{}
-	query.Set("collection", collection)
-	query.Set("location", strings.Join(locations, ","))
-
-	url := fmt.Sprintf("http://%s:%d/sets?%s", ip, c.port, query.Encode())
-	resp, err := HttpClient.Get(url)
+	_ = precision
+	_ = properties
+	q := url.Values{}
+	q.Set("collection", collection)
+	q.Set("location", strings.Join(locations, ","))
+	urlStr := c.url("/sets", q)
+	body, st, err := doRaw(HttpClient, "GET", urlStr)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("error code: %d", resp.StatusCode)
+	if st != http.StatusOK {
+		return nil, fmt.Errorf("error code: %d", st)
 	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
 	return body, nil
 }
 
 func (c *Contact) New(item *domain.Item, root string, current string) error {
-	ip, parsedIP := c.ip, net.ParseIP(c.ip)
-
-	if parsedIP != nil && parsedIP.To4() == nil {
-		ip = fmt.Sprintf("[%s]", ip)
-	}
-
-	url := fmt.Sprintf("http://%s:%d/item", ip, c.port)
-	body := struct {
+	urlStr := c.url("/item", nil)
+	reqBody := struct {
 		Item    *domain.Item `json:"item"`
 		Root    string       `json:"root"`
 		Current string       `json:"current"`
@@ -397,27 +279,12 @@ func (c *Contact) New(item *domain.Item, root string, current string) error {
 		Root:    root,
 		Current: current,
 	}
-
-	jsonData, err := json.Marshal(body)
+	st, err := jsonRoundTrip(ItemClient, "POST", urlStr, reqBody, nil)
 	if err != nil {
 		return err
 	}
-
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return err
+	if st != http.StatusCreated {
+		return fmt.Errorf("error code: %d", st)
 	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := ItemClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusCreated {
-		return fmt.Errorf("error code: %d", resp.StatusCode)
-	}
-
 	return nil
 }
