@@ -54,6 +54,7 @@ type Service interface {
 	Random(domain.Peer) (domain.Contact, error)
 	Transfer(domain.Peer, domain.Key, []*domain.Item) error
 	Get(string, string) (domain.Contact, *domain.Set, error)
+	GetLocal(string, string) (domain.Contact, *domain.Set, error)
 	GetMultiple(string, []string, int, []func(*domain.Abelian) int) ([]byte, error)
 	New(*domain.Item, string, string) error
 }
@@ -262,8 +263,18 @@ func (h *Handler) Transfer(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	collection := r.URL.Query().Get("collection")
 	location := r.URL.Query().Get("location")
+	local := r.URL.Query().Get("local") == "1"
 
-	contact, set, err := h.Service.Get(collection, location)
+	var (
+		contact domain.Contact
+		set     *domain.Set
+		err     error
+	)
+	if local {
+		contact, set, err = h.Service.GetLocal(collection, location)
+	} else {
+		contact, set, err = h.Service.Get(collection, location)
+	}
 	if err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
@@ -303,6 +314,10 @@ func (h *Handler) GetMultiple(w http.ResponseWriter, r *http.Request) {
 
 	// Potentially multiple locations (comma-separated)
 	locationsParam := r.URL.Query().Get("location")
+	if locationsParam == "" {
+		// Compatibility with clients that still send `locations=...`.
+		locationsParam = r.URL.Query().Get("locations")
+	}
 	if locationsParam == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "location parameter is required"})
 		return

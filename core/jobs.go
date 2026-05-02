@@ -181,16 +181,24 @@ func (n *Node) Update() error {
 				log.Println(err)
 			}
 
-			if contact.Name() == n.Name() {
+			if contact != nil && contact.Name() == n.Name() {
 				continue
 			}
 
-			_, set, err := contact.Get(collection, location)
+			// n.Get fans out across all registered peers when the
+			// XOR-nearest one doesn't actually hold the shard, so the
+			// aggregate refresh works even when ownership ended up on
+			// a peer that isn't routing-nearest. contact.Get on its own
+			// would return nil here and the parent aggregate would
+			// freeze (or worse, get rolled back to zero).
+			_, set, err := n.Get(collection, location)
 			if err != nil {
 				log.Println(err)
 			}
 
-			if set == nil {
+			// Only propagate when we actually got something — empty
+			// or nil sets must not overwrite a healthy aggregate.
+			if set == nil || set.Abelian().Count() == 0 {
 				continue
 			}
 

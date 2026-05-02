@@ -2,10 +2,50 @@ package core
 
 import (
 	"fmt"
+	"sort"
 
 	"github.com/indexus/go-indexus-core/domain"
 	"github.com/indexus/go-indexus-core/encoding"
 )
+
+// OwnedEntry describes one ownership zone this node holds in its routing BST
+// with the number of leaf items under that zone (same semantics as Count()).
+type OwnedEntry struct {
+	Collection string `json:"collection"`
+	Location   string `json:"location"`
+	Count      int    `json:"count"`
+}
+
+// Owned returns (collection, location) keys in n.owned with leaf item counts.
+func (n *Node) Owned() ([]OwnedEntry, error) {
+	var out []OwnedEntry
+	n.owned.Traverse(0, encoding.BASE64.NewID(), func(i int, b []byte, keys map[domain.Key]any) {
+		for key := range keys {
+			collection, exist := n.collections.Get(key.Collection)
+			if !exist {
+				continue
+			}
+			count := 0
+			collection.Traverse(
+				key.Location,
+				func(s string, a *domain.Abelian) {},
+				func(s1, s2, s3 string, a *domain.Abelian) { count++ },
+			)
+			out = append(out, OwnedEntry{
+				Collection: key.Collection,
+				Location:   key.Location,
+				Count:      count,
+			})
+		}
+	})
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Collection != out[j].Collection {
+			return out[i].Collection < out[j].Collection
+		}
+		return out[i].Location < out[j].Location
+	})
+	return out, nil
+}
 
 func (n *Node) Routing() ([]domain.Contact, error) {
 	return n.traverseRouting(true), nil

@@ -124,6 +124,7 @@ The application accepts several command-line flags for configuration:
 - `-archive`: Directory where rotated or dropped shard data is moved (default: `.data/archive`).
 - `-maxLoadedShards`: Maximum number of shards kept in RAM at once (default: `256`; `0` = unlimited). Oldest-accessed shards are evicted when the budget is exceeded.
 - `-shardIdleTTL`: Evict shards that have not been accessed for this duration (default: `0` = disabled). Example: `-shardIdleTTL 10m`.
+- `-delegation`: Number of distinct items under a subtree prefix before a **delegation** splits ownership (default: built-in threshold, typically `1000`). Lower values stress-test subtree splits and `/transfer` handoffs (e.g. `-delegation 64` for multinode harnesses).
 
 ### Backup layout (per owned subtree)
 
@@ -146,7 +147,7 @@ The node maintains a **per-shard LRU cache** governed by `-maxLoadedShards` and 
 - **Writes** always append to the WAL and mark the shard dirty, regardless of whether the shard is in RAM or evicted.
 - **Eviction**: in the `Refresh` tick, shards over budget are snapshotted first (if dirty) then removed from RAM. The owner-level `Set` (`c.sets[owner]`) is always preserved so aggregate queries remain fast without a reload.
 
-Monitor the cache via `GET /cache` on the monitoring port:
+Monitoring endpoints on the same port include `GET /registered`, `GET /ownership`, **`GET /owned`** (JSON array of `{ "collection", "location", "count" }` per shard in the node’s `owned` map — `count` is leaf items under that zone), and `GET /cache` for LRU stats, for example:
 
 ```json
 { "loaded": 64, "evicted": 139, "dirty": 0, "hits": 1234, "misses": 42, "loads": 42, "evictions": 165 }

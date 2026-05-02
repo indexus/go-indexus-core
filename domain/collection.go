@@ -351,9 +351,25 @@ func (c *Collection) Add(location string, id string, metrics []float64, delegati
 			continue
 		}
 
-		if !added && set.Add(entry, abelian, c.base.Length()) {
-			set.Shrink(c.base, c.sets, parent, c.base.Length())
-		} else if added && set.Incr(child, abelian).Count() == delegation {
+		if !added {
+			// Idempotent insert at the deepest existing shard. If the
+			// entry already exists (same location:id pair was added
+			// before, e.g. because a forward timed out at the sender
+			// while actually being processed by the receiver and then
+			// got retried), we MUST NOT propagate Incrs to the parent
+			// chain — they would double-count this single physical
+			// item against the @ aggregate. Return a non-nil (but
+			// empty) Ownership so n.add treats the call as a successful
+			// no-op rather than a delegated rejection that would walk
+			// the parent chain back up and re-queue the item forever.
+			fresh, full := set.AddIfAbsent(entry, abelian, c.base.Length())
+			if !fresh {
+				return areas
+			}
+			if full {
+				set.Shrink(c.base, c.sets, parent, c.base.Length())
+			}
+		} else if set.Incr(child, abelian).Count() == delegation {
 			areas[child] = Delegation{}
 		}
 		added = true
@@ -375,6 +391,22 @@ func (c *Collection) Add(location string, id string, metrics []float64, delegati
 	return areas
 }
 
+// Update reconciles a delegated branch's cached aggregate with the value
+// just fetched from its current owner. Indexus is append-only at the
+// application layer (items can migrate between owners during ownership
+// transfers, but the per-branch total is monotonically non-decreasing
+// from the perspective of any non-owner caching the aggregate). We
+// therefore enforce monotonic progression: a fresh sample whose count is
+// strictly less than the cached one is treated as a stale read (the peer
+// is mid-catch-up — its queue still has items, an ownership transfer is
+// in flight, or its local shard hasn't reloaded yet) and discarded.
+//
+// Without this guard the cluster aggregate at @ would oscillate down
+// every Update tick, dropping items that were already correctly counted.
+// Concretely: 21001 fetches branch 'e' from 21003 mid-load, sees 12k of
+// the eventual 30k, and rolls back its own '@.e' from a previously
+// observed 25k to 12k — the difference is silently lost in the parent
+// sum.
 func (c *Collection) Update(sublocation string, abelian *Abelian) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -391,6 +423,13 @@ func (c *Collection) Update(sublocation string, abelian *Abelian) {
 		return
 	}
 
+	// Monotonic guard: never roll a cached aggregate backwards.
+	// previous == nil (entry never seen) always proceeds.
+	// previous.Count() == 0 also proceeds (no information yet).
+	if previous != nil && abelian.Count() < previous.Count() {
+		return
+	}
+
 	set.Put(sublocation, abelian)
 
 	delta := abelian.Clone()
@@ -398,6 +437,8 @@ func (c *Collection) Update(sublocation string, abelian *Abelian) {
 		delta.Substract(previous)
 	}
 
+	// delta.count is guaranteed >= 0 by the monotonic guard above, so
+	// parent aggregates only ever grow through Update propagation.
 	parent, child := location, sublocation
 	for {
 		parent, child = c.base.Parent(parent), parent
@@ -444,7 +485,14 @@ func (c *Collection) Complete(root string) Ownership {
 				c.sets[parent] = NewSet()
 			}
 
-			c.sets[parent].Put(previous, c.sets[previous].Abelian())
+			// Concurrent inserts/transfers may briefly leave c.sets[previous]
+			// nil while ownership chains are being rebuilt; skip the propagation
+			// rather than panicking — the next Complete() will catch up.
+			prev := c.sets[previous]
+			if prev == nil {
+				continue
+			}
+			c.sets[parent].Put(previous, prev.Abelian())
 
 			if _, exist := areas[parent]; !exist {
 				areas[parent] = Delegation{}
@@ -588,11 +636,14 @@ func (c *Collection) Refresh() map[string]any {
 
 	result := make(map[string]any)
 
+	// We refresh every delegation we hold even when a shard for that key
+	// still lives locally. Otherwise, leftover shards from earlier
+	// ownership transitions silently shadow the real owner and the parent
+	// aggregate at this node freezes (e.g. /set?location=@ never reflects
+	// items added to delegated branches).
 	for _, ownership := range c.owned {
 		for delegation := range ownership {
-			if _, exist := c.owned[delegation]; !exist {
-				result[delegation] = nil
-			}
+			result[delegation] = nil
 		}
 	}
 
@@ -614,25 +665,67 @@ func (c *Collection) SetOwnerAggregate(owner string, list map[string]*Abelian) {
 	s.SetList(list)
 }
 
-// EvictShard removes every c.sets[loc] whose key is strictly deeper than owner
-// (i.e. has owner as a true prefix or, for the root owner, is any key other
-// than owner itself). c.sets[owner] is preserved so that aggregate queries
-// continue to be served from the cached header.
+// EvictShard removes the in-RAM sub-shards whose data BELONGS to `owner`
+// (i.e. their immediate owner — the deepest c.owned ancestor in the
+// hierarchy — is exactly `owner`). c.sets[owner] itself is preserved so
+// that aggregate queries continue to be served from the cached header.
+//
+// "Immediate owner" matters: locations like '1A' look like they descend
+// from '@' (everything does), but if '1' is separately owned then '1A'
+// is part of the '1' shard's data and MUST NOT be touched when '@' is
+// being evicted. The previous prefix-only filter happily wiped '1A'
+// during root-shard eviction, deleting every Incr aggregate that c.Add
+// had built for non-delegated children of '1' and creating a permanent
+// undercount at @ (the symptom that made cluster aggregates land
+// 14k below the load count even after we fixed the cross-shard
+// delegation deletion).
+//
+// Locations that are themselves owners are also skipped — their data
+// lives in their own snapshots, not in the evicted parent's.
+//
 // Returns the number of sets removed.
 func (c *Collection) EvictShard(owner string) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	root := c.base.Root()
+
+	// immediateOwner returns the deepest c.owned ancestor of loc (or loc
+	// itself if loc is owned). When no ancestor is owned, falls back to
+	// the root because the root owner implicitly contains every key not
+	// claimed by a deeper delegation.
+	immediateOwner := func(loc string) string {
+		if _, owned := c.owned[loc]; owned {
+			return loc
+		}
+		cur := loc
+		for cur != "" {
+			cur = c.base.Parent(cur)
+			if _, owned := c.owned[cur]; owned {
+				return cur
+			}
+		}
+		return root
+	}
+
 	count := 0
-	isRoot := owner == c.base.Root()
 	for loc := range c.sets {
 		if loc == owner {
 			continue
 		}
-		if isRoot || strings.HasPrefix(loc, owner) {
-			delete(c.sets, loc)
-			count++
+		// Don't wipe a separately-owned shard (it has its own snapshot)
+		// or an intermediate aggregator that holds child aggregates for
+		// other owners' subtrees.
+		if _, owned := c.owned[loc]; owned {
+			continue
 		}
+		// The data at loc belongs to whichever shard owns it directly.
+		// Only wipe when that shard is the one being evicted.
+		if immediateOwner(loc) != owner {
+			continue
+		}
+		delete(c.sets, loc)
+		count++
 	}
 	return count
 }

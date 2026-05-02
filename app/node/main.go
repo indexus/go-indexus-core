@@ -54,6 +54,7 @@ type Config struct {
 	SSLStorageFlag        string
 	MaxLoadedShards       int
 	ShardIdleTTL          time.Duration
+	Delegation            int
 	Bootstraps            []domain.Contact
 }
 
@@ -98,8 +99,14 @@ func parseFlags() Config {
 	sslStorageFlagPtr := flag.String("sslStorage", "", "Path to the ssl certificates")
 	maxLoadedShardsFlagPtr := flag.Int("maxLoadedShards", 256, "Maximum number of shards kept in RAM (LRU budget; 0 = unlimited)")
 	shardIdleTTLFlagPtr := flag.Duration("shardIdleTTL", 0, "Evict shards idle longer than this duration (0 = disabled)")
+	delegationFlagPtr := flag.Int("delegation", domain.DelegationTreshold(), "Subtree size at which ownership delegates to a child (lower = more splits)")
 
 	flag.Parse()
+
+	delegation := *delegationFlagPtr
+	if delegation < 1 {
+		delegation = domain.DelegationTreshold()
+	}
 
 	bootstraps := make([]domain.Contact, 0)
 
@@ -132,6 +139,7 @@ func parseFlags() Config {
 		SSLStorageFlag:        *sslStorageFlagPtr,
 		MaxLoadedShards:       *maxLoadedShardsFlagPtr,
 		ShardIdleTTL:          *shardIdleTTLFlagPtr,
+		Delegation:            delegation,
 		Bootstraps:            bootstraps,
 	}
 }
@@ -154,12 +162,13 @@ func displayMessages(config Config) {
 	fmt.Println("Storage Path:", config.StorageFlag)
 	fmt.Println("Max Loaded Shards:", config.MaxLoadedShards, "(0 = unlimited)")
 	fmt.Println("Shard Idle TTL:", config.ShardIdleTTL)
+	fmt.Println("Delegation threshold:", config.Delegation)
 	fmt.Println()
 }
 
 // startProcess initializes and starts the core components of the application
 func startProcess(config Config) {
-	settings, err := core.NewSettings(config.NameFlag, config.P2pPortFlag, 10*time.Second, 5*time.Minute, domain.DelegationTreshold())
+	settings, err := core.NewSettings(config.NameFlag, config.P2pPortFlag, 10*time.Second, 5*time.Minute, config.Delegation)
 	if err != nil {
 		log.Fatal(err)
 	}

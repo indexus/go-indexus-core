@@ -1,15 +1,25 @@
 package core
 
 import (
-	"errors"
 	"fmt"
 	"log"
 	"math/rand"
+	"sync/atomic"
 	"time"
 
 	"github.com/indexus/go-indexus-core/domain"
 	"github.com/indexus/go-indexus-core/encoding"
 )
+
+// insertMetrics tracks the disposition of every queued item so we can
+// detect silent ingestion losses (forwarded vs added vs requeued vs
+// rejected at the c.Add level).
+type insertMetrics struct {
+	added     int64
+	addFail   int64
+	requeued  int64
+	forwarded int64
+}
 
 type Node struct {
 	settings     *Settings
@@ -25,10 +35,19 @@ type Node struct {
 	storage      domain.Storage
 	shards       *ShardManager
 	ready        bool
+	metrics      insertMetrics
 
 	// lastClusterHash skips redundant cluster snapshot writes when the
 	// in-memory state has not changed since the last successful save.
 	lastClusterHash uint64
+}
+
+// InsertMetrics returns a snapshot of (added, addFail, requeued, forwarded).
+func (n *Node) InsertMetrics() (int64, int64, int64, int64) {
+	return atomic.LoadInt64(&n.metrics.added),
+		atomic.LoadInt64(&n.metrics.addFail),
+		atomic.LoadInt64(&n.metrics.requeued),
+		atomic.LoadInt64(&n.metrics.forwarded)
 }
 
 func NewNode(settings *Settings, newContact func(string, map[string]any, int) domain.Contact, bootstraps []domain.Contact, storage domain.Storage, shards *ShardManager) (*Node, error) {
@@ -141,6 +160,48 @@ func (n *Node) Transfer(origin domain.Peer, key domain.Key, items []*domain.Item
 	return nil
 }
 
+// localFetch returns whatever this node holds for (collection, location)
+// without ever forwarding. Used by GetLocal and as a fallback in Get.
+func (n *Node) localFetch(collection, location string) *domain.Set {
+	if c, exist := n.collections.Get(collection); exist {
+		if set, ok := c.Get(location); ok {
+			if owner, ownerOk := c.OwnerOf(location); ownerOk {
+				n.shards.Touch(domain.Key{Collection: collection, Location: owner})
+			}
+			return set
+		}
+		if owner, ownerOk := c.OwnerOf(location); ownerOk {
+			sk := domain.Key{Collection: collection, Location: owner}
+			if err := n.shards.EnsureLoaded(sk, func() error { return n.loadShard(sk) }); err == nil {
+				if set, ok := c.Get(location); ok {
+					return set
+				}
+			}
+		}
+	}
+	if set, exist := n.cache.Get(collection, location); exist {
+		return set
+	}
+	return nil
+}
+
+// GetLocal answers strictly from this node's own state — never forwards.
+// Peers call this variant via /set?local=1 to avoid recursive cross-node
+// forwarding when the cluster routing owner doesn't actually hold the data.
+func (n *Node) GetLocal(collection, location string) (domain.Contact, *domain.Set, error) {
+	id, err := encoding.MergeEncodings(
+		encoding.BASE64,
+		encoding.BASE64,
+		location,
+		collection,
+	)
+	if err != nil {
+		log.Println("Error decoding: ", err)
+	}
+	nearest := n.registered.Nearest(0, id)
+	return nearest, n.localFetch(collection, location), nil
+}
+
 func (n *Node) Get(collection, location string) (domain.Contact, *domain.Set, error) {
 
 	id, err := encoding.MergeEncodings(
@@ -155,39 +216,132 @@ func (n *Node) Get(collection, location string) (domain.Contact, *domain.Set, er
 
 	nearest := n.registered.Nearest(0, id)
 
-	if c, exist := n.collections.Get(collection); exist {
-		// Fast path: shard already in RAM.
-		if set, ok := c.Get(location); ok {
-			if owner, ownerOk := c.OwnerOf(location); ownerOk {
-				n.shards.Touch(domain.Key{Collection: collection, Location: owner})
-			}
-			return nearest, set, nil
+	if nearest == nil || nearest.Name() == n.Name() {
+		set := n.localFetch(collection, location)
+		if set == nil {
+			n.cache.Set(collection, location, nil)
 		}
-		// Slow path: shard may be evicted — load it on demand.
-		if owner, ownerOk := c.OwnerOf(location); ownerOk {
-			sk := domain.Key{Collection: collection, Location: owner}
-			if err := n.shards.EnsureLoaded(sk, func() error { return n.loadShard(sk) }); err != nil {
-				return nearest, nil, err
-			}
-			if set, ok := c.Get(location); ok {
-				return nearest, set, nil
-			}
+		return nearest, set, nil
+	}
+
+	// XOR-routing's nearest peer may not actually hold the shard if
+	// ownership was placed at a different node when the keyspace was
+	// less populated. Walk every registered peer (closest first) using
+	// the local-only RPC variant so this fan-out can't recurse, and
+	// fall back to our own state if no one has anything.
+	tried := map[string]bool{n.Name(): true}
+	visit := func(peer domain.Contact) (domain.Contact, *domain.Set, bool) {
+		if peer == nil || tried[peer.Name()] {
+			return nil, nil, false
+		}
+		tried[peer.Name()] = true
+		contact, set, err := peer.Get(collection, location)
+		if err != nil {
+			return nil, nil, false
+		}
+		if set != nil && len(set.List()) > 0 {
+			n.cache.Set(collection, location, set)
+			return contact, set, true
+		}
+		return nil, nil, false
+	}
+
+	if contact, set, ok := visit(nearest); ok {
+		return contact, set, nil
+	}
+	for _, peer := range n.traverseRegistered(false) {
+		if contact, set, ok := visit(peer); ok {
+			return contact, set, nil
 		}
 	}
 
-	if set, exist := n.cache.Get(collection, location); exist {
+	if set := n.localFetch(collection, location); set != nil {
 		return nearest, set, nil
 	}
 
 	n.cache.Set(collection, location, nil)
-
 	return nearest, nil, nil
 }
 
 func (n *Node) GetMultiple(collection string, locations []string, precision int, properties []func(*domain.Abelian) int) ([]byte, error) {
+	if len(locations) == 0 {
+		return nil, nil
+	}
+
+	// Group locations by their nearest owner so a single /sets that spans
+	// multiple owners still returns data for every requested branch.
+	// Without this, the server only handled the first owner and silently
+	// dropped the remaining locations from the binary stream.
+	type bucket struct {
+		owner     domain.Contact
+		locations []string
+	}
+	buckets := make(map[string]*bucket)
+	order := make([]string, 0, len(locations))
+	selfBucket := ""
+
+	for _, loc := range locations {
+		id, err := encoding.MergeEncodings(
+			encoding.BASE64,
+			encoding.BASE64,
+			loc,
+			collection,
+		)
+		var ownerName string
+		var owner domain.Contact
+		if err == nil {
+			owner = n.registered.Nearest(0, id)
+			if owner != nil {
+				ownerName = owner.Name()
+			}
+		}
+		if owner == nil || ownerName == n.Name() {
+			ownerName = ""
+			owner = nil
+			if selfBucket == "" {
+				selfBucket = "self"
+			}
+			ownerName = selfBucket
+		}
+		b, exists := buckets[ownerName]
+		if !exists {
+			b = &bucket{owner: owner}
+			buckets[ownerName] = b
+			order = append(order, ownerName)
+		}
+		b.locations = append(b.locations, loc)
+	}
+
+	var combined []byte
+	for _, key := range order {
+		b := buckets[key]
+		if b.owner == nil {
+			payload, err := n.getMultipleLocal(collection, b.locations, precision, properties)
+			if err != nil {
+				return nil, err
+			}
+			combined = append(combined, payload...)
+			continue
+		}
+		if remote, ok := b.owner.(interface {
+			GetMultiple(string, []string, int, []func(*domain.Abelian) int) ([]byte, error)
+		}); ok {
+			payload, err := remote.GetMultiple(collection, b.locations, precision, properties)
+			if err != nil {
+				// One owner being unavailable shouldn't blank the whole
+				// response — keep merging successful buckets.
+				continue
+			}
+			combined = append(combined, payload...)
+		}
+	}
+	return combined, nil
+}
+
+func (n *Node) getMultipleLocal(collection string, locations []string, precision int, properties []func(*domain.Abelian) int) ([]byte, error) {
 	c, ok := n.collections.Get(collection)
 	if !ok {
-		return nil, errors.New("no collection")
+		return nil, nil
 	}
 
 	// Ensure each relevant shard is loaded before aggregating.
@@ -360,7 +514,15 @@ func (n *Node) insert(item *domain.Item, root, current string) error {
 	}
 
 	if n.Name() != contact.Name() {
-		contact.New(item, root, current)
+		// Forwarding errors used to be swallowed, silently dropping items
+		// whenever the remote peer was momentarily unreachable. Re-queue
+		// locally so the next Feed cycle retries against the freshest
+		// routing table.
+		if err := contact.New(item, root, current); err != nil {
+			log.Printf("forward to %s for %s/%s failed: %v; re-enqueuing", contact.Name(), item.Collection, current, err)
+			return n.New(item, root, item.Location)
+		}
+		atomic.AddInt64(&n.metrics.forwarded, 1)
 		return nil
 	}
 
@@ -369,12 +531,16 @@ func (n *Node) insert(item *domain.Item, root, current string) error {
 	}
 
 	if n.add(item) {
+		atomic.AddInt64(&n.metrics.added, 1)
 		return nil
 	}
+
+	atomic.AddInt64(&n.metrics.addFail, 1)
 
 	current = encoding.BASE64.Parent(current)
 
 	if len(current) == 0 {
+		atomic.AddInt64(&n.metrics.requeued, 1)
 		n.New(item, root, item.Location)
 		return nil
 	}

@@ -46,9 +46,13 @@ func (w *Worker) Start() error {
 			if err := w.Service.Refresh(); err != nil {
 				return err
 			}
-			// if err := w.Service.Update(); err != nil {
-			// 	return err
-			// }
+			// Without Update(), parent-level aggregates for delegated
+			// branches stay frozen at the value they had when the shard
+			// was last local — every /set?location=@ on the @-owner
+			// then under-reports items in branches owned by peers.
+			if err := w.Service.Update(); err != nil {
+				return err
+			}
 		}
 	}
 }
