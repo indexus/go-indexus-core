@@ -18,7 +18,8 @@ type OwnedEntry struct {
 
 // Owned returns (collection, location) keys in n.owned with leaf item counts.
 func (n *Node) Owned() ([]OwnedEntry, error) {
-	var out []OwnedEntry
+	// Non-nil slice so JSON encodes [] not null (multinode/assert.py expects a list).
+	out := make([]OwnedEntry, 0)
 	n.owned.Traverse(0, encoding.BASE64.NewID(), func(i int, b []byte, keys map[domain.Key]any) {
 		for key := range keys {
 			collection, exist := n.collections.Get(key.Collection)
