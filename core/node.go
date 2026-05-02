@@ -163,23 +163,29 @@ func (n *Node) Transfer(origin domain.Peer, key domain.Key, items []*domain.Item
 // localFetch returns whatever this node holds for (collection, location)
 // without ever forwarding. Used by GetLocal and as a fallback in Get.
 func (n *Node) localFetch(collection, location string) *domain.Set {
-	if c, exist := n.collections.Get(collection); exist {
-		if set, ok := c.Get(location); ok {
-			if owner, ownerOk := c.OwnerOf(location); ownerOk {
-				n.shards.Touch(domain.Key{Collection: collection, Location: owner})
-			}
+	c, exist := n.collections.Get(collection)
+	if !exist {
+		if set, ok := n.cache.Get(collection, location); ok {
 			return set
 		}
-		if owner, ownerOk := c.OwnerOf(location); ownerOk {
-			sk := domain.Key{Collection: collection, Location: owner}
-			if err := n.shards.EnsureLoaded(sk, func() error { return n.loadShard(sk) }); err == nil {
-				if set, ok := c.Get(location); ok {
-					return set
-				}
+		return nil
+	}
+	owner, ownerOk := c.OwnerOf(location)
+	if set, ok := c.Get(location); ok {
+		if ownerOk {
+			n.shards.Touch(domain.Key{Collection: collection, Location: owner})
+		}
+		return set
+	}
+	if ownerOk {
+		sk := domain.Key{Collection: collection, Location: owner}
+		if err := n.shards.EnsureLoaded(sk, func() error { return n.loadShard(sk) }); err == nil {
+			if set, ok := c.Get(location); ok {
+				return set
 			}
 		}
 	}
-	if set, exist := n.cache.Get(collection, location); exist {
+	if set, ok := n.cache.Get(collection, location); ok {
 		return set
 	}
 	return nil
@@ -189,32 +195,12 @@ func (n *Node) localFetch(collection, location string) *domain.Set {
 // Peers call this variant via /set?local=1 to avoid recursive cross-node
 // forwarding when the cluster routing owner doesn't actually hold the data.
 func (n *Node) GetLocal(collection, location string) (domain.Contact, *domain.Set, error) {
-	id, err := encoding.MergeEncodings(
-		encoding.BASE64,
-		encoding.BASE64,
-		location,
-		collection,
-	)
-	if err != nil {
-		log.Println("Error decoding: ", err)
-	}
-	nearest := n.registered.Nearest(0, id)
+	nearest := n.nearestRegistered(collection, location)
 	return nearest, n.localFetch(collection, location), nil
 }
 
 func (n *Node) Get(collection, location string) (domain.Contact, *domain.Set, error) {
-
-	id, err := encoding.MergeEncodings(
-		encoding.BASE64,
-		encoding.BASE64,
-		location,
-		collection,
-	)
-	if err != nil {
-		log.Println("Error decoding: ", err)
-	}
-
-	nearest := n.registered.Nearest(0, id)
+	nearest := n.nearestRegistered(collection, location)
 
 	if nearest == nil || nearest.Name() == n.Name() {
 		set := n.localFetch(collection, location)
@@ -229,36 +215,12 @@ func (n *Node) Get(collection, location string) (domain.Contact, *domain.Set, er
 	// less populated. Walk every registered peer (closest first) using
 	// the local-only RPC variant so this fan-out can't recurse, and
 	// fall back to our own state if no one has anything.
-	tried := map[string]bool{n.Name(): true}
-	visit := func(peer domain.Contact) (domain.Contact, *domain.Set, bool) {
-		if peer == nil || tried[peer.Name()] {
-			return nil, nil, false
-		}
-		tried[peer.Name()] = true
-		contact, set, err := peer.Get(collection, location)
-		if err != nil {
-			return nil, nil, false
-		}
-		if set != nil && len(set.List()) > 0 {
-			n.cache.Set(collection, location, set)
-			return contact, set, true
-		}
-		return nil, nil, false
-	}
-
-	if contact, set, ok := visit(nearest); ok {
+	if contact, set, ok := n.fanOutGet(collection, location, nearest); ok {
 		return contact, set, nil
 	}
-	for _, peer := range n.traverseRegistered(false) {
-		if contact, set, ok := visit(peer); ok {
-			return contact, set, nil
-		}
-	}
-
 	if set := n.localFetch(collection, location); set != nil {
 		return nearest, set, nil
 	}
-
 	n.cache.Set(collection, location, nil)
 	return nearest, nil, nil
 }
@@ -272,68 +234,18 @@ func (n *Node) GetMultiple(collection string, locations []string, precision int,
 	// multiple owners still returns data for every requested branch.
 	// Without this, the server only handled the first owner and silently
 	// dropped the remaining locations from the binary stream.
-	type bucket struct {
-		owner     domain.Contact
-		locations []string
-	}
-	buckets := make(map[string]*bucket)
-	order := make([]string, 0, len(locations))
-	selfBucket := ""
-
-	for _, loc := range locations {
-		id, err := encoding.MergeEncodings(
-			encoding.BASE64,
-			encoding.BASE64,
-			loc,
-			collection,
-		)
-		var ownerName string
-		var owner domain.Contact
-		if err == nil {
-			owner = n.registered.Nearest(0, id)
-			if owner != nil {
-				ownerName = owner.Name()
-			}
-		}
-		if owner == nil || ownerName == n.Name() {
-			ownerName = ""
-			owner = nil
-			if selfBucket == "" {
-				selfBucket = "self"
-			}
-			ownerName = selfBucket
-		}
-		b, exists := buckets[ownerName]
-		if !exists {
-			b = &bucket{owner: owner}
-			buckets[ownerName] = b
-			order = append(order, ownerName)
-		}
-		b.locations = append(b.locations, loc)
-	}
-
 	var combined []byte
-	for _, key := range order {
-		b := buckets[key]
-		if b.owner == nil {
-			payload, err := n.getMultipleLocal(collection, b.locations, precision, properties)
-			if err != nil {
+	for _, b := range n.groupGetMultipleBuckets(collection, locations) {
+		payload, err := n.fetchGetMultipleBucket(collection, b, precision, properties)
+		if err != nil {
+			if b.owner == nil {
 				return nil, err
 			}
-			combined = append(combined, payload...)
+			// One owner being unavailable shouldn't blank the whole
+			// response — keep merging successful buckets.
 			continue
 		}
-		if remote, ok := b.owner.(interface {
-			GetMultiple(string, []string, int, []func(*domain.Abelian) int) ([]byte, error)
-		}); ok {
-			payload, err := remote.GetMultiple(collection, b.locations, precision, properties)
-			if err != nil {
-				// One owner being unavailable shouldn't blank the whole
-				// response — keep merging successful buckets.
-				continue
-			}
-			combined = append(combined, payload...)
-		}
+		combined = append(combined, payload...)
 	}
 	return combined, nil
 }
@@ -440,18 +352,7 @@ func (n *Node) subscribe(contacts []domain.Contact) {
 }
 
 func (n *Node) find(collection, location string) (domain.Contact, error) {
-
-	id, err := encoding.MergeEncodings(
-		encoding.BASE64,
-		encoding.BASE64,
-		location,
-		collection,
-	)
-	if err != nil {
-		log.Println("Error decoding: ", err)
-	}
-
-	if nearest := n.registered.Nearest(0, id); nearest != nil {
+	if nearest := n.nearestRegistered(collection, location); nearest != nil {
 		return nearest, nil
 	}
 	return n, nil
@@ -507,45 +408,38 @@ func (n *Node) clean() error {
 }
 
 func (n *Node) insert(item *domain.Item, root, current string) error {
-
-	contact, err := n.find(item.Collection, current)
-	if err != nil {
-		return err
-	}
-
-	if n.Name() != contact.Name() {
-		// Forwarding errors used to be swallowed, silently dropping items
-		// whenever the remote peer was momentarily unreachable. Re-queue
-		// locally so the next Feed cycle retries against the freshest
-		// routing table.
-		if err := contact.New(item, root, current); err != nil {
-			log.Printf("forward to %s for %s/%s failed: %v; re-enqueuing", contact.Name(), item.Collection, current, err)
-			return n.New(item, root, item.Location)
+	for {
+		contact, err := n.find(item.Collection, current)
+		if err != nil {
+			return err
 		}
-		atomic.AddInt64(&n.metrics.forwarded, 1)
-		return nil
+		if n.Name() != contact.Name() {
+			// Forwarding errors used to be swallowed, silently dropping items
+			// whenever the remote peer was momentarily unreachable. Re-queue
+			// locally so the next Feed cycle retries against the freshest
+			// routing table.
+			if err := contact.New(item, root, current); err != nil {
+				log.Printf("forward to %s for %s/%s failed: %v; re-enqueuing", contact.Name(), item.Collection, current, err)
+				return n.New(item, root, item.Location)
+			}
+			atomic.AddInt64(&n.metrics.forwarded, 1)
+			return nil
+		}
+		if current == root {
+			n.create(item.Collection, root)
+		}
+		if n.add(item) {
+			atomic.AddInt64(&n.metrics.added, 1)
+			return nil
+		}
+		atomic.AddInt64(&n.metrics.addFail, 1)
+		current = encoding.BASE64.Parent(current)
+		if len(current) == 0 {
+			atomic.AddInt64(&n.metrics.requeued, 1)
+			n.New(item, root, item.Location)
+			return nil
+		}
 	}
-
-	if current == root {
-		n.create(item.Collection, root)
-	}
-
-	if n.add(item) {
-		atomic.AddInt64(&n.metrics.added, 1)
-		return nil
-	}
-
-	atomic.AddInt64(&n.metrics.addFail, 1)
-
-	current = encoding.BASE64.Parent(current)
-
-	if len(current) == 0 {
-		atomic.AddInt64(&n.metrics.requeued, 1)
-		n.New(item, root, item.Location)
-		return nil
-	}
-
-	return n.insert(item, root, current)
 }
 
 func (n *Node) create(col, root string) {
