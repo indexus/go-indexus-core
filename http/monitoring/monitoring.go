@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 
+	"github.com/indexus/go-indexus-core/core"
 	"github.com/indexus/go-indexus-core/domain"
 )
 
@@ -15,8 +16,11 @@ type Service interface {
 	Registered() ([]domain.Contact, error)
 	Routing() ([]domain.Contact, error)
 	Ownership() (map[string]map[string]map[string]any, error)
+	Owned() ([]core.OwnedEntry, error)
 	Queue() int
 	CacheStats() map[string]int64
+	InsertMetrics() (int64, int64, int64, int64)
+	Count() (int, error)
 }
 
 type Handler struct {
@@ -42,8 +46,11 @@ func (h *Handler) Serve(lis net.Listener) error {
 	mux.HandleFunc("/registered", h.Registered)
 	mux.HandleFunc("/routing", h.Routing)
 	mux.HandleFunc("/ownership", h.Ownership)
+	mux.HandleFunc("/owned", h.Owned)
 	mux.HandleFunc("/queue", h.Queue)
 	mux.HandleFunc("/cache", h.Cache)
+	mux.HandleFunc("/insert-metrics", h.InsertMetrics)
+	mux.HandleFunc("/count", h.Count)
 
 	s := &http.Server{Handler: mux}
 
@@ -130,6 +137,16 @@ func (h *Handler) Ownership(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, body)
 }
 
+// Owned handles the /owned endpoint — this node's owned shards with leaf counts.
+func (h *Handler) Owned(w http.ResponseWriter, r *http.Request) {
+	entries, err := h.Service.Owned()
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, entries)
+}
+
 // Queue handles the /queue endpoint
 func (h *Handler) Queue(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, struct {
@@ -142,4 +159,26 @@ func (h *Handler) Queue(w http.ResponseWriter, r *http.Request) {
 // Cache handles the /cache endpoint — returns shard LRU cache statistics.
 func (h *Handler) Cache(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, h.Service.CacheStats())
+}
+
+// InsertMetrics handles the /insert-metrics endpoint — returns counters
+// for items added, add-failures, requeues and forwards.
+func (h *Handler) InsertMetrics(w http.ResponseWriter, r *http.Request) {
+	added, addFail, requeued, forwarded := h.Service.InsertMetrics()
+	writeJSON(w, http.StatusOK, map[string]int64{
+		"added":     added,
+		"add_fail":  addFail,
+		"requeued":  requeued,
+		"forwarded": forwarded,
+	})
+}
+
+// Count handles the /count endpoint — total leaf items across all owned shards.
+func (h *Handler) Count(w http.ResponseWriter, r *http.Request) {
+	c, err := h.Service.Count()
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int{"count": c})
 }

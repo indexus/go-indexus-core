@@ -4,16 +4,19 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/indexus/go-indexus-core/domain"
 	"github.com/indexus/go-indexus-core/encoding"
 )
 
-// HttpClient is the default client used for short P2P RPCs (Ping,
-// Neighbors, Random, Get, New). The 2-second default is conservative
+// HttpClient is the default client used for short, idempotent P2P RPCs
+// (Ping, Neighbors, Random, Get). The 2-second default is conservative
 // enough to absorb WAN jitter while still failing peers fast.
 var HttpClient = &http.Client{
 	Timeout: 2 * time.Second,
@@ -23,6 +26,20 @@ var HttpClient = &http.Client{
 // `delegation` items in a single batch and therefore needs a much
 // larger budget than the discovery RPCs.
 var TransferClient = &http.Client{
+	Timeout: 30 * time.Second,
+}
+
+// ItemClient is used for forwarding individual items via /item. Even
+// though the receiver only enqueues and returns 201, the response can
+// still be delayed by GC pauses, lock contention on a busy queue, or
+// kernel-level socket backpressure when the loader saturates the
+// destination with concurrent POSTs. A 2-second budget proved too
+// tight: the origin spuriously timed out, re-queued, and the receiver
+// ended up adding the same entry twice — silently inflating parent
+// aggregates while sometimes losing the item entirely if the retry
+// also raced. Bump the budget enough to absorb that backpressure
+// without giving up the ability to detect a truly dead peer.
+var ItemClient = &http.Client{
 	Timeout: 30 * time.Second,
 }
 
@@ -294,7 +311,11 @@ func (c *Contact) Get(collection string, location string) (domain.Contact, *doma
 		ip = fmt.Sprintf("[%s]", ip)
 	}
 
-	url := fmt.Sprintf("http://%s:%d/set?collection=%s&location=%s", ip, c.port, collection, location)
+	// `local=1` tells the receiving peer to answer from its own state only
+	// instead of fanning the query out to other peers. Without it, two
+	// nodes that both lack the shard could ping-pong forever asking each
+	// other for it.
+	url := fmt.Sprintf("http://%s:%d/set?collection=%s&location=%s&local=1", ip, c.port, collection, location)
 	resp, err := HttpClient.Get(url)
 	if err != nil {
 		return nil, nil, err
@@ -314,12 +335,49 @@ func (c *Contact) Get(collection string, location string) (domain.Contact, *doma
 		return nil, nil, err
 	}
 
+	// Distinguish "peer doesn't have this set" (body.Set is nil) from
+	// "peer returned an empty set (zero entries)". The former must not
+	// overwrite a locally-cached aggregate with zero, otherwise the
+	// Update job silently rolls back items every refresh tick.
+	if body.Set == nil {
+		return body.Contact, nil, nil
+	}
 	set := domain.NewSet()
 	for key, value := range body.Set {
 		set.Put(key, value)
 	}
 
 	return body.Contact, set, nil
+}
+
+func (c *Contact) GetMultiple(collection string, locations []string, precision int, properties []func(*domain.Abelian) int) ([]byte, error) {
+	ip, parsedIP := c.ip, net.ParseIP(c.ip)
+
+	if parsedIP != nil && parsedIP.To4() == nil {
+		ip = fmt.Sprintf("[%s]", ip)
+	}
+
+	query := url.Values{}
+	query.Set("collection", collection)
+	query.Set("location", strings.Join(locations, ","))
+
+	url := fmt.Sprintf("http://%s:%d/sets?%s", ip, c.port, query.Encode())
+	resp, err := HttpClient.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("error code: %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	return body, nil
 }
 
 func (c *Contact) New(item *domain.Item, root string, current string) error {
@@ -351,7 +409,7 @@ func (c *Contact) New(item *domain.Item, root string, current string) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := HttpClient.Do(req)
+	resp, err := ItemClient.Do(req)
 	if err != nil {
 		return err
 	}

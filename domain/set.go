@@ -50,6 +50,25 @@ func (s *Set) Add(value string, abelian *Abelian, max int) bool {
 	return s.add(value, abelian, max)
 }
 
+// AddIfAbsent inserts the entry only when value is not already present.
+// Returns (added, full): added=false means a duplicate was detected and
+// the caller MUST NOT propagate aggregate Incrs to parent levels (doing
+// so would double-count this item — the exact failure mode that
+// inflated aggregates whenever a /item forward timed out at the origin
+// while actually succeeding at the receiver, then was retried). full
+// mirrors the standard Add contract so the caller can still trigger a
+// shrink when the deepest shard reaches its capacity boundary.
+func (s *Set) AddIfAbsent(value string, abelian *Abelian, max int) (added bool, full bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if existing, ok := s.list[value]; ok && existing != nil {
+		return false, len(s.list) > max
+	}
+	s.list[value] = abelian
+	return true, len(s.list) > max
+}
+
 func (s *Set) Put(value string, abelian *Abelian) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -143,12 +162,18 @@ func (s *Set) abelian() *Abelian {
 	var metrics []float64
 
 	for _, elm := range s.list {
+		if elm == nil {
+			continue
+		}
 		count += elm.Count()
 
-		if metrics == nil {
-			metrics = make([]float64, len(elm.Metrics()))
+		em := elm.Metrics()
+		if len(em) > len(metrics) {
+			grown := make([]float64, len(em))
+			copy(grown, metrics)
+			metrics = grown
 		}
-		for idx, value := range elm.Metrics() {
+		for idx, value := range em {
 			metrics[idx] += value
 		}
 	}

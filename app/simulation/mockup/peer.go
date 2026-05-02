@@ -69,6 +69,15 @@ func (n *Network) Join(node *core.Node) {
 	n.nodes[node.Name()] = node
 }
 
+// Leave removes a node from the in-process network by name so a new instance
+// with the same identity can replace it (restart simulation).
+func (n *Network) Leave(name string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	delete(n.nodes, name)
+	delete(n.unreachable, name)
+}
+
 func (n *Network) Unreachable(node *core.Node) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
