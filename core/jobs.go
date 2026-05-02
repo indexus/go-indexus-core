@@ -47,9 +47,18 @@ func (n *Node) Observe() error {
 }
 
 func (n *Node) Refresh() error {
+	n.refreshRoutingContacts()
+	n.handleOwnershipTransfers()
+	if _, err := n.SaveClusterIfDirty(); err != nil {
+		return err
+	}
+	n.maintainShards(time.Now())
+	return n.clean()
+}
 
+// refreshRoutingContacts pulls neighbor lists from routing peers and registers them.
+func (n *Node) refreshRoutingContacts() {
 	toRegister := make([]domain.Contact, 0)
-
 	for _, contact := range n.traverseRouting(false) {
 		contacts, err := contact.Neighbors(n)
 		if err != nil {
@@ -57,16 +66,16 @@ func (n *Node) Refresh() error {
 		}
 		toRegister = append(toRegister, contacts...)
 	}
-
 	n.register(toRegister)
+}
 
+// handleOwnershipTransfers delegates shards to XOR-closer peers via control().
+func (n *Node) handleOwnershipTransfers() {
 	for candidate, keys := range n.control() {
 		for key, items := range keys {
-
 			if len(items) == 0 {
 				continue
 			}
-
 			// control() may have deleted the collection if every owned
 			// location was handed off; in that case there is no Base()
 			// to walk so we just transfer with the original location.
@@ -111,32 +120,29 @@ func (n *Node) Refresh() error {
 			}
 		}
 	}
+}
 
-	if _, err := n.SaveClusterIfDirty(); err != nil {
-		return err
+// snapshotShard persists one shard header + WAL items when dirty.
+func (n *Node) snapshotShard(key domain.Key, collection *domain.Collection) {
+	header, items := extractShard(collection, key.Location)
+	if header == nil && len(items) == 0 {
+		return
 	}
-
-	// Unified shard-snapshot + LRU-eviction pass. PlanWork returns disjoint
-	// sets: toSnapshot stays in RAM, toEvict gets snapshotted (if dirty)
-	// then removed from RAM.
-	toSnapshot, toEvict := n.shards.PlanWork(time.Now())
-
-	snapshot := func(key domain.Key, collection *domain.Collection) {
-		header, items := extractShard(collection, key.Location)
-		if header == nil && len(items) == 0 {
-			return
-		}
-		if err := n.storage.SnapshotShard(key, header, items); err == nil {
-			n.shards.MarkSnapshotted(key)
-		}
+	if err := n.storage.SnapshotShard(key, header, items); err == nil {
+		n.shards.MarkSnapshotted(key)
 	}
+}
 
+// maintainShards runs PlanWork: snapshot hot shards, snapshot-then-evict cold ones.
+func (n *Node) maintainShards(now time.Time) {
+	// PlanWork returns disjoint sets: toSnapshot stays in RAM, toEvict gets
+	// snapshotted (if dirty) then removed from RAM.
+	toSnapshot, toEvict := n.shards.PlanWork(now)
 	for _, key := range toSnapshot {
 		if collection, ok := n.collections.Get(key.Collection); ok {
-			snapshot(key, collection)
+			n.snapshotShard(key, collection)
 		}
 	}
-
 	for _, key := range toEvict {
 		collection, ok := n.collections.Get(key.Collection)
 		if !ok {
@@ -146,17 +152,11 @@ func (n *Node) Refresh() error {
 		// Race-window cover: PlanWork may have skipped the dirty bit
 		// flip between its snapshot and our iteration here.
 		if n.shards.IsDirty(key) {
-			snapshot(key, collection)
+			n.snapshotShard(key, collection)
 		}
 		collection.EvictShard(key.Location)
 		n.shards.MarkEvicted(key)
 	}
-
-	if err := n.clean(); err != nil {
-		return err
-	}
-
-	return nil
 }
 
 func (n *Node) Update() error {
