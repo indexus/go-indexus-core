@@ -232,17 +232,31 @@ func (c *Collection) GetMultiple(locations []string, precision int, properties [
 		content []byte
 	}
 
-	data := make([]t, precision)
-	for idx := range data {
-		data[idx] = t{
+	makeBucket := func() t {
+		b := t{
 			size:    0,
 			bits:    make([]int, len(properties)),
 			values:  make([][]int, 0),
 			content: make([]byte, 0),
 		}
-
 		for v := 0; v < len(properties); v++ {
-			data[idx].values = append(data[idx].values, make([]int, 0))
+			b.values = append(b.values, make([]int, 0))
+		}
+		return b
+	}
+
+	if precision < 1 {
+		precision = 1
+	}
+
+	data := make([]t, precision)
+	for idx := range data {
+		data[idx] = makeBucket()
+	}
+
+	ensureDepth := func(l int) {
+		for len(data) <= l {
+			data = append(data, makeBucket())
 		}
 	}
 
@@ -259,7 +273,12 @@ func (c *Collection) GetMultiple(locations []string, precision int, properties [
 				key = key[:precision]
 			}
 
+			if len(key) == 0 {
+				continue
+			}
+
 			l := len(key) - 1
+			ensureDepth(l)
 
 			data[l].size++
 			data[l].content = append(data[l].content, []byte(key)...)
@@ -282,7 +301,7 @@ func (c *Collection) GetMultiple(locations []string, precision int, properties [
 		return bits.Len(uint(n))
 	}
 
-	for i := 0; i < precision; i++ {
+	for i := 0; i < len(data); i++ {
 		if data[i].size == 0 {
 			continue
 		}
