@@ -1,5 +1,7 @@
 .vscode
 .data
+.data-node-*
+.DS_Store
 .ssl
 */__debug*
 z_draft/*
