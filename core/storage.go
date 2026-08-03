@@ -92,7 +92,48 @@ func (n *Node) Restore() error {
 
 	stream := n.storage.Stream(0)
 	for log := range stream {
+		if strings.HasPrefix(log, "ingress|") {
+			arr := strings.Split(log, "|")
+			if len(arr) < 6 {
+				continue
+			}
+			item := &domain.Item{
+				Collection: arr[3],
+				Location:   arr[4],
+				Id:         arr[5],
+			}
+			_ = n.queue.TryAdd(NewElement(item, arr[1], arr[2]), n.settings.queueMax)
+			continue
+		}
+		if strings.HasPrefix(log, "delete|") {
+			arr := strings.Split(log, "|")
+			if len(arr) < 6 {
+				continue
+			}
+			item := &domain.Item{
+				Collection: arr[3],
+				Location:   arr[4],
+				Id:         arr[5],
+			}
+			_ = n.queue.TryAdd(NewDeleteElement(item, arr[1], arr[2]), n.settings.queueMax)
+			continue
+		}
+		if strings.HasPrefix(log, "tombstone|") {
+			arr := strings.Split(log, "|")
+			if len(arr) < 5 {
+				continue
+			}
+			var gen uint64
+			fmt.Sscanf(arr[4], "%d", &gen)
+			if c, ok := n.collections.Get(arr[1]); ok {
+				c.ApplyTombstone(arr[2], arr[3], gen)
+			}
+			continue
+		}
 		arr := strings.Split(log, "|")
+		if len(arr) < 3 {
+			continue
+		}
 		item := &domain.Item{
 			Collection: arr[0],
 			Location:   arr[1],

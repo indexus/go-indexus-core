@@ -8,14 +8,20 @@ import (
 )
 
 type Settings struct {
-	id         []byte
-	name       string
-	ip         string
-	ips        map[string]any
-	port       int
-	delay      time.Duration
-	expiration time.Duration
-	delegation int
+	id           []byte
+	name         string
+	ip           string
+	ips          map[string]any
+	port         int
+	delay        time.Duration
+	expiration   time.Duration
+	delegation   int
+	cacheBeta    float64
+	queueMax     int
+	cacheMax     int
+	updateEta    float64 // skip probability for Update pulls (0..1)
+	forwardRate  int     // max forwards per second (0 = unlimited)
+	leafRedirect int     // dense leaf count threshold for hybrid redirect
 }
 
 func NewSettings(name string, port int, delay, expiration time.Duration, delegation int) (*Settings, error) {
@@ -26,15 +32,71 @@ func NewSettings(name string, port int, delay, expiration time.Duration, delegat
 	}
 
 	return &Settings{
-		id:         id,
-		name:       name,
-		ip:         "127.0.0.1",
-		ips:        getPublicIPs(),
-		port:       port,
-		delay:      delay,
-		expiration: expiration,
-		delegation: delegation,
+		id:           id,
+		name:         name,
+		ip:           "127.0.0.1",
+		ips:          getPublicIPs(),
+		port:         port,
+		delay:        delay,
+		expiration:   expiration,
+		delegation:   delegation,
+		cacheBeta:    1.0,
+		queueMax:     10_000,
+		cacheMax:     8_000,
+		updateEta:    0.3,
+		forwardRate:  200,
+		leafRedirect: 64,
 	}, nil
+}
+
+func (s *Settings) SetCacheBeta(beta float64) {
+	if beta < 0 {
+		beta = 0
+	}
+	s.cacheBeta = beta
+}
+
+func (s *Settings) SetQueueMax(max int) {
+	s.queueMax = max
+}
+
+func (s *Settings) SetCacheMax(max int) {
+	s.cacheMax = max
+}
+
+func (s *Settings) SetUpdateEta(eta float64) {
+	if eta < 0 {
+		eta = 0
+	}
+	if eta > 1 {
+		eta = 1
+	}
+	s.updateEta = eta
+}
+
+func (s *Settings) SetForwardRate(r int) {
+	s.forwardRate = r
+}
+
+func (s *Settings) SetLeafRedirect(threshold int) {
+	s.leafRedirect = threshold
+}
+
+// SetAdvertise overrides the advertised IP set (e.g. 127.0.0.1 for local tests).
+func (s *Settings) SetAdvertise(addrs ...string) {
+	ips := make(map[string]any, len(addrs))
+	for i, a := range addrs {
+		if a == "" {
+			continue
+		}
+		ips[a] = nil
+		if i == 0 {
+			s.ip = a
+		}
+	}
+	if len(ips) > 0 {
+		s.ips = ips
+	}
 }
 
 // getPublicIPs retrieves all public IPv4 and IPv6 addresses and returns them in a map[string]any.

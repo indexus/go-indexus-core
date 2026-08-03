@@ -24,6 +24,8 @@ type Node struct {
 	queue        *domain.Queue[*Element]
 	storage      domain.Storage
 	ready        bool
+	fwdTokens    float64
+	fwdLast      time.Time
 }
 
 func NewNode(settings *Settings, newContact func(string, map[string]any, int) domain.Contact, bootstraps []domain.Contact, storage domain.Storage) (*Node, error) {
@@ -39,6 +41,8 @@ func NewNode(settings *Settings, newContact func(string, map[string]any, int) do
 		cache:        domain.NewCache(),
 		queue:        domain.NewQueue[*Element](),
 		storage:      storage,
+		fwdLast:      time.Now(),
+		fwdTokens:    float64(settings.forwardRate),
 	}
 
 	node.register([]domain.Contact{node})
@@ -126,13 +130,26 @@ func (n *Node) Random(origin domain.Peer) (domain.Contact, error) {
 
 func (n *Node) Transfer(origin domain.Peer, key domain.Key, items []*domain.Item) error {
 	for _, item := range items {
-		n.New(item, key.Location, key.Location)
+		if item == nil {
+			continue
+		}
+		if item.Tombstone {
+			n.create(item.Collection, key.Location)
+			if c, ok := n.collections.Get(item.Collection); ok {
+				c.ApplyTombstone(item.Location, item.Id, item.Gen)
+				if n.ready {
+					n.storage.Append(item.Content())
+				}
+			}
+			continue
+		}
+		_ = n.New(item, key.Location, key.Location)
 	}
 
 	return nil
 }
 
-func (n *Node) Get(collection, location string) (domain.Contact, *domain.Set, error) {
+func (n *Node) Get(collection, location string, depth int) (domain.Contact, *domain.Set, error) {
 
 	id, err := encoding.MergeEncodings(
 		encoding.BASE64,
@@ -153,12 +170,33 @@ func (n *Node) Get(collection, location string) (domain.Contact, *domain.Set, er
 		}
 	}
 
-	if set, exist := n.cache.Get(collection, location); exist {
+	if set, exist := n.cache.Get(collection, location); exist && set != nil {
 		return nearest, set, nil
 	}
 
-	n.cache.Set(collection, location, nil)
+	// Hybrid leaf: depth==0 means client wants redirect, not path-fill proxy.
+	if depth <= 0 {
+		n.cache.SetHops(collection, location, nil, 0)
+		return nearest, nil, nil
+	}
 
+	if nearest != nil && nearest.Name() != n.Name() {
+		_, set, err := nearest.Get(collection, location, depth-1)
+		if err == nil && set != nil && set.Count() > 0 {
+			// Dense leaf: if over threshold, still cache but stamp higher hops (shorter TTL).
+			hops := 1
+			if depth < 2 {
+				hops = 2
+			}
+			if n.settings.leafRedirect > 0 && set.Count() >= n.settings.leafRedirect {
+				hops++
+			}
+			n.cache.SetHops(collection, location, set, hops)
+			return nearest, set, nil
+		}
+	}
+
+	n.cache.SetHops(collection, location, nil, 0)
 	return nearest, nil, nil
 }
 
@@ -171,8 +209,44 @@ func (n *Node) GetMultiple(collection string, locations []string, precision int,
 	return c.GetMultiple(locations, precision, properties)
 }
 
+// ErrQueueFull is returned when ingress backpressure rejects a write.
+var ErrQueueFull = errors.New("ingress queue full")
+
 func (n *Node) New(item *domain.Item, root, current string) error {
-	n.queue.Add(NewElement(item, root, current))
+	if item == nil {
+		return errors.New("nil item")
+	}
+	// Durable ingress accept: persist before ack so a crash does not lose
+	// a client-visible "accepted" write. Mock storages may no-op SyncAppend.
+	line := fmt.Sprintf("ingress|%s|%s|%s", root, current, item.Content())
+	if sa, ok := n.storage.(interface{ SyncAppend(string) error }); ok {
+		if err := sa.SyncAppend(line); err != nil {
+			return fmt.Errorf("ingress wal: %w", err)
+		}
+	} else if n.ready {
+		n.storage.Append(line)
+	}
+	if !n.queue.TryAdd(NewElement(item, root, current), n.settings.queueMax) {
+		return ErrQueueFull
+	}
+	return nil
+}
+
+func (n *Node) Delete(item *domain.Item, root, current string) error {
+	if item == nil {
+		return errors.New("nil item")
+	}
+	line := fmt.Sprintf("delete|%s|%s|%s|%s|%s", root, current, item.Collection, item.Location, item.Id)
+	if sa, ok := n.storage.(interface{ SyncAppend(string) error }); ok {
+		if err := sa.SyncAppend(line); err != nil {
+			return fmt.Errorf("delete wal: %w", err)
+		}
+	} else if n.ready {
+		n.storage.Append(line)
+	}
+	if !n.queue.TryAdd(NewDeleteElement(item, root, current), n.settings.queueMax) {
+		return ErrQueueFull
+	}
 	return nil
 }
 
@@ -292,7 +366,7 @@ func (n *Node) clean() error {
 		return err
 	}
 
-	n.routing = domain.NewBST[domain.Peer]()
+	n.routing.Reset()
 
 	n.subscribe(append(neighbors, n))
 	return nil
@@ -306,7 +380,11 @@ func (n *Node) insert(item *domain.Item, root, current string) error {
 	}
 
 	if n.Name() != contact.Name() {
-		contact.New(item, root, current)
+		if err := n.forwardNew(contact, item, root, current); err != nil {
+			// Re-queue on transient forward failure (backpressure / dial).
+			_ = n.queue.TryAdd(NewElement(item, root, current), n.settings.queueMax)
+			return nil
+		}
 		return nil
 	}
 
@@ -326,6 +404,69 @@ func (n *Node) insert(item *domain.Item, root, current string) error {
 	}
 
 	return n.insert(item, root, current)
+}
+
+func (n *Node) deleteOp(item *domain.Item, root, current string) error {
+	contact, err := n.find(item.Collection, current)
+	if err != nil {
+		return err
+	}
+
+	if n.Name() != contact.Name() {
+		if err := n.forwardDelete(contact, item, root, current); err != nil {
+			_ = n.queue.TryAdd(NewDeleteElement(item, root, current), n.settings.queueMax)
+			return nil
+		}
+		return nil
+	}
+
+	if current == root {
+		n.create(item.Collection, root)
+	}
+
+	if n.remove(item) {
+		return nil
+	}
+
+	current = encoding.BASE64.Parent(current)
+	if len(current) == 0 {
+		_ = n.Delete(item, root, item.Location)
+		return nil
+	}
+	return n.deleteOp(item, root, current)
+}
+
+func (n *Node) allowForward() bool {
+	rate := n.settings.forwardRate
+	if rate <= 0 {
+		return true
+	}
+	now := time.Now()
+	elapsed := now.Sub(n.fwdLast).Seconds()
+	n.fwdLast = now
+	n.fwdTokens += elapsed * float64(rate)
+	if n.fwdTokens > float64(rate) {
+		n.fwdTokens = float64(rate)
+	}
+	if n.fwdTokens < 1 {
+		return false
+	}
+	n.fwdTokens--
+	return true
+}
+
+func (n *Node) forwardNew(contact domain.Contact, item *domain.Item, root, current string) error {
+	if !n.allowForward() {
+		return ErrQueueFull
+	}
+	return contact.New(item, root, current)
+}
+
+func (n *Node) forwardDelete(contact domain.Contact, item *domain.Item, root, current string) error {
+	if !n.allowForward() {
+		return ErrQueueFull
+	}
+	return contact.Delete(item, root, current)
 }
 
 func (n *Node) create(col, root string) {
@@ -365,6 +506,29 @@ func (n *Node) add(item *domain.Item) bool {
 		n.own(collection, areas)
 	}
 
+	return true
+}
+
+func (n *Node) remove(item *domain.Item) bool {
+	collection, exist := n.collections.Get(item.Collection)
+	if !exist {
+		return false
+	}
+
+	_, gen, ok := collection.Remove(item.Location, item.Id)
+	if !ok {
+		return false
+	}
+
+	if n.ready {
+		n.storage.Append((&domain.Item{
+			Collection: item.Collection,
+			Location:   item.Location,
+			Id:         item.Id,
+			Tombstone:  true,
+			Gen:        gen,
+		}).Content())
+	}
 	return true
 }
 

@@ -54,20 +54,22 @@ func (c *Collections) List() []*Collection {
 }
 
 type Collection struct {
-	name  string
-	base  Encoder
-	sets  map[string]*Set
-	owned Ownership
-	mu    *sync.Mutex
+	name       string
+	base       Encoder
+	sets       map[string]*Set
+	owned      Ownership
+	tombstones map[string]uint64 // "location:id" -> generation
+	mu         *sync.Mutex
 }
 
 func NewCollection(name string, root string, base Encoder) *Collection {
 	return &Collection{
-		name:  name,
-		base:  base,
-		sets:  map[string]*Set{root: NewSet()},
-		owned: map[string]Delegation{root: {}},
-		mu:    &sync.Mutex{},
+		name:       name,
+		base:       base,
+		sets:       map[string]*Set{root: NewSet()},
+		owned:      map[string]Delegation{root: {}},
+		tombstones: make(map[string]uint64),
+		mu:         &sync.Mutex{},
 	}
 }
 
@@ -93,6 +95,8 @@ func (c *Collection) Allowing(location string) bool {
 }
 
 func (c *Collection) Browse(processOwnership func(string), processDelegation func(string, string)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	for ownership, delegations := range c.owned {
 		processOwnership(ownership)
@@ -166,6 +170,9 @@ func encodeBits(values []int, bitsPerValue int) []byte {
 }
 
 func (c *Collection) GetMultiple(locations []string, precision int, properties []func(*Abelian) int) ([]byte, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	var result []byte
 
 	type t struct {
@@ -195,10 +202,15 @@ func (c *Collection) GetMultiple(locations []string, precision int, properties [
 			continue
 		}
 
-		for key, value := range set.list {
-			idxColon := strings.IndexByte(key, ':')
-			if idxColon >= 0 {
+		set.Traverse(func(key string, value *Abelian) {
+			if idx := strings.IndexByte(key, ':'); idx >= 0 {
+				key = key[:idx]
+			}
+			if len(key) > precision {
 				key = key[:precision]
+			}
+			if key == "" {
+				return
 			}
 
 			l := len(key) - 1
@@ -213,7 +225,7 @@ func (c *Collection) GetMultiple(locations []string, precision int, properties [
 					data[l].bits[idx] = p
 				}
 			}
-		}
+		})
 	}
 
 	bitsNeeded := func(n int) int {
@@ -255,7 +267,11 @@ func (c *Collection) List() map[string]*Set {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	return c.sets
+	out := make(map[string]*Set, len(c.sets))
+	for k, v := range c.sets {
+		out[k] = v
+	}
+	return out
 }
 
 func (c *Collection) Add(location string, id string, metrics []float64, delegation int) Ownership {
@@ -274,10 +290,24 @@ func (c *Collection) Add(location string, id string, metrics []float64, delegati
 		return nil
 	}
 
-	added, areas := false, Ownership{}
 	entry := fmt.Sprintf("%s:%s", location, id)
 	abelian := NewAbelian(1, metrics)
 
+	// Idempotent / replace-with-delta when the leaf already exists.
+	if setKey, previous, ok := c.findLeaf(entry); ok {
+		if previous.IsEqual(abelian) {
+			return Ownership{} // no-op success
+		}
+		c.sets[setKey].Put(entry, abelian)
+		c.refreshAncestors(setKey)
+		delete(c.tombstones, entry)
+		return Ownership{}
+	}
+
+	// Re-add after delete: clear tombstone (gen advanced by ApplyTombstone/Remove).
+	delete(c.tombstones, entry)
+
+	added, areas := false, Ownership{}
 	child, parent := "", location
 
 	for len(parent) > 0 {
@@ -310,6 +340,150 @@ func (c *Collection) Add(location string, id string, metrics []float64, delegati
 	}
 
 	return areas
+}
+
+// Remove deletes a live leaf, subtracts its Abelian up the tree, and plants a tombstone.
+// Returns (removed, gen, true) on success; (nil, 0, false) if the location is not owned.
+// Already-tombstoned ids are a successful no-op.
+func (c *Collection) Remove(location, id string) (*Abelian, uint64, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	delegated := true
+	for child, parent := "", location; parent != ""; child, parent = parent, c.base.Parent(parent) {
+		if delegation, owned := c.owned[parent]; owned {
+			_, delegated = delegation[child]
+			break
+		}
+	}
+	if delegated {
+		return nil, 0, false
+	}
+
+	entry := fmt.Sprintf("%s:%s", location, id)
+	if gen, exists := c.tombstones[entry]; exists {
+		if _, _, ok := c.findLeaf(entry); !ok {
+			return nil, gen, true // already deleted
+		}
+	}
+
+	setKey, previous, ok := c.findLeaf(entry)
+	if !ok {
+		gen := c.tombstones[entry]
+		if gen == 0 {
+			gen = 1
+		}
+		c.tombstones[entry] = gen
+		return nil, gen, true
+	}
+
+	c.sets[setKey].Delete(entry)
+	c.refreshAncestors(setKey)
+
+	gen := c.tombstones[entry] + 1
+	if gen == 0 {
+		gen = 1
+	}
+	c.tombstones[entry] = gen
+	return previous, gen, true
+}
+
+// ApplyTombstone records a remote/transferred tombstone without requiring a live leaf.
+func (c *Collection) ApplyTombstone(location, id string, gen uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	entry := fmt.Sprintf("%s:%s", location, id)
+	if setKey, _, ok := c.findLeaf(entry); ok {
+		c.sets[setKey].Delete(entry)
+		c.refreshAncestors(setKey)
+	}
+	if gen == 0 {
+		gen = 1
+	}
+	if cur, ok := c.tombstones[entry]; !ok || gen > cur {
+		c.tombstones[entry] = gen
+	}
+}
+
+// TombstonesUnder returns tombstones whose location is under the given ownership root.
+func (c *Collection) TombstonesUnder(root string) []*Item {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	out := make([]*Item, 0)
+	for entry, gen := range c.tombstones {
+		arr := strings.SplitN(entry, ":", 2)
+		if len(arr) != 2 {
+			continue
+		}
+		loc, id := arr[0], arr[1]
+		if root != c.base.Root() && loc != root && !strings.HasPrefix(loc, root) {
+			continue
+		}
+		out = append(out, &Item{
+			Collection: c.name,
+			Location:   loc,
+			Id:         id,
+			Tombstone:  true,
+			Gen:        gen,
+		})
+	}
+	return out
+}
+
+// ClearTombstonesUnder drops tombstones under root (after a successful Transfer).
+func (c *Collection) ClearTombstonesUnder(root string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for entry := range c.tombstones {
+		arr := strings.SplitN(entry, ":", 2)
+		if len(arr) != 2 {
+			continue
+		}
+		loc := arr[0]
+		if root == c.base.Root() || loc == root || strings.HasPrefix(loc, root) {
+			delete(c.tombstones, entry)
+		}
+	}
+}
+
+// IsTombstoned reports whether location:id carries an active tombstone and no live leaf.
+func (c *Collection) IsTombstoned(location, id string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry := fmt.Sprintf("%s:%s", location, id)
+	if _, ok := c.tombstones[entry]; !ok {
+		return false
+	}
+	_, _, live := c.findLeaf(entry)
+	return !live
+}
+
+// findLeaf locates a count==1 entry across all sets. Caller must hold c.mu.
+func (c *Collection) findLeaf(entry string) (setKey string, abelian *Abelian, ok bool) {
+	for key, set := range c.sets {
+		if ab, found := set.Get(entry); found && ab.Count() == 1 {
+			return key, ab, true
+		}
+	}
+	return "", nil, false
+}
+
+// refreshAncestors recomputes aggregate entries from setKey up to the root.
+func (c *Collection) refreshAncestors(setKey string) {
+	child := setKey
+	parent := c.base.Parent(setKey)
+	for parent != "" {
+		set, ok := c.sets[parent]
+		if !ok {
+			return
+		}
+		if childSet, ok := c.sets[child]; ok {
+			set.Put(child, childSet.Abelian())
+		}
+		child, parent = parent, c.base.Parent(parent)
+	}
 }
 
 func (c *Collection) Update(sublocation string, abelian *Abelian) {
@@ -403,6 +577,25 @@ func (c *Collection) Delegate(location string) ([]*Item, bool) {
 		items = append(items, &Item{Collection: c.name, Location: location, Id: id, Metrics: abelian.Metrics()})
 	})
 
+	// Carry tombstones so the receiving owner does not resurrect deleted ids.
+	for entry, gen := range c.tombstones {
+		arr := strings.SplitN(entry, ":", 2)
+		if len(arr) != 2 {
+			continue
+		}
+		loc, id := arr[0], arr[1]
+		if location == c.base.Root() || loc == location || strings.HasPrefix(loc, location) {
+			items = append(items, &Item{
+				Collection: c.name,
+				Location:   loc,
+				Id:         id,
+				Tombstone:  true,
+				Gen:        gen,
+			})
+			delete(c.tombstones, entry)
+		}
+	}
+
 	parent := c.base.Parent(location)
 
 	_, exist := c.owned[parent]
@@ -424,20 +617,26 @@ func (c *Collection) Traverse(parent string, processSet func(string, *Abelian), 
 
 func (c *Collection) traverse(parent string, processSet func(string, *Abelian), processItem func(string, string, string, *Abelian)) {
 
+	set, exist := c.sets[parent]
+	if !exist {
+		return
+	}
+
 	var total *Abelian
-	c.sets[parent].Traverse(func(key string, abelian *Abelian) {
+	set.Traverse(func(key string, abelian *Abelian) {
 
 		if total == nil {
 			total = NewAbelian(abelian.Count(), abelian.Metrics())
 		}
 
-		if abelian.Count() == 1 {
-			arr := strings.Split(key, ":")
+		// Items are keyed location:id, sub-sets by location alone. The count is
+		// not a discriminator: deleting items can leave a sub-set holding one.
+		if arr := strings.SplitN(key, ":", 2); len(arr) == 2 {
 			processItem(parent, arr[0], arr[1], abelian)
 			return
 		}
 
-		if c.browsable(parent, key) {
+		if c.browsable(parent, key) && c.sets[key] != nil {
 			c.traverse(key, processSet, processItem)
 		}
 	})
@@ -454,10 +653,13 @@ func (c *Collection) Clean(parent string, processSet func(string, *Abelian), pro
 
 func (c *Collection) clean(parent string, processSet func(string, *Abelian), processItem func(string, string, string, *Abelian)) {
 
-	c.sets[parent].Traverse(func(key string, abelian *Abelian) {
-		if abelian.Count() == 1 {
-			arr := strings.Split(key, ":")
+	set, exist := c.sets[parent]
+	if !exist {
+		return
+	}
 
+	set.Traverse(func(key string, abelian *Abelian) {
+		if arr := strings.SplitN(key, ":", 2); len(arr) == 2 {
 			k := arr[0][:len(parent)]
 			if parent != c.base.Root() {
 				k = arr[0][:len(parent)+1]

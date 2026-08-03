@@ -3,6 +3,8 @@ package mockup
 import (
 	"fmt"
 	"math/rand"
+	"sync"
+	"sync/atomic"
 
 	"github.com/indexus/go-indexus-core/core"
 	"github.com/indexus/go-indexus-core/domain"
@@ -11,9 +13,32 @@ import (
 
 var network = NewNetwork()
 
+func ResetNetwork() {
+	network.Reset()
+}
+
 type Network struct {
+	mu          sync.RWMutex
 	nodes       map[string]*core.Node
 	unreachable map[string]*core.Node
+
+	transferDropPct atomic.Int32
+	transferOK      atomic.Uint64
+	transferDropped atomic.Uint64
+}
+
+func (n *Network) SetTransferDropRate(pct int) {
+	if pct < 0 {
+		pct = 0
+	}
+	if pct > 100 {
+		pct = 100
+	}
+	n.transferDropPct.Store(int32(pct))
+}
+
+func (n *Network) TransferStats() (uint64, uint64) {
+	return n.transferOK.Load(), n.transferDropped.Load()
 }
 
 func NewNetwork() *Network {
@@ -23,19 +48,56 @@ func NewNetwork() *Network {
 	}
 }
 
+// Reset empties the network in place; reassigning the package global would
+// race with the peers still reading it.
+func (n *Network) Reset() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.nodes = map[string]*core.Node{}
+	n.unreachable = map[string]*core.Node{}
+	n.transferDropPct.Store(0)
+	n.transferOK.Store(0)
+	n.transferDropped.Store(0)
+}
+
 func (n *Network) Join(node *core.Node) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
 	n.nodes[node.Name()] = node
 }
 
 func (n *Network) Unreachable(node *core.Node) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
 	n.unreachable[node.Name()] = node
 }
 
 func (n *Network) Length() int {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
 	return len(n.nodes)
 }
 
+func (n *Network) Get(name string) (*core.Node, bool) {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	node, ok := n.nodes[name]
+	return node, ok
+}
+
+func (n *Network) Nodes() []*core.Node {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	out := make([]*core.Node, 0, len(n.nodes))
+	for _, node := range n.nodes {
+		out = append(out, node)
+	}
+	return out
+}
+
 func (n *Network) Random() *core.Node {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
 	if len(n.nodes) > 0 {
 		stop := rand.Intn(len(n.nodes))
 		for _, node := range n.nodes {
@@ -93,7 +155,7 @@ func (p *Peer) Host() string {
 
 func (p *Peer) Ping(origin domain.Contact) (domain.Contact, error) {
 
-	distant, ok := network.nodes[p.Name()]
+	distant, ok := network.Get(p.Name())
 	if !ok {
 		return nil, fmt.Errorf("error code: 404")
 	}
@@ -108,7 +170,7 @@ func (p *Peer) Ping(origin domain.Contact) (domain.Contact, error) {
 
 func (p *Peer) Neighbors(origin domain.Peer) ([]domain.Contact, error) {
 
-	distant, ok := network.nodes[p.Name()]
+	distant, ok := network.Get(p.Name())
 	if !ok {
 		return nil, fmt.Errorf("error code: 404")
 	}
@@ -128,7 +190,7 @@ func (p *Peer) Neighbors(origin domain.Peer) ([]domain.Contact, error) {
 
 func (p *Peer) Random(origin domain.Peer) (domain.Contact, error) {
 
-	distant, ok := network.nodes[p.Name()]
+	distant, ok := network.Get(p.Name())
 	if !ok {
 		return nil, fmt.Errorf("error code: 404")
 	}
@@ -147,7 +209,14 @@ func (p *Peer) Random(origin domain.Peer) (domain.Contact, error) {
 
 func (p *Peer) Transfer(origin domain.Peer, key domain.Key, items []*domain.Item) error {
 
-	distant, ok := network.nodes[p.Name()]
+	if pct := network.transferDropPct.Load(); pct > 0 {
+		if rand.Intn(100) < int(pct) {
+			network.transferDropped.Add(1)
+			return fmt.Errorf("simulated transfer drop")
+		}
+	}
+
+	distant, ok := network.Get(p.Name())
 	if !ok {
 		return fmt.Errorf("error code: 404")
 	}
@@ -156,18 +225,19 @@ func (p *Peer) Transfer(origin domain.Peer, key domain.Key, items []*domain.Item
 	if err != nil {
 		return fmt.Errorf("error making request: %s", err.Error())
 	}
+	network.transferOK.Add(1)
 
 	return nil
 }
 
-func (p *Peer) Get(collection string, location string) (domain.Contact, *domain.Set, error) {
+func (p *Peer) Get(collection string, location string, depth int) (domain.Contact, *domain.Set, error) {
 
-	distant, ok := network.nodes[p.Name()]
+	distant, ok := network.Get(p.Name())
 	if !ok {
 		return nil, nil, fmt.Errorf("error code: 404")
 	}
 
-	contact, set, err := distant.Get(collection, location)
+	contact, set, err := distant.Get(collection, location, depth)
 	if err != nil {
 		return nil, nil, fmt.Errorf("error making request: %s", err.Error())
 	}
@@ -177,7 +247,7 @@ func (p *Peer) Get(collection string, location string) (domain.Contact, *domain.
 
 func (p *Peer) New(item *domain.Item, root string, current string) error {
 
-	distant, ok := network.nodes[p.Name()]
+	distant, ok := network.Get(p.Name())
 	if !ok {
 		return fmt.Errorf("error code: 404")
 	}
@@ -187,5 +257,17 @@ func (p *Peer) New(item *domain.Item, root string, current string) error {
 		return fmt.Errorf("error making request: %s", err.Error())
 	}
 
+	return err
+}
+
+func (p *Peer) Delete(item *domain.Item, root string, current string) error {
+	distant, ok := network.Get(p.Name())
+	if !ok {
+		return fmt.Errorf("error code: 404")
+	}
+	err := distant.Delete(item, root, current)
+	if err != nil {
+		return fmt.Errorf("error making request: %s", err.Error())
+	}
 	return err
 }
