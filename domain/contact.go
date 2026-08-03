@@ -12,8 +12,9 @@ type Contact interface {
 	Neighbors(Peer) ([]Contact, error)
 	Random(Peer) (Contact, error)
 	Transfer(Peer, Key, []*Item) error
-	Get(string, string) (Contact, *Set, error)
+	Get(collection, location string, depth int) (Contact, *Set, error)
 	New(*Item, string, string) error
+	Delete(*Item, string, string) error
 }
 
 func ConvertToContactSlice[T Contact](items []T) []Contact {

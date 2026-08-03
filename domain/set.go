@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"strings"
 	"sync"
 	"time"
 )
@@ -79,6 +80,20 @@ func (s *Set) Incr(value string, abelian *Abelian) *Abelian {
 	return s.incr(value, abelian)
 }
 
+func (s *Set) Decr(value string, abelian *Abelian) *Abelian {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.decr(value, abelian)
+}
+
+func (s *Set) Delete(value string) (*Abelian, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.delete(value)
+}
+
 func (s *Set) Reset() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -151,6 +166,23 @@ func (s *Set) incr(value string, delta *Abelian) *Abelian {
 	return s.list[value]
 }
 
+func (s *Set) decr(value string, delta *Abelian) *Abelian {
+	if _, ok := s.list[value]; !ok {
+		s.list[value] = NewAbelian(0, nil)
+	}
+	s.list[value].Substract(delta)
+	return s.list[value]
+}
+
+func (s *Set) delete(value string) (*Abelian, bool) {
+	abelian, ok := s.list[value]
+	if !ok {
+		return nil, false
+	}
+	delete(s.list, value)
+	return abelian, true
+}
+
 func (s *Set) shrink(base Encoder, sets map[string]*Set, key string, max int) {
 
 	type tmp struct {
@@ -159,8 +191,9 @@ func (s *Set) shrink(base Encoder, sets map[string]*Set, key string, max int) {
 	}
 	list := make(map[string]*Abelian)
 	exist := make(map[string]tmp)
+	moved := make(map[string]any)
 
-	child, precision := "", len(key)
+	precision := len(key)
 	if key == base.Root() {
 		precision = 0
 	}
@@ -172,22 +205,30 @@ func (s *Set) shrink(base Encoder, sets map[string]*Set, key string, max int) {
 			continue
 		}
 
-		child = current[:precision+1]
+		// Entries are "location:id"; only the location part is splittable.
+		location := current
+		if idx := strings.IndexByte(current, ':'); idx >= 0 {
+			location = current[:idx]
+		}
 
-		if set, ok1 := sets[child]; ok1 {
-			full := set.add(current, abelian, max)
-			list[child].Sum(abelian)
+		if len(location) <= precision {
+			list[current] = abelian
+			continue
+		}
+		child := location[:precision+1]
 
-			if full {
+		if set, ok := sets[child]; ok {
+			if set.add(current, abelian, max) {
 				set.shrink(base, sets, child, max)
 			}
-		} else if first, ok2 := exist[child]; ok2 {
+			moved[child] = nil
+		} else if first, ok := exist[child]; ok {
 			set := NewSet()
 			set.add(first.key, first.abelian, max)
 			set.add(current, abelian, max)
 
 			sets[child] = set
-			list[child] = set.Abelian()
+			moved[child] = nil
 			delete(exist, child)
 		} else {
 			exist[child] = tmp{
@@ -199,6 +240,11 @@ func (s *Set) shrink(base Encoder, sets map[string]*Set, key string, max int) {
 
 	for _, elm := range exist {
 		list[elm.key] = elm.abelian
+	}
+
+	// Last word: an aggregate copied above would otherwise be stale.
+	for child := range moved {
+		list[child] = sets[child].abelian()
 	}
 
 	s.list = list

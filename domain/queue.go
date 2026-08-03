@@ -28,6 +28,20 @@ func (q *Queue[T]) Add(e T) {
 	q.cond.Signal()
 }
 
+// TryAdd enqueues only if pending length < max. max<=0 means unbounded.
+func (q *Queue[T]) TryAdd(e T, max int) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	pending := len(q.data) - q.cursor
+	if max > 0 && pending >= max {
+		return false
+	}
+	q.data = append(q.data, e)
+	q.cond.Signal()
+	return true
+}
+
 func (q *Queue[T]) Consume() (T, bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()

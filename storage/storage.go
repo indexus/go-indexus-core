@@ -108,6 +108,23 @@ func (s *Storage) Append(log string) {
 	s.input <- log
 }
 
+// SyncAppend durable-writes one line (append + fsync) for ingress ACK.
+func (s *Storage) SyncAppend(log string) error {
+	path := fmt.Sprintf("%s.logs", s.filename)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("sync append open: %w", err)
+	}
+	defer f.Close()
+	if _, err := f.WriteString(log + "\n"); err != nil {
+		return fmt.Errorf("sync append write: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("sync append fsync: %w", err)
+	}
+	return nil
+}
+
 func (s *Storage) Stream(start int) <-chan string {
 	stream := make(chan string)
 	go func() {

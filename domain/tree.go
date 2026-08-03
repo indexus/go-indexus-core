@@ -223,6 +223,13 @@ func (bst *BST[N]) Insert(idx int, id []byte, node N) {
 	bst.tree.Insert(idx, id, node)
 }
 
+func (bst *BST[N]) Reset() {
+	bst.mu.Lock()
+	defer bst.mu.Unlock()
+
+	bst.tree = &tree[N]{}
+}
+
 func (bst *BST[N]) Update(idx int, id []byte, process func(int, []byte, N)) {
 	bst.mu.Lock()
 	defer bst.mu.Unlock()

@@ -88,6 +88,41 @@ func (b *Base) RandomName() (string, error) {
 	return b.Encode(id), nil
 }
 
+// RandomNameNear returns a random ID that shares the first keepBits bits with
+// target (XOR-near). Used when spawning nodes to relieve a hot owner.
+func (b *Base) RandomNameNear(target []byte, keepBits int) (string, error) {
+	id := make([]byte, b.idLength)
+	_, err := rand.Read(id)
+	if err != nil {
+		return "", err
+	}
+	if len(target) == 0 {
+		return b.Encode(id), nil
+	}
+	total := b.idLength * 8
+	if keepBits < 0 {
+		keepBits = 0
+	}
+	if keepBits > total {
+		keepBits = total
+	}
+	if keepBits > len(target)*8 {
+		keepBits = len(target) * 8
+	}
+	out := make([]byte, b.idLength)
+	copy(out, id)
+	fullBytes := keepBits / 8
+	rem := keepBits % 8
+	for i := 0; i < fullBytes && i < len(out) && i < len(target); i++ {
+		out[i] = target[i]
+	}
+	if rem > 0 && fullBytes < len(out) && fullBytes < len(target) {
+		mask := byte(0xFF << (8 - rem))
+		out[fullBytes] = (target[fullBytes] & mask) | (out[fullBytes] & ^mask)
+	}
+	return b.Encode(out), nil
+}
+
 // Encode converts a byte slice into a base-N string of length b.idLength.
 // It uses exactly b.idLength * b.bitsPerChar bits from src (padding with zero bits if needed).
 func (b *Base) Encode(src []byte) string {

@@ -287,14 +287,14 @@ func (c *Contact) Transfer(origin domain.Peer, key domain.Key, items []*domain.I
 	return nil
 }
 
-func (c *Contact) Get(collection string, location string) (domain.Contact, *domain.Set, error) {
+func (c *Contact) Get(collection string, location string, depth int) (domain.Contact, *domain.Set, error) {
 	ip, parsedIP := c.ip, net.ParseIP(c.ip)
 
 	if parsedIP != nil && parsedIP.To4() == nil {
 		ip = fmt.Sprintf("[%s]", ip)
 	}
 
-	url := fmt.Sprintf("http://%s:%d/set?collection=%s&location=%s", ip, c.port, collection, location)
+	url := fmt.Sprintf("http://%s:%d/set?collection=%s&location=%s&depth=%d", ip, c.port, collection, location, depth)
 	resp, err := HttpClient.Get(url)
 	if err != nil {
 		return nil, nil, err
@@ -314,12 +314,24 @@ func (c *Contact) Get(collection string, location string) (domain.Contact, *doma
 		return nil, nil, err
 	}
 
+	if body.Set == nil {
+		var contact domain.Contact
+		if body.Contact != nil {
+			contact = body.Contact
+		}
+		return contact, nil, nil
+	}
+
 	set := domain.NewSet()
 	for key, value := range body.Set {
 		set.Put(key, value)
 	}
 
-	return body.Contact, set, nil
+	var contact domain.Contact
+	if body.Contact != nil {
+		contact = body.Contact
+	}
+	return contact, set, nil
 }
 
 func (c *Contact) New(item *domain.Item, root string, current string) error {
@@ -357,7 +369,55 @@ func (c *Contact) New(item *domain.Item, root string, current string) error {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusServiceUnavailable {
+		return fmt.Errorf("ingress queue full")
+	}
 	if resp.StatusCode != http.StatusCreated {
+		return fmt.Errorf("error code: %d", resp.StatusCode)
+	}
+
+	return nil
+}
+
+func (c *Contact) Delete(item *domain.Item, root string, current string) error {
+	ip, parsedIP := c.ip, net.ParseIP(c.ip)
+
+	if parsedIP != nil && parsedIP.To4() == nil {
+		ip = fmt.Sprintf("[%s]", ip)
+	}
+
+	url := fmt.Sprintf("http://%s:%d/item/delete", ip, c.port)
+	body := struct {
+		Item    *domain.Item `json:"item"`
+		Root    string       `json:"root"`
+		Current string       `json:"current"`
+	}{
+		Item:    item,
+		Root:    root,
+		Current: current,
+	}
+
+	jsonData, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := HttpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusServiceUnavailable {
+		return fmt.Errorf("ingress queue full")
+	}
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("error code: %d", resp.StatusCode)
 	}
 

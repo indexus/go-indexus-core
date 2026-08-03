@@ -59,42 +59,55 @@ func (n *Node) Count() (int, error) {
 func (n *Node) Check() []string {
 	result := make([]string, 0)
 
+	// Ownerships and owned keys are collected before being looked up: holding a
+	// collection lock while taking the owned tree lock (or the reverse) would
+	// deadlock against the ingest path.
 	for _, collection := range n.collections.List() {
+		ownerships := make([]string, 0)
 		collection.Browse(
 			func(ownership string) {
-
-				id, err := encoding.MergeEncodings(
-					encoding.BASE64,
-					encoding.BASE64,
-					ownership,
-					collection.Name(),
-				)
-				if err != nil {
-					return
-				}
-
-				_, ok := n.owned.Get(0, id)
-				if !ok {
-					result = append(result, fmt.Sprintf("%s:%s", collection.Name(), ownership))
-				}
+				ownerships = append(ownerships, ownership)
 			},
 			func(ownership, delegation string) {},
 		)
-	}
 
-	n.owned.Traverse(0, encoding.BASE64.NewID(), func(i int, b []byte, keys map[domain.Key]any) {
-		for key := range keys {
-			collection, ok := n.collections.Get(key.Collection)
-			if !ok {
-				result = append(result, fmt.Sprintf("%s:%s", collection.Name(), key.Location))
+		for _, ownership := range ownerships {
+			id, err := encoding.MergeEncodings(
+				encoding.BASE64,
+				encoding.BASE64,
+				ownership,
+				collection.Name(),
+			)
+			if err != nil {
+				continue
 			}
 
-			_, ok = collection.Get(key.Location)
+			_, ok := n.owned.Get(0, id)
 			if !ok {
-				result = append(result, fmt.Sprintf("%s:%s", collection.Name(), key.Location))
+				result = append(result, fmt.Sprintf("%s:%s", collection.Name(), ownership))
 			}
 		}
+	}
+
+	owned := make([]domain.Key, 0)
+	n.owned.Traverse(0, encoding.BASE64.NewID(), func(i int, b []byte, keys map[domain.Key]any) {
+		for key := range keys {
+			owned = append(owned, key)
+		}
 	})
+
+	for _, key := range owned {
+		collection, ok := n.collections.Get(key.Collection)
+		if !ok {
+			result = append(result, fmt.Sprintf("%s:%s", key.Collection, key.Location))
+			continue
+		}
+
+		_, ok = collection.Get(key.Location)
+		if !ok {
+			result = append(result, fmt.Sprintf("%s:%s", key.Collection, key.Location))
+		}
+	}
 	return result
 }
 

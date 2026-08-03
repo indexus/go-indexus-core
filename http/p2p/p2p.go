@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/indexus/go-indexus-core/domain"
@@ -53,9 +54,10 @@ type Service interface {
 	Neighbors(domain.Peer) ([]domain.Contact, error)
 	Random(domain.Peer) (domain.Contact, error)
 	Transfer(domain.Peer, domain.Key, []*domain.Item) error
-	Get(string, string) (domain.Contact, *domain.Set, error)
+	Get(string, string, int) (domain.Contact, *domain.Set, error)
 	GetMultiple(string, []string, int, []func(*domain.Abelian) int) ([]byte, error)
 	New(*domain.Item, string, string) error
+	Delete(*domain.Item, string, string) error
 }
 
 type Handler struct {
@@ -90,6 +92,7 @@ func (h *Handler) Serve(lis net.Listener) error {
 	mux.HandleFunc("/set", h.Get)
 	mux.HandleFunc("/sets", h.GetMultiple)
 	mux.HandleFunc("/item", h.New)
+	mux.HandleFunc("/item/delete", h.Delete)
 
 	// Configure CORS
 	c := cors.New(cors.Options{
@@ -263,7 +266,14 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	collection := r.URL.Query().Get("collection")
 	location := r.URL.Query().Get("location")
 
-	contact, set, err := h.Service.Get(collection, location)
+	depth := 2
+	if d := r.URL.Query().Get("depth"); d != "" {
+		if v, err := strconv.Atoi(d); err == nil {
+			depth = v
+		}
+	}
+
+	contact, set, err := h.Service.Get(collection, location, depth)
 	if err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
@@ -278,13 +288,15 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		Contact Contact                    `json:"contact"`
 		Set     map[string]*domain.Abelian `json:"set"`
 	}{
-		Contact: Contact{
+		Set: list,
+	}
+	if contact != nil {
+		body.Contact = Contact{
 			Name: contact.Name(),
 			IPs:  contact.IPs(),
 			Port: contact.Port(),
 			IP:   contact.IP(),
-		},
-		Set: list,
+		}
 	}
 
 	writeJSON(w, http.StatusOK, body)
@@ -350,6 +362,34 @@ func (h *Handler) New(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.Service.New(body.Item, body.Root, body.Current); err != nil {
+		if strings.Contains(err.Error(), "ingress queue full") {
+			w.Header().Set("Retry-After", "1")
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "ingress queue full"})
+			return
+		}
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		return
+	}
+	w.WriteHeader(http.StatusCreated)
+}
+
+// Delete handles POST /item/delete
+func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Item    *domain.Item `json:"item"`
+		Root    string       `json:"root"`
+		Current string       `json:"current"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	if err := h.Service.Delete(body.Item, body.Root, body.Current); err != nil {
+		if strings.Contains(err.Error(), "ingress queue full") {
+			w.Header().Set("Retry-After", "1")
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "ingress queue full"})
+			return
+		}
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
 	}

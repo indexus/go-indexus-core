@@ -154,7 +154,7 @@ func (h *Handler) Ping(w http.ResponseWriter, r *http.Request) {
 
 	destination := r.Header.Get("Destination")
 
-	node, ok := network.nodes[destination]
+	node, ok := network.Get(destination)
 	if !ok {
 		w.WriteHeader(http.StatusNotFound)
 		return
@@ -199,7 +199,7 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 
 	destination := r.Header.Get("Destination")
 
-	node, ok := network.nodes[destination]
+	node, ok := network.Get(destination)
 	if !ok {
 		w.WriteHeader(http.StatusNotFound)
 		return
@@ -208,7 +208,7 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	collection := r.URL.Query().Get("collection")
 	location := r.URL.Query().Get("location")
 
-	contact, set, err := node.Get(collection, location)
+	contact, set, err := node.Get(collection, location, 2)
 	if err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
@@ -241,7 +241,7 @@ func (h *Handler) GetMultiple(w http.ResponseWriter, r *http.Request) {
 
 	destination := r.Header.Get("Destination")
 
-	node, ok := network.nodes[destination]
+	node, ok := network.Get(destination)
 	if !ok {
 		w.WriteHeader(http.StatusNotFound)
 		return
@@ -299,7 +299,7 @@ func (h *Handler) New(w http.ResponseWriter, r *http.Request) {
 
 	destination := r.Header.Get("Destination")
 
-	node, ok := network.nodes[destination]
+	node, ok := network.Get(destination)
 	if !ok {
 		w.WriteHeader(http.StatusNotFound)
 		return
@@ -327,7 +327,7 @@ func (h *Handler) Acknowledged(w http.ResponseWriter, r *http.Request) {
 
 	destination := r.Header.Get("Destination")
 
-	node, ok := network.nodes[destination]
+	node, ok := network.Get(destination)
 	if !ok {
 		node, ok = network.unreachable[destination]
 		if !ok {
@@ -359,7 +359,7 @@ func (h *Handler) Registered(w http.ResponseWriter, r *http.Request) {
 
 	destination := r.Header.Get("Destination")
 
-	node, ok := network.nodes[destination]
+	node, ok := network.Get(destination)
 	if !ok {
 		node, ok = network.unreachable[destination]
 		if !ok {
@@ -391,7 +391,7 @@ func (h *Handler) Routing(w http.ResponseWriter, r *http.Request) {
 
 	destination := r.Header.Get("Destination")
 
-	node, ok := network.nodes[destination]
+	node, ok := network.Get(destination)
 	if !ok {
 		node, ok = network.unreachable[destination]
 		if !ok {
@@ -423,7 +423,7 @@ func (h *Handler) AllOwnership(w http.ResponseWriter, r *http.Request) {
 
 	body := map[string]any{}
 
-	for _, node := range network.nodes {
+	for _, node := range network.Nodes() {
 		arr, err := node.Ownership()
 		if err != nil || len(arr) == 0 {
 			continue
@@ -441,7 +441,7 @@ func (h *Handler) AllCount(w http.ResponseWriter, r *http.Request) {
 	body := map[string]any{}
 	total := 0
 
-	for _, node := range network.nodes {
+	for _, node := range network.Nodes() {
 		count, err := node.Count()
 		if err != nil {
 			continue
@@ -460,7 +460,7 @@ func (h *Handler) AllCheck(w http.ResponseWriter, r *http.Request) {
 
 	body := map[string]any{}
 
-	for _, node := range network.nodes {
+	for _, node := range network.Nodes() {
 		body[node.Name()] = node.Check()
 	}
 
@@ -473,14 +473,14 @@ func (h *Handler) AllQueue(w http.ResponseWriter, r *http.Request) {
 
 	body := map[string]any{}
 
-	for _, node := range network.nodes {
+	for _, node := range network.Nodes() {
 		body[node.Name()] = node.Queue()
 	}
 
 	writeJSON(w, http.StatusOK, body)
 }
 
-// FeedNetwork handles the /feed/network.nodes endpoint
+// FeedNetwork handles the /feed/network endpoint
 func (h *Handler) FeedNetwork(w http.ResponseWriter, r *http.Request) {
 	h.randomDelay() // Introduce latency
 
@@ -504,7 +504,7 @@ func (h *Handler) FeedNetwork(w http.ResponseWriter, r *http.Request) {
 			log.Fatal(err)
 		}
 
-		settings, err := core.NewSettings(name, len(network.nodes), 1*time.Second, 5*time.Minute, domain.DelegationTreshold())
+		settings, err := core.NewSettings(name, network.Length(), 1*time.Second, 5*time.Minute, domain.DelegationTreshold())
 		if err != nil {
 			log.Fatal(err)
 		}
