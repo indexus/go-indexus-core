@@ -83,7 +83,16 @@ func (n *Node) Restore() error {
 			n.create(collection, ownership)
 		case "delegation":
 			delegation = arr[1]
-			c, _ := n.collections.Get(collection)
+			c, ok := n.collections.Get(collection)
+			if !ok {
+				continue
+			}
+			// A snapshot can name a delegation whose location set was never
+			// materialized, e.g. saved while ownership was being handed off.
+			// Delegating it would walk a set that does not exist.
+			if _, exist := c.Get(delegation); !exist {
+				continue
+			}
 			c.Delegate(delegation)
 		default:
 			return errors.New("backup file is corrupted and cannot be restored")

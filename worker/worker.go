@@ -40,14 +40,17 @@ func (w *Worker) Start() error {
 		case <-w.ctx.Done():
 			return nil
 		case <-time.After(w.Service.Delay()):
+			// A job failure is almost always transient — an unreachable peer, a
+			// full queue. Returning here would stop rebalancing and cache
+			// refresh for good while the node keeps answering requests.
 			if err := w.Service.Observe(); err != nil {
-				return err
+				log.Printf("worker Observe: %v", err)
 			}
 			if err := w.Service.Refresh(); err != nil {
-				return err
+				log.Printf("worker Refresh: %v", err)
 			}
 			if err := w.Service.Update(); err != nil {
-				return err
+				log.Printf("worker Update: %v", err)
 			}
 		}
 	}
