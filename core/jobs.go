@@ -191,7 +191,11 @@ func (n *Node) Feed() error {
 			continue
 		}
 		if err := n.process(element); err != nil {
-			return err
+			// A peer EOF or a transient dial failure must not stop ingestion for
+			// good. Re-queue and back off instead of returning.
+			log.Printf("feed op failed (re-queue): %v", err)
+			_ = n.queue.TryAdd(element, n.settings.queueMax)
+			time.Sleep(50 * time.Millisecond)
 		}
 	}
 }
