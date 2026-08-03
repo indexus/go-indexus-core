@@ -143,7 +143,11 @@ func (n *Node) Transfer(origin domain.Peer, key domain.Key, items []*domain.Item
 			}
 			continue
 		}
-		_ = n.New(item, key.Location, key.Location)
+		// The sender drops its own copy once this call succeeds, so an item we
+		// cannot enqueue has to be reported rather than acknowledged.
+		if err := n.New(item, key.Location, key.Location); err != nil {
+			return err
+		}
 	}
 
 	return nil

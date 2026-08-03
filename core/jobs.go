@@ -100,8 +100,7 @@ func (n *Node) Refresh() error {
 		}
 	}
 
-	// n.Snapshot()
-	err := n.storage.Save([]string{})
+	err := n.storage.Save(n.Snapshot())
 	if err != nil {
 		return err
 	}
