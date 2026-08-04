@@ -13,8 +13,11 @@ import (
 
 var network = NewNetwork()
 
+// ResetNetwork drops all known nodes from the in-process simulation.
+// Intended for tests that want a clean global before driving a new
+// topology.
 func ResetNetwork() {
-	network.Reset()
+	network = NewNetwork()
 }
 
 type Network struct {
@@ -22,11 +25,21 @@ type Network struct {
 	nodes       map[string]*core.Node
 	unreachable map[string]*core.Node
 
+	// transferDropPct is a 0..100 percentage. When non-zero, every
+	// Transfer call has that probability of returning a synthetic
+	// transport error WITHOUT dispatching to the receiver. Used by the
+	// fault-injection tests to exercise the lossy-handoff path.
 	transferDropPct atomic.Int32
+
+	// transferCounters track how many Transfer calls succeeded vs
+	// were dropped by fault injection. Useful to assert in tests.
 	transferOK      atomic.Uint64
 	transferDropped atomic.Uint64
 }
 
+// SetTransferDropRate sets the probability (0..100) that any given
+// Transfer call will fail with a synthetic transport error. Setting it
+// to 0 disables fault injection.
 func (n *Network) SetTransferDropRate(pct int) {
 	if pct < 0 {
 		pct = 0
@@ -37,6 +50,8 @@ func (n *Network) SetTransferDropRate(pct int) {
 	n.transferDropPct.Store(int32(pct))
 }
 
+// TransferStats returns (ok, dropped) Transfer counters since the
+// network was created.
 func (n *Network) TransferStats() (uint64, uint64) {
 	return n.transferOK.Load(), n.transferDropped.Load()
 }
@@ -46,18 +61,6 @@ func NewNetwork() *Network {
 		nodes:       map[string]*core.Node{},
 		unreachable: map[string]*core.Node{},
 	}
-}
-
-// Reset empties the network in place; reassigning the package global would
-// race with the peers still reading it.
-func (n *Network) Reset() {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	n.nodes = map[string]*core.Node{}
-	n.unreachable = map[string]*core.Node{}
-	n.transferDropPct.Store(0)
-	n.transferOK.Store(0)
-	n.transferDropped.Store(0)
 }
 
 func (n *Network) Join(node *core.Node) {
@@ -220,12 +223,12 @@ func (p *Peer) Transfer(origin domain.Peer, key domain.Key, items []*domain.Item
 	if !ok {
 		return fmt.Errorf("error code: 404")
 	}
+	network.transferOK.Add(1)
 
 	err := distant.Transfer(origin, key, items)
 	if err != nil {
 		return fmt.Errorf("error making request: %s", err.Error())
 	}
-	network.transferOK.Add(1)
 
 	return nil
 }
@@ -261,13 +264,16 @@ func (p *Peer) New(item *domain.Item, root string, current string) error {
 }
 
 func (p *Peer) Delete(item *domain.Item, root string, current string) error {
+
 	distant, ok := network.Get(p.Name())
 	if !ok {
 		return fmt.Errorf("error code: 404")
 	}
+
 	err := distant.Delete(item, root, current)
 	if err != nil {
 		return fmt.Errorf("error making request: %s", err.Error())
 	}
+
 	return err
 }

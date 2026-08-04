@@ -2,6 +2,7 @@ package core
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/indexus/go-indexus-core/domain"
 	"github.com/indexus/go-indexus-core/encoding"
@@ -44,7 +45,7 @@ func (n *Node) Count() (int, error) {
 		for key := range keys {
 			collection, exist := n.collections.Get(key.Collection)
 			if !exist {
-				return
+				continue
 			}
 			collection.Traverse(
 				key.Location,
@@ -53,15 +54,29 @@ func (n *Node) Count() (int, error) {
 			)
 		}
 	})
+	n.items.Store(int64(total))
 	return total, nil
+}
+
+func (n *Node) Items() int {
+	if n.items.Load() == 0 && n.lastCountAt.Load() == 0 {
+		total, _ := n.Count()
+		n.lastCountAt.Store(time.Now().UnixNano())
+		return total
+	}
+	return int(n.items.Load())
+}
+
+func (n *Node) MeasureItems() {
+	if _, err := n.Count(); err != nil {
+		return
+	}
+	n.lastCountAt.Store(time.Now().UnixNano())
 }
 
 func (n *Node) Check() []string {
 	result := make([]string, 0)
 
-	// Ownerships and owned keys are collected before being looked up: holding a
-	// collection lock while taking the owned tree lock (or the reverse) would
-	// deadlock against the ingest path.
 	for _, collection := range n.collections.List() {
 		ownerships := make([]string, 0)
 		collection.Browse(
@@ -113,4 +128,36 @@ func (n *Node) Check() []string {
 
 func (n *Node) Queue() int {
 	return n.queue.Length()
+}
+
+func (n *Node) SnapshotInfo() map[string]any {
+	info := map[string]any{
+		"store":        n.Store() != nil,
+		"delegation":   n.Delegation(),
+		"deleg_in":     n.pendingInbound(),
+		"deleg_out":    0,
+		"dirty":        0,
+		"snapped":      0,
+		"wal_segments": 0,
+	}
+	if n == nil {
+		return info
+	}
+	n.delegMu.Lock()
+	out := 0
+	for _, s := range n.delegOut {
+		if s.State != delegSwitched && s.State != delegCancelled {
+			out++
+		}
+	}
+	n.delegMu.Unlock()
+	info["deleg_out"] = out
+	if n.zoneSnap != nil {
+		n.zoneSnap.mu.Lock()
+		info["dirty"] = len(n.zoneSnap.dirty)
+		info["snapped"] = len(n.zoneSnap.seq)
+		info["wal_segments"] = len(n.zoneSnap.walSegs)
+		n.zoneSnap.mu.Unlock()
+	}
+	return info
 }

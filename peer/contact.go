@@ -3,27 +3,51 @@ package peer
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"time"
 
+	"github.com/indexus/go-indexus-core/auth"
 	"github.com/indexus/go-indexus-core/domain"
 	"github.com/indexus/go-indexus-core/encoding"
 )
 
-// HttpClient is the default client used for short P2P RPCs (Ping,
-// Neighbors, Random, Get, New). The 2-second default is conservative
-// enough to absorb WAN jitter while still failing peers fast.
 var HttpClient = &http.Client{
 	Timeout: 2 * time.Second,
+	Transport: &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 2 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          512,
+		MaxIdleConnsPerHost:   128,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   2 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	},
 }
 
-// TransferClient is used for /transfer, which can carry up to
-// `delegation` items in a single batch and therefore needs a much
-// larger budget than the discovery RPCs.
 var TransferClient = &http.Client{
 	Timeout: 30 * time.Second,
+	Transport: &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          256,
+		MaxIdleConnsPerHost:   64,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   5 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	},
+}
+
+var OutboundBearer string
+
+func withAuth(req *http.Request) {
+	if OutboundBearer != "" {
+		req.Header.Set("Authorization", "Bearer "+OutboundBearer)
+	}
 }
 
 type Contact struct {
@@ -32,31 +56,33 @@ type Contact struct {
 	ips  map[string]any
 	ip   string
 	port int
+	cert *auth.NodeCert
 }
 
-// Implementing json.Marshaler interface
 func (c *Contact) MarshalJSON() ([]byte, error) {
 	type Alias struct {
 		Name string         `json:"name"`
 		IPs  map[string]any `json:"ips"`
 		IP   string         `json:"ip"`
 		Port int            `json:"port"`
+		Cert *auth.NodeCert `json:"cert,omitempty"`
 	}
 	return json.Marshal(&Alias{
 		Name: c.name,
 		IPs:  c.ips,
 		IP:   c.ip,
 		Port: c.port,
+		Cert: c.cert,
 	})
 }
 
-// Implementing json.Unmarshaler interface
 func (c *Contact) UnmarshalJSON(data []byte) error {
 	type Alias struct {
 		Name string         `json:"name"`
 		IPs  map[string]any `json:"ips"`
 		IP   string         `json:"ip"`
 		Port int            `json:"port"`
+		Cert *auth.NodeCert `json:"cert,omitempty"`
 	}
 	aux := &Alias{}
 	if err := json.Unmarshal(data, &aux); err != nil {
@@ -66,19 +92,38 @@ func (c *Contact) UnmarshalJSON(data []byte) error {
 	c.ips = aux.IPs
 	c.ip = aux.IP
 	c.port = aux.Port
+	c.cert = aux.Cert
 	c.id, _ = encoding.BASE64.Decode(aux.Name)
 	return nil
 }
 
 func NewContact(name string, ips map[string]any, port int) domain.Contact {
 	id, _ := encoding.BASE64.Decode(name)
-	return &Contact{
+	c := &Contact{
 		name: name,
 		id:   id,
 		ips:  ips,
 		port: port,
 	}
+
+	for ip := range ips {
+		if ip != "" {
+			c.ip = ip
+			break
+		}
+	}
+	return c
 }
+
+func NewContactWithCert(name string, ips map[string]any, port int, cert *auth.NodeCert) domain.Contact {
+	c := NewContact(name, ips, port).(*Contact)
+	c.cert = cert
+	return c
+}
+
+func (c *Contact) Cert() *auth.NodeCert { return c.cert }
+
+func (c *Contact) SetCert(cert *auth.NodeCert) { c.cert = cert }
 
 func (c *Contact) ID() []byte {
 	return c.id
@@ -101,11 +146,27 @@ func (c *Contact) IP() string {
 }
 
 func (c *Contact) Host() string {
-	return fmt.Sprintf("%s@%s|%d", c.name, c.ip, c.port)
+	ip := c.ip
+	if ip == "" {
+		for candidate := range c.ips {
+			if candidate != "" {
+				ip = candidate
+				break
+			}
+		}
+	}
+	return fmt.Sprintf("%s@%s|%d", c.name, ip, c.port)
 }
 
 func (c *Contact) Ping(origin domain.Contact) (domain.Contact, error) {
-	for ip := range c.ips {
+	ips := c.ips
+	if len(ips) == 0 && c.ip != "" {
+		ips = map[string]any{c.ip: nil}
+	}
+	for ip := range ips {
+		if ip == "" {
+			continue
+		}
 		contact, err := c.ping(origin, ip)
 		if err != nil {
 			continue
@@ -123,14 +184,18 @@ func (c *Contact) ping(origin domain.Contact, ip string) (domain.Contact, error)
 	}
 
 	url := fmt.Sprintf("http://%s:%d/ping", ip, c.port)
+	originPeer := &Contact{
+		name: origin.Name(),
+		ips:  origin.IPs(),
+		port: origin.Port(),
+	}
+	if oc, ok := origin.(interface{ Cert() *auth.NodeCert }); ok {
+		originPeer.cert = oc.Cert()
+	}
 	reqBody := struct {
 		Origin *Contact `json:"origin"`
 	}{
-		Origin: &Contact{
-			name: origin.Name(),
-			ips:  origin.IPs(),
-			port: origin.Port(),
-		},
+		Origin: originPeer,
 	}
 
 	jsonData, err := json.Marshal(reqBody)
@@ -143,6 +208,7 @@ func (c *Contact) ping(origin domain.Contact, ip string) (domain.Contact, error)
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	withAuth(req)
 
 	resp, err := HttpClient.Do(req)
 	if err != nil {
@@ -182,6 +248,7 @@ func (c *Contact) Neighbors(origin domain.Peer) ([]domain.Contact, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error creating request: %s", err.Error())
 	}
+	withAuth(req)
 
 	resp, err := HttpClient.Do(req)
 	if err != nil {
@@ -223,6 +290,7 @@ func (c *Contact) Random(origin domain.Peer) (domain.Contact, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error creating request: %s", err.Error())
 	}
+	withAuth(req)
 
 	resp, err := HttpClient.Do(req)
 	if err != nil {
@@ -245,46 +313,90 @@ func (c *Contact) Random(origin domain.Peer) (domain.Contact, error) {
 	return body.Contact, nil
 }
 
+func (c *Contact) dialTargets() []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, 1+len(c.ips))
+	add := func(ip string) {
+		if ip == "" || seen[ip] {
+			return
+		}
+		seen[ip] = true
+		out = append(out, ip)
+	}
+	add(c.ip)
+	for ip := range c.ips {
+		add(ip)
+	}
+	return out
+}
+
 func (c *Contact) Transfer(origin domain.Peer, key domain.Key, items []*domain.Item) error {
-	ip, parsedIP := c.ip, net.ParseIP(c.ip)
-
-	if parsedIP != nil && parsedIP.To4() == nil {
-		ip = fmt.Sprintf("[%s]", ip)
+	if c.port <= 0 {
+		return fmt.Errorf("transfer: invalid port on peer %s", c.name)
 	}
-
-	url := fmt.Sprintf("http://%s:%d/transfer", ip, c.port)
-	body := struct {
-		Origin string         `json:"origin"`
-		Key    domain.Key     `json:"key"`
-		Items  []*domain.Item `json:"items"`
-	}{
-		Origin: origin.Name(),
-		Key:    key,
-		Items:  items,
+	targets := c.dialTargets()
+	if len(targets) == 0 {
+		return fmt.Errorf("transfer: no dialable IP on peer %s", c.name)
 	}
+	var lastErr error
+	for _, rawIP := range targets {
+		ip := rawIP
+		if parsed := net.ParseIP(rawIP); parsed != nil && parsed.To4() == nil {
+			ip = fmt.Sprintf("[%s]", rawIP)
+		}
+		url := fmt.Sprintf("http://%s:%d/transfer", ip, c.port)
+		body := struct {
+			Origin string         `json:"origin"`
+			Key    domain.Key     `json:"key"`
+			Items  []*domain.Item `json:"items"`
+		}{
+			Origin: origin.Name(),
+			Key:    key,
+			Items:  items,
+		}
+		jsonData, err := json.Marshal(body)
+		if err != nil {
+			return err
+		}
+		req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+		withAuth(req)
+		resp, err := TransferClient.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		func() {
+			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusConflict {
 
-	jsonData, err := json.Marshal(body)
-	if err != nil {
-		return err
+				lastErr = domain.ErrLeaving
+				return
+			}
+			if resp.StatusCode != http.StatusCreated {
+				lastErr = fmt.Errorf("transfer %s: status %d", url, resp.StatusCode)
+				return
+			}
+			lastErr = nil
+		}()
+		if errors.Is(lastErr, domain.ErrLeaving) {
+			return lastErr
+		}
+		if lastErr == nil {
+			if c.ip == "" {
+				c.ip = rawIP
+			}
+			return nil
+		}
 	}
-
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return err
+	if lastErr == nil {
+		lastErr = fmt.Errorf("transfer: all dial targets failed for %s", c.name)
 	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := TransferClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusCreated {
-		return fmt.Errorf("error code: %d", resp.StatusCode)
-	}
-
-	return nil
+	return lastErr
 }
 
 func (c *Contact) Get(collection string, location string, depth int) (domain.Contact, *domain.Set, error) {
@@ -295,7 +407,12 @@ func (c *Contact) Get(collection string, location string, depth int) (domain.Con
 	}
 
 	url := fmt.Sprintf("http://%s:%d/set?collection=%s&location=%s&depth=%d", ip, c.port, collection, location, depth)
-	resp, err := HttpClient.Get(url)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	withAuth(req)
+	resp, err := HttpClient.Do(req)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -363,6 +480,9 @@ func (c *Contact) New(item *domain.Item, root string, current string) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
+	req.Header.Set(domain.HandoffHeader, "1")
+	withAuth(req)
+
 	resp, err := HttpClient.Do(req)
 	if err != nil {
 		return err
@@ -370,7 +490,7 @@ func (c *Contact) New(item *domain.Item, root string, current string) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusServiceUnavailable {
-		return fmt.Errorf("ingress queue full")
+		return domain.ErrPeerBusy
 	}
 	if resp.StatusCode != http.StatusCreated {
 		return fmt.Errorf("error code: %d", resp.StatusCode)
@@ -407,6 +527,7 @@ func (c *Contact) Delete(item *domain.Item, root string, current string) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	withAuth(req)
 
 	resp, err := HttpClient.Do(req)
 	if err != nil {
@@ -415,11 +536,95 @@ func (c *Contact) Delete(item *domain.Item, root string, current string) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusServiceUnavailable {
-		return fmt.Errorf("ingress queue full")
+		return domain.ErrPeerBusy
 	}
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("error code: %d", resp.StatusCode)
 	}
 
 	return nil
+}
+
+func (c *Contact) DelegationOffer(origin domain.Peer, offer domain.DelegationOfferPayload) error {
+	return c.postJSON("/delegation/offer", struct {
+		Origin string                        `json:"origin"`
+		Offer  domain.DelegationOfferPayload `json:"offer"`
+	}{Origin: origin.Name(), Offer: offer})
+}
+
+func (c *Contact) WALDelta(origin domain.Peer, delta domain.WALDeltaPayload) error {
+	return c.postJSON("/delegation/wal-delta", struct {
+		Origin string                 `json:"origin"`
+		Delta  domain.WALDeltaPayload `json:"delta"`
+	}{Origin: origin.Name(), Delta: delta})
+}
+
+func (c *Contact) CaughtUp(origin domain.Peer, payload domain.CaughtUpPayload) error {
+	return c.postJSON("/delegation/caught-up", struct {
+		Origin  string                 `json:"origin"`
+		Payload domain.CaughtUpPayload `json:"payload"`
+	}{Origin: origin.Name(), Payload: payload})
+}
+
+func (c *Contact) SwitchAck(origin domain.Peer, payload domain.SwitchAckPayload) error {
+	return c.postJSON("/delegation/switch-ack", struct {
+		Origin  string                  `json:"origin"`
+		Payload domain.SwitchAckPayload `json:"payload"`
+	}{Origin: origin.Name(), Payload: payload})
+}
+
+func (c *Contact) postJSON(path string, body any) error {
+	if c.port <= 0 {
+		return fmt.Errorf("%s: invalid port on peer %s", path, c.name)
+	}
+	targets := c.dialTargets()
+	if len(targets) == 0 {
+		return fmt.Errorf("%s: no dialable IP on peer %s", path, c.name)
+	}
+	jsonData, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	var lastErr error
+	for _, rawIP := range targets {
+		ip := rawIP
+		if parsed := net.ParseIP(rawIP); parsed != nil && parsed.To4() == nil {
+			ip = fmt.Sprintf("[%s]", rawIP)
+		}
+		url := fmt.Sprintf("http://%s:%d%s", ip, c.port, path)
+		req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+		withAuth(req)
+		resp, err := TransferClient.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		func() {
+			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusConflict {
+				lastErr = domain.ErrLeaving
+				return
+			}
+			if resp.StatusCode >= 300 {
+				lastErr = fmt.Errorf("%s: status %d", path, resp.StatusCode)
+				return
+			}
+			lastErr = nil
+		}()
+		if errors.Is(lastErr, domain.ErrLeaving) {
+			return lastErr
+		}
+		if lastErr == nil {
+			return nil
+		}
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("%s: all dial targets failed for %s", path, c.name)
+	}
+	return lastErr
 }

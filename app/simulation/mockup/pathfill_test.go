@@ -7,6 +7,7 @@ import (
 	"github.com/indexus/go-indexus-core/core"
 	"github.com/indexus/go-indexus-core/domain"
 	"github.com/indexus/go-indexus-core/encoding"
+	"github.com/indexus/go-indexus-core/storage"
 )
 
 func TestQueueBackpressureOnNode(t *testing.T) {
@@ -21,7 +22,7 @@ func TestQueueBackpressureOnNode(t *testing.T) {
 	}
 	settings.SetQueueMax(2)
 	settings.SetAdvertise("127.0.0.1")
-	n, err := core.NewNode(settings, NewContact, nil, NewStorage())
+	n, err := core.NewNode(settings, NewContact, nil, storage.NewMemory())
 	if err != nil {
 		t.Fatal(err)
 	}

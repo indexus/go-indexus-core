@@ -3,7 +3,7 @@ package mockup
 import (
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"math/rand"
 	"net"
 	"net/http"
@@ -15,6 +15,7 @@ import (
 	"github.com/indexus/go-indexus-core/core"
 	"github.com/indexus/go-indexus-core/domain"
 	"github.com/indexus/go-indexus-core/encoding"
+	"github.com/indexus/go-indexus-core/storage"
 	"github.com/indexus/go-indexus-core/worker"
 )
 
@@ -83,7 +84,7 @@ func (h *Handler) Serve(lis net.Listener) error {
 
 	s := &http.Server{Handler: mux}
 
-	log.Println("HTTP Server started")
+	slog.Info("simulation server listening", "addr", lis.Addr().String())
 
 	return s.Serve(lis)
 }
@@ -215,9 +216,11 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var body = struct {
-		Contact Contact                    `json:"contact"`
-		Set     map[string]*domain.Abelian `json:"set"`
-	}{}
+		Contact Contact     `json:"contact"`
+		Set     *domain.Set `json:"set"`
+	}{
+		Set: set,
+	}
 
 	if contact != nil {
 		body.Contact = Contact{
@@ -226,10 +229,6 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 			Port: contact.Port(),
 			IP:   contact.IP(),
 		}
-	}
-
-	if set != nil {
-		body.Set = set.List()
 	}
 
 	writeJSON(w, http.StatusOK, body)
@@ -288,8 +287,8 @@ func (h *Handler) GetMultiple(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/octet-stream")
-	if _, writeErr := w.Write(sets); writeErr != nil {
-		log.Println("Error writing response:", writeErr)
+	if _, err := w.Write(sets); err != nil {
+		slog.Warn("sets response truncated", "err", err)
 	}
 }
 
@@ -501,17 +500,20 @@ func (h *Handler) FeedNetwork(w http.ResponseWriter, r *http.Request) {
 
 		name, err := encoding.BASE64.RandomName()
 		if err != nil {
-			log.Fatal(err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
 		}
 
 		settings, err := core.NewSettings(name, network.Length(), 1*time.Second, 5*time.Minute, domain.DelegationTreshold())
 		if err != nil {
-			log.Fatal(err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
 		}
 
-		node, err := core.NewNode(settings, NewContact, bootstraps, NewStorage())
+		node, err := core.NewNode(settings, NewContact, bootstraps, storage.NewMemory())
 		if err != nil {
-			log.Fatal(err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
 		}
 
 		workerInstance := worker.NewWorker(node)
@@ -530,7 +532,7 @@ func (h *Handler) FeedNetwork(w http.ResponseWriter, r *http.Request) {
 			network.Unreachable(node)
 		}
 
-		log.Printf("Node %s started", node.Name())
+		slog.Info("simulated node started", "name", node.Name())
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"message": "FeedNetwork completed"})
@@ -553,7 +555,8 @@ func (h *Handler) FeedCollection(w http.ResponseWriter, r *http.Request) {
 
 			location, err := encoding.BASE64.RandomName()
 			if err != nil {
-				log.Fatal(err)
+				slog.Error("simulation feed stopped", "err", err)
+				return
 			}
 
 			item := &domain.Item{
@@ -563,9 +566,8 @@ func (h *Handler) FeedCollection(w http.ResponseWriter, r *http.Request) {
 				Metrics:    []float64{rand.Float64(), rand.Float64(), rand.Float64(), rand.Float64(), rand.Float64()},
 			}
 
-			err = network.Random().New(item, encoding.BASE64.Root(), item.Location)
-			if err != nil {
-				log.Println(err)
+			if err := network.Random().New(item, encoding.BASE64.Root(), item.Location); err != nil {
+				slog.Debug("simulated insert rejected", "err", err)
 			}
 		}
 	}()

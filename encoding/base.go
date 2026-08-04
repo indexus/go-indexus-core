@@ -45,6 +45,12 @@ func (b *Base) Length() int {
 	return b.lengthConfig
 }
 
+// IDLength is the width of an identifier in characters, and with it the depth of
+// the trees keyed on identifiers. Encode always produces that width.
+func (b *Base) IDLength() int {
+	return b.idLength
+}
+
 func (b *Base) Packing() int {
 	return b.bitsPerChar
 }
@@ -86,6 +92,74 @@ func (b *Base) RandomName() (string, error) {
 		return "", err
 	}
 	return b.Encode(id), nil
+}
+
+// PreferNearTargets returns N distinct XOR-near keys around hot so multi-spawn
+// peers land in adjacent slices instead of fighting over one neighborhood.
+// keepBits of hot are preserved; the next bits encode the slot index.
+func (b *Base) PreferNearTargets(hot string, n int) ([]string, error) {
+	if n < 1 {
+		n = 1
+	}
+	if n > 3 {
+		n = 3
+	}
+	out := make([]string, n)
+	var target []byte
+	if hot != "" {
+		if decoded, err := b.Decode(hot); err == nil {
+			target = decoded
+		}
+	}
+	// Preserve ~14 bits of the hot key, then branch on the next 2 bits so
+	// N=2/3 peers take non-overlapping XOR slices around the hotspot.
+	const keepBits = 14
+	for i := 0; i < n; i++ {
+		id := make([]byte, b.idLength)
+		if _, err := rand.Read(id); err != nil {
+			return nil, err
+		}
+		if len(target) > 0 {
+			copyNearBits(id, target, keepBits)
+			setBitRange(id, keepBits, 2, i)
+		}
+		out[i] = b.Encode(id)
+	}
+	return out, nil
+}
+
+func copyNearBits(dst, src []byte, keepBits int) {
+	if keepBits < 0 {
+		keepBits = 0
+	}
+	fullBytes := keepBits / 8
+	rem := keepBits % 8
+	for i := 0; i < fullBytes && i < len(dst) && i < len(src); i++ {
+		dst[i] = src[i]
+	}
+	if rem > 0 && fullBytes < len(dst) && fullBytes < len(src) {
+		mask := byte(0xFF << (8 - rem))
+		dst[fullBytes] = (src[fullBytes] & mask) | (dst[fullBytes] & ^mask)
+	}
+}
+
+// setBitRange writes the low width bits of value into dst starting at bitOffset
+// (MSB-first within each byte, matching copyNearBits / RandomNameNear).
+func setBitRange(dst []byte, bitOffset, width, value int) {
+	for w := 0; w < width; w++ {
+		bit := bitOffset + w
+		byteIdx := bit / 8
+		if byteIdx >= len(dst) {
+			return
+		}
+		shift := 7 - (bit % 8)
+		mask := byte(1 << shift)
+		if (value>>(width-1-w))&1 == 1 {
+			dst[byteIdx] |= mask
+		} else {
+			dst[byteIdx] &^= mask
+		}
+	}
 }
 
 // RandomNameNear returns a random ID that shares the first keepBits bits with
