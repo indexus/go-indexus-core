@@ -1,0 +1,9 @@
+# Keep image build context small
+.git
+.data*
+bin/
+scripts/bench/node_modules
+scripts/bench/out
+**/.DS_Store
+deploy/terraform/.terraform
+*.md

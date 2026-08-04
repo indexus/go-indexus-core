@@ -4,15 +4,11 @@ import (
 	"fmt"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/indexus/go-indexus-core/domain"
 	"github.com/indexus/go-indexus-core/encoding"
-	"github.com/indexus/go-indexus-core/peer"
 )
 
-// noopStorage keeps the test inside package core; importing the simulation
-// mockup would create a cycle.
 type noopStorage struct{}
 
 func (noopStorage) Exist() bool             { return false }
@@ -26,29 +22,10 @@ func (noopStorage) Stream(int) <-chan string {
 	return c
 }
 
-func newTestNode(t *testing.T, delegation int) *Node {
-	t.Helper()
-
-	name, err := encoding.BASE64.RandomName()
-	if err != nil {
-		t.Fatalf("RandomName: %v", err)
-	}
-	settings, err := NewSettings(name, 0, time.Second, time.Minute, delegation)
-	if err != nil {
-		t.Fatalf("NewSettings: %v", err)
-	}
-	node, err := NewNode(settings, peer.NewContact, nil, noopStorage{})
-	if err != nil {
-		t.Fatalf("NewNode: %v", err)
-	}
-	return node
-}
-
-// clean() empties the routing tree while monitoring reads it.
 func TestNodeCleanRacesMonitoring(t *testing.T) {
 	const ops = 500
 
-	n := newTestNode(t, domain.DelegationTreshold())
+	n := newNodeOn(t, noopStorage{}, domain.DelegationTreshold())
 
 	var wg sync.WaitGroup
 
@@ -75,17 +52,13 @@ func TestNodeCleanRacesMonitoring(t *testing.T) {
 	wg.Wait()
 }
 
-// Ownership() browses collection internals while items are being ingested.
-// Locations and ids are unique so the writer really grows the collection
-// (shrink splits sets, delegation adds ownerships) instead of overwriting one
-// entry.
 func TestNodeInsertRacesOwnership(t *testing.T) {
 	const (
 		items      = 500
 		delegation = 10
 	)
 
-	n := newTestNode(t, delegation)
+	n := newNodeOn(t, noopStorage{}, delegation)
 
 	collection, err := encoding.BASE64.RandomName()
 	if err != nil {
@@ -104,7 +77,7 @@ func TestNodeInsertRacesOwnership(t *testing.T) {
 				Location:   location,
 				Id:         fmt.Sprintf("id-%d", i),
 				Metrics:    []float64{1, 2, 3, 4, 5},
-			}, encoding.BASE64.Root(), location)
+			}, encoding.BASE64.Root(), location, true)
 		}
 	}()
 
@@ -121,7 +94,6 @@ func TestNodeInsertRacesOwnership(t *testing.T) {
 
 	wg.Wait()
 
-	// Guard against a vacuous test: the writer must have stored something.
 	count, err := n.Count()
 	if err != nil {
 		t.Fatalf("Count: %v", err)
@@ -131,16 +103,13 @@ func TestNodeInsertRacesOwnership(t *testing.T) {
 	}
 }
 
-// Check() browses a collection and looks up the owned tree, while the ingest
-// path locks the owned tree and then the collection. Taking both locks in
-// opposite orders deadlocks, so this test hangs instead of failing.
 func TestNodeCheckRacesInsert(t *testing.T) {
 	const (
 		items      = 500
 		delegation = 10
 	)
 
-	n := newTestNode(t, delegation)
+	n := newNodeOn(t, noopStorage{}, delegation)
 
 	collection, err := encoding.BASE64.RandomName()
 	if err != nil {
@@ -159,7 +128,7 @@ func TestNodeCheckRacesInsert(t *testing.T) {
 				Location:   location,
 				Id:         fmt.Sprintf("id-%d", i),
 				Metrics:    []float64{1, 2, 3, 4, 5},
-			}, encoding.BASE64.Root(), location)
+			}, encoding.BASE64.Root(), location, true)
 		}
 	}()
 

@@ -61,10 +61,26 @@ To navigate through the Indexus collections effectively, users employ a combinat
 - **Support for Multiple Dimensions**: Index data using various dimensions like geospatiality, temporality, and more.
 - **Delegation Mechanism**: Automatically delegates sub-parts of collections to different nodes when they reach a certain size, ensuring balanced data distribution.
 - **Extensible and Modular**: Designed to be extensible, allowing for the integration of additional features and dimensions.
+- **Optional AWS deploy**: Same binary; enable issuer auth, SoftLeave drain, and autoscale via flags. Terraform + bench live under `deploy/` and `scripts/`.
 
 ### Upcoming
 
 - **Redundancy and Caching**: Implements data redundancy and caching mechanisms for high availability and quick data access.
+
+---
+
+## Optional: AWS deployment
+
+Open mesh by default (`-requireAuth=false`, `-autoscale=false`). To run a permissioned, auto-scaling lab in an existing VPC:
+
+```bash
+./deploy/scripts/deploy.sh
+cd scripts/bench && npm install && ./run_suite.sh
+```
+
+Useful flags on `./app/node`: `-issuer`, `-network`, `-requireAuth`, `-autoscale`, `-advertise`, `-leaveTimeout`. SoftLeave: `POST :19000/leave?timeout_s=90`. Local mesh without EC2: `./scripts/local/mesh_up.sh`. Deferred high-volume lifecycle battle plan: [`docs/plans/aws_lifecycle_battle.md`](docs/plans/aws_lifecycle_battle.md).
+
+Destroy: `cd deploy/terraform && terraform destroy -auto-approve`.
 
 ---
 

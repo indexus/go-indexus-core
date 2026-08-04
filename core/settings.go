@@ -18,10 +18,13 @@ type Settings struct {
 	delegation   int
 	cacheBeta    float64
 	queueMax     int
+	peerQueueMax int
 	cacheMax     int
-	updateEta    float64 // skip probability for Update pulls (0..1)
-	forwardRate  int     // max forwards per second (0 = unlimited)
-	leafRedirect int     // dense leaf count threshold for hybrid redirect
+	updateEta    float64
+	forwardRate  int
+	feedWorkers  int
+	leafRedirect int
+	memRefusePct float64
 }
 
 func NewSettings(name string, port int, delay, expiration time.Duration, delegation int) (*Settings, error) {
@@ -31,22 +34,46 @@ func NewSettings(name string, port int, delay, expiration time.Duration, delegat
 		return nil, err
 	}
 
-	return &Settings{
-		id:           id,
-		name:         name,
-		ip:           "127.0.0.1",
-		ips:          getPublicIPs(),
-		port:         port,
-		delay:        delay,
-		expiration:   expiration,
-		delegation:   delegation,
-		cacheBeta:    1.0,
-		queueMax:     10_000,
-		cacheMax:     8_000,
-		updateEta:    0.3,
-		forwardRate:  200,
+	settings := &Settings{
+		id:         id,
+		name:       name,
+		ip:         "127.0.0.1",
+		ips:        getPublicIPs(),
+		port:       port,
+		delay:      delay,
+		expiration: expiration,
+		delegation: delegation,
+		cacheBeta:  1.0,
+		queueMax:   10_000,
+		cacheMax:   8_000,
+		updateEta:  0.3,
+
+		forwardRate:  2_000,
+		feedWorkers:  32,
 		leafRedirect: 64,
-	}, nil
+
+		memRefusePct: 68,
+	}
+
+	if v := envInt("INDEXUS_QUEUE_MAX", 0); v > 0 {
+		settings.queueMax = v
+	}
+	if v := envInt("INDEXUS_FORWARD_RATE", -1); v >= 0 {
+		settings.forwardRate = v
+	}
+	if v := envInt("INDEXUS_FEED_WORKERS", 0); v > 0 {
+		settings.feedWorkers = v
+	}
+	if v := envFloat("INDEXUS_MEM_REFUSE_PCT", 0); v > 0 {
+		settings.memRefusePct = v
+	}
+	settings.peerQueueMax = peerCeiling(settings.queueMax)
+
+	return settings, nil
+}
+
+func peerCeiling(queueMax int) int {
+	return 4 * queueMax
 }
 
 func (s *Settings) SetCacheBeta(beta float64) {
@@ -58,6 +85,7 @@ func (s *Settings) SetCacheBeta(beta float64) {
 
 func (s *Settings) SetQueueMax(max int) {
 	s.queueMax = max
+	s.peerQueueMax = peerCeiling(max)
 }
 
 func (s *Settings) SetCacheMax(max int) {
@@ -78,11 +106,21 @@ func (s *Settings) SetForwardRate(r int) {
 	s.forwardRate = r
 }
 
+func (s *Settings) SetFeedWorkers(n int) {
+	if n < 1 {
+		n = 1
+	}
+	s.feedWorkers = n
+}
+
 func (s *Settings) SetLeafRedirect(threshold int) {
 	s.leafRedirect = threshold
 }
 
-// SetAdvertise overrides the advertised IP set (e.g. 127.0.0.1 for local tests).
+func (s *Settings) SetMemRefusePct(pct float64) {
+	s.memRefusePct = pct
+}
+
 func (s *Settings) SetAdvertise(addrs ...string) {
 	ips := make(map[string]any, len(addrs))
 	for i, a := range addrs {
@@ -99,7 +137,6 @@ func (s *Settings) SetAdvertise(addrs ...string) {
 	}
 }
 
-// getPublicIPs retrieves all public IPv4 and IPv6 addresses and returns them in a map[string]any.
 func getPublicIPs() map[string]any {
 	ips := make(map[string]any)
 	interfaces, err := net.Interfaces()
@@ -110,10 +147,10 @@ func getPublicIPs() map[string]any {
 	for _, iface := range interfaces {
 		addrs, err := iface.Addrs()
 		if err != nil {
-			continue // skip this interface on error
+			continue
 		}
 		for _, addr := range addrs {
-			// Get the IP address
+
 			var ip net.IP
 			switch v := addr.(type) {
 			case *net.IPNet:
@@ -122,17 +159,14 @@ func getPublicIPs() map[string]any {
 				ip = v.IP
 			}
 
-			// Skip nil IPs and loopback addresses
 			if ip == nil || ip.IsLoopback() {
 				continue
 			}
 
-			// Skip private IP addresses
 			if isPrivateIP(ip) {
 				continue
 			}
 
-			// Append public IPs to the list
 			ips[ip.String()] = nil
 		}
 	}
@@ -140,35 +174,32 @@ func getPublicIPs() map[string]any {
 	return ips
 }
 
-// Helper function to check if an IP is private
 func isPrivateIP(ip net.IP) bool {
 	return isPrivateIPv4(ip) || isPrivateIPv6(ip)
 }
 
-// Check for private IPv4 addresses
 func isPrivateIPv4(ip net.IP) bool {
 	ip = ip.To4()
 	if ip == nil {
-		return false // Not an IPv4 address
+		return false
 	}
 	switch {
 	case ip[0] == 10:
-		return true // 10.0.0.0/8
+		return true
 	case ip[0] == 172 && ip[1]&0xf0 == 16:
-		return true // 172.16.0.0/12
+		return true
 	case ip[0] == 192 && ip[1] == 168:
-		return true // 192.168.0.0/16
+		return true
 	default:
 		return false
 	}
 }
 
-// Check for private IPv6 addresses
 func isPrivateIPv6(ip net.IP) bool {
 	ip = ip.To16()
 	if ip == nil || ip.To4() != nil {
-		return false // Not an IPv6 address
+		return false
 	}
-	// Unique local addresses (fc00::/7)
+
 	return ip[0]&0xfe == 0xfc
 }

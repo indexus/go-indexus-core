@@ -33,3 +33,27 @@ func TestRandomNameNearKeepsPrefixBits(t *testing.T) {
 		}
 	}
 }
+
+func TestPreferNearTargetsDistinct(t *testing.T) {
+	hot, err := BASE64.RandomName()
+	if err != nil {
+		t.Fatal(err)
+	}
+	targets, err := BASE64.PreferNearTargets(hot, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 3 {
+		t.Fatalf("len=%d", len(targets))
+	}
+	seen := map[string]bool{}
+	for i, s := range targets {
+		if s == "" {
+			t.Fatalf("empty target %d", i)
+		}
+		if seen[s] {
+			t.Fatalf("duplicate PreferNear target %q", s)
+		}
+		seen[s] = true
+	}
+}

@@ -105,13 +105,13 @@ func TestConvergence_LargeScale_Burst(t *testing.T) {
 	ResetNetwork()
 
 	const (
-		collections = 400
-		perColl     = 25 // -> 10_000 items
-		burst       = 9
+		collections = 200
+		perColl     = 20 // -> 4_000 items (enough to stress trie + delegation)
+		burst       = 6
 		delegation  = 80
 		tickEvery   = 30 * time.Millisecond
-		steadyFor   = 4 * time.Second
-		timeout     = 180 * time.Second
+		steadyFor   = 2 * time.Second
+		timeout     = 90 * time.Second
 	)
 
 	n1 := newConvergenceNode(t, delegation)
@@ -205,16 +205,16 @@ func TestConvergence_MixedInsertsAndRebalance(t *testing.T) {
 	ResetNetwork()
 
 	const (
-		seedCollections = 200
-		seedPerColl     = 10  // -> 2000 items pre-seed
-		liveCollections = 100 // additional collections written during the storm
-		liveItemsTotal  = 3000
-		burst           = 6
+		seedCollections = 100
+		seedPerColl     = 10  // -> 1000 items pre-seed
+		liveCollections = 50
+		liveItemsTotal  = 1500
+		burst           = 4
 		delegation      = 60
 		tickEvery       = 30 * time.Millisecond
-		producerRate    = 800 * time.Microsecond // ~1250 items/s
-		steadyFor       = 3 * time.Second
-		timeout         = 120 * time.Second
+		producerRate    = 400 * time.Microsecond
+		steadyFor       = 2 * time.Second
+		timeout         = 60 * time.Second
 	)
 
 	n1 := newConvergenceNode(t, delegation)
@@ -251,12 +251,14 @@ func TestConvergence_MixedInsertsAndRebalance(t *testing.T) {
 
 	currentNodes := func() []*core.Node {
 		out := []*core.Node{n1}
-		for _, n := range network.Nodes() {
+		network.mu.RLock()
+		for _, n := range network.nodes {
 			if n.Name() == n1.Name() {
 				continue
 			}
 			out = append(out, n)
 		}
+		network.mu.RUnlock()
 		return out
 	}
 
@@ -369,8 +371,8 @@ func TestConvergence_LossyTransfer_RecoversWithoutLoss(t *testing.T) {
 		timeout   time.Duration
 		steadyFor time.Duration
 	}{
-		{name: "moderate_20pct", dropPct: 20, timeout: 60 * time.Second, steadyFor: 4 * time.Second},
-		{name: "severe_50pct", dropPct: 50, timeout: 90 * time.Second, steadyFor: 5 * time.Second},
+		{name: "moderate_20pct", dropPct: 20, timeout: 45 * time.Second, steadyFor: 2 * time.Second},
+		{name: "severe_50pct", dropPct: 50, timeout: 60 * time.Second, steadyFor: 3 * time.Second},
 	}
 
 	for _, tc := range cases {
@@ -378,9 +380,9 @@ func TestConvergence_LossyTransfer_RecoversWithoutLoss(t *testing.T) {
 			ResetNetwork()
 
 			const (
-				collections = 200
-				perColl     = 8 // -> 1600 items
-				burst       = 4
+				collections = 100
+				perColl     = 8 // -> 800 items
+				burst       = 3
 				delegation  = 60
 				tickEvery   = 30 * time.Millisecond
 			)

@@ -1,8 +1,8 @@
 package core
 
 import (
-	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
 
@@ -36,6 +36,44 @@ func (n *Node) Snapshot() []string {
 			},
 		)
 	}
+
+	n.owned.Traverse(0, encoding.BASE64.NewID(), func(i int, b []byte, keys map[domain.Key]any) {
+		for key := range keys {
+			collection, exist := n.collections.Get(key.Collection)
+			if !exist {
+				continue
+			}
+			collection.Traverse(
+				key.Location,
+				func(string, *domain.Abelian) {},
+				func(_ string, location, id string, abelian *domain.Abelian) {
+					item := &domain.Item{
+						Collection: key.Collection,
+						Location:   location,
+						Id:         id,
+						Metrics:    abelian.Metrics(),
+					}
+					snapshot = append(snapshot, "item|"+item.Content())
+				},
+			)
+			for _, tomb := range collection.TombstonesUnder(key.Location) {
+				snapshot = append(snapshot, tomb.Content())
+			}
+		}
+	})
+
+	for _, el := range n.queue.Snapshot() {
+		if el == nil || el.item == nil {
+			continue
+		}
+		switch el.op {
+		case OpDelete:
+			snapshot = append(snapshot, fmt.Sprintf("pending-delete|%s|%s|%s", el.root, el.current, el.item.Content()))
+		default:
+			snapshot = append(snapshot, fmt.Sprintf("pending-ingress|%s|%s|%s", el.root, el.current, el.item.Content()))
+		}
+	}
+
 	return snapshot
 }
 
@@ -46,14 +84,18 @@ func (n *Node) Restore() error {
 
 	commands, err := n.storage.Load()
 	if err != nil {
-		return err
+
+		slog.Error("snapshot unreadable, replaying the write-ahead log alone", "err", err)
+		commands = nil
 	}
 
-	var collection, ownership, delegation string
+	var collection string
+
 	for _, command := range commands {
 		arr := strings.Split(command, "|")
-		if len(arr) == 0 {
-			return errors.New("backup file is corrupted and cannot be restored")
+		if len(arr) < 2 {
+			slog.Warn("skipping corrupted snapshot line", "line", command)
+			continue
 		}
 
 		switch arr[0] {
@@ -79,79 +121,106 @@ func (n *Node) Restore() error {
 		case "collection":
 			collection = arr[1]
 		case "ownership":
-			ownership = arr[1]
-			n.create(collection, ownership)
+			n.create(collection, arr[1])
 		case "delegation":
-			delegation = arr[1]
-			c, ok := n.collections.Get(collection)
+			current, ok := n.collections.Get(collection)
 			if !ok {
 				continue
 			}
-			// A snapshot can name a delegation whose location set was never
-			// materialized, e.g. saved while ownership was being handed off.
-			// Delegating it would walk a set that does not exist.
-			if _, exist := c.Get(delegation); !exist {
+			if _, exist := current.Get(arr[1]); !exist {
 				continue
 			}
-			c.Delegate(delegation)
+			current.Delegate(arr[1])
+		case "item":
+			item, ok := domain.ParseContent(command)
+			if !ok || item.Tombstone {
+				continue
+			}
+			if _, exist := n.collections.Get(item.Collection); !exist {
+				continue
+			}
+			n.add(item, false)
+		case "tombstone":
+			item, ok := domain.ParseContent(command)
+			if !ok || !item.Tombstone {
+				continue
+			}
+			if c, ok := n.collections.Get(item.Collection); ok {
+				c.ApplyTombstone(item.Location, item.Id, item.Gen)
+			}
+		case "pending-ingress":
+			n.restorePending(command, false)
+		case "pending-delete":
+			n.restorePending(command, true)
 		default:
-			return errors.New("backup file is corrupted and cannot be restored")
+			slog.Warn("unknown snapshot command, skipping", "line", command)
 		}
 	}
 
 	stream := n.storage.Stream(0)
 	for log := range stream {
-		if strings.HasPrefix(log, "ingress|") {
-			arr := strings.Split(log, "|")
-			if len(arr) < 6 {
-				continue
-			}
-			item := &domain.Item{
-				Collection: arr[3],
-				Location:   arr[4],
-				Id:         arr[5],
-			}
-			_ = n.queue.TryAdd(NewElement(item, arr[1], arr[2]), n.settings.queueMax)
-			continue
-		}
-		if strings.HasPrefix(log, "delete|") {
-			arr := strings.Split(log, "|")
-			if len(arr) < 6 {
-				continue
-			}
-			item := &domain.Item{
-				Collection: arr[3],
-				Location:   arr[4],
-				Id:         arr[5],
-			}
-			_ = n.queue.TryAdd(NewDeleteElement(item, arr[1], arr[2]), n.settings.queueMax)
-			continue
-		}
-		if strings.HasPrefix(log, "tombstone|") {
-			arr := strings.Split(log, "|")
-			if len(arr) < 5 {
-				continue
-			}
-			var gen uint64
-			fmt.Sscanf(arr[4], "%d", &gen)
-			if c, ok := n.collections.Get(arr[1]); ok {
-				c.ApplyTombstone(arr[2], arr[3], gen)
-			}
-			continue
-		}
-		arr := strings.Split(log, "|")
-		if len(arr) < 3 {
-			continue
-		}
-		item := &domain.Item{
-			Collection: arr[0],
-			Location:   arr[1],
-			Id:         arr[2],
-		}
-		if _, exist := n.collections.Get(item.Collection); exist {
-			n.add(item)
-		}
+		n.replayLogLine(log)
 	}
 
 	return nil
+}
+
+func (n *Node) restorePending(command string, del bool) {
+	arr := strings.SplitN(command, "|", 4)
+	if len(arr) < 4 {
+		return
+	}
+	item, ok := domain.ParseContent(arr[3])
+	if !ok {
+		return
+	}
+	if del {
+		n.queue.Add(NewDeleteElement(item, arr[1], arr[2]))
+		return
+	}
+	n.queue.Add(NewElement(item, arr[1], arr[2]))
+}
+
+func (n *Node) replayLogLine(log string) {
+	if strings.HasPrefix(log, "ingress|") {
+		arr := strings.SplitN(log, "|", 4)
+		if len(arr) < 4 {
+			return
+		}
+		item, ok := domain.ParseContent(arr[3])
+		if !ok {
+			return
+		}
+		n.queue.Add(NewElement(item, arr[1], arr[2]))
+		return
+	}
+	if strings.HasPrefix(log, "delete|") {
+		arr := strings.SplitN(log, "|", 4)
+		if len(arr) < 4 {
+			return
+		}
+		item, ok := domain.ParseContent(arr[3])
+		if !ok {
+			return
+		}
+		n.queue.Add(NewDeleteElement(item, arr[1], arr[2]))
+		return
+	}
+	if strings.HasPrefix(log, "tombstone|") {
+		item, ok := domain.ParseContent(log)
+		if !ok {
+			return
+		}
+		if c, ok := n.collections.Get(item.Collection); ok {
+			c.ApplyTombstone(item.Location, item.Id, item.Gen)
+		}
+		return
+	}
+	item, ok := domain.ParseContent(log)
+	if !ok || item.Tombstone {
+		return
+	}
+	if _, exist := n.collections.Get(item.Collection); exist {
+		n.add(item, false)
+	}
 }

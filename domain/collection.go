@@ -9,20 +9,20 @@ import (
 )
 
 type Collections struct {
-	mu   *sync.Mutex
+	mu   *sync.RWMutex
 	data map[string]*Collection
 }
 
 func NewCollections() *Collections {
 	return &Collections{
-		mu:   &sync.Mutex{},
+		mu:   &sync.RWMutex{},
 		data: make(map[string]*Collection),
 	}
 }
 
 func (c *Collections) Get(name string) (*Collection, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 
 	collection, ok := c.data[name]
 	return collection, ok
@@ -35,6 +35,21 @@ func (c *Collections) Set(collection *Collection) {
 	c.data[collection.Name()] = collection
 }
 
+// Ensure returns the named collection and creates it under the lock that looked
+// it up. Two callers missing at the same time used to build one collection each
+// and the later Set threw away everything the other had already stored.
+func (c *Collections) Ensure(name, root string, base Encoder) *Collection {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	collection, exist := c.data[name]
+	if !exist {
+		collection = NewCollection(name, root, base)
+		c.data[name] = collection
+	}
+	return collection
+}
+
 func (c *Collections) Delete(name string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -43,8 +58,8 @@ func (c *Collections) Delete(name string) {
 }
 
 func (c *Collections) List() []*Collection {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 
 	collections := make([]*Collection, 0)
 	for _, collection := range c.data {
@@ -59,7 +74,8 @@ type Collection struct {
 	sets       map[string]*Set
 	owned      Ownership
 	tombstones map[string]uint64 // "location:id" -> generation
-	mu         *sync.Mutex
+	leaves     map[string]string // "location:id" -> setKey (O(1) findLeaf)
+	mu         *sync.RWMutex
 }
 
 func NewCollection(name string, root string, base Encoder) *Collection {
@@ -69,7 +85,8 @@ func NewCollection(name string, root string, base Encoder) *Collection {
 		sets:       map[string]*Set{root: NewSet()},
 		owned:      map[string]Delegation{root: {}},
 		tombstones: make(map[string]uint64),
-		mu:         &sync.Mutex{},
+		leaves:     make(map[string]string),
+		mu:         &sync.RWMutex{},
 	}
 }
 
@@ -82,8 +99,8 @@ func (c *Collection) Base() Encoder {
 }
 
 func (c *Collection) Allowing(location string) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 
 	for child, parent := "", location; parent != ""; child, parent = parent, c.base.Parent(parent) {
 		if delegation, owned := c.owned[parent]; owned {
@@ -110,6 +127,23 @@ func (c *Collection) New(location string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	c.new(location)
+}
+
+// EnsureSet materialises a location that has no set yet. New replaces, so two
+// callers racing on the same location left one of them adding to a set the
+// other had already thrown away.
+func (c *Collection) EnsureSet(location string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if _, exist := c.sets[location]; exist {
+		return
+	}
+	c.new(location)
+}
+
+func (c *Collection) new(location string) {
 	c.sets[location] = NewSet()
 
 	parent := c.base.Parent(location)
@@ -127,8 +161,8 @@ func (c *Collection) New(location string) {
 }
 
 func (c *Collection) Get(location string) (*Set, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 
 	set, ok := c.sets[location]
 	return set, ok
@@ -170,8 +204,10 @@ func encodeBits(values []int, bitsPerValue int) []byte {
 }
 
 func (c *Collection) GetMultiple(locations []string, precision int, properties []func(*Abelian) int) ([]byte, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	// Encode is read-only over sets; exclusive Lock used to stall every Add
+	// for the whole /sets response.
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 
 	var result []byte
 
@@ -318,9 +354,14 @@ func (c *Collection) Add(location string, id string, metrics []float64, delegati
 			continue
 		}
 
-		if !added && set.Add(entry, abelian, c.base.Length()) {
-			set.Shrink(c.base, c.sets, parent, c.base.Length())
-		} else if added && set.Incr(child, abelian).Count() == delegation {
+		if !added {
+			if set.Add(entry, abelian, c.base.Length()) {
+				set.Shrink(c.base, c.sets, parent, c.base.Length(), c.leaves)
+			}
+			if _, ok := c.leaves[entry]; !ok {
+				c.leaves[entry] = parent
+			}
+		} else if set.Incr(child, abelian).Count() == delegation {
 			areas[child] = Delegation{}
 		}
 		added = true
@@ -378,6 +419,7 @@ func (c *Collection) Remove(location, id string) (*Abelian, uint64, bool) {
 	}
 
 	c.sets[setKey].Delete(entry)
+	delete(c.leaves, entry)
 	c.refreshAncestors(setKey)
 
 	gen := c.tombstones[entry] + 1
@@ -396,6 +438,7 @@ func (c *Collection) ApplyTombstone(location, id string, gen uint64) {
 	entry := fmt.Sprintf("%s:%s", location, id)
 	if setKey, _, ok := c.findLeaf(entry); ok {
 		c.sets[setKey].Delete(entry)
+		delete(c.leaves, entry)
 		c.refreshAncestors(setKey)
 	}
 	if gen == 0 {
@@ -450,8 +493,8 @@ func (c *Collection) ClearTombstonesUnder(root string) {
 
 // IsTombstoned reports whether location:id carries an active tombstone and no live leaf.
 func (c *Collection) IsTombstoned(location, id string) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	entry := fmt.Sprintf("%s:%s", location, id)
 	if _, ok := c.tombstones[entry]; !ok {
 		return false
@@ -460,14 +503,23 @@ func (c *Collection) IsTombstoned(location, id string) bool {
 	return !live
 }
 
-// findLeaf locates a count==1 entry across all sets. Caller must hold c.mu.
+// findLeaf locates a count==1 entry via the leaves index. Caller must hold c.mu.
 func (c *Collection) findLeaf(entry string) (setKey string, abelian *Abelian, ok bool) {
-	for key, set := range c.sets {
-		if ab, found := set.Get(entry); found && ab.Count() == 1 {
-			return key, ab, true
-		}
+	setKey, indexed := c.leaves[entry]
+	if !indexed {
+		return "", nil, false
 	}
-	return "", nil, false
+	set, exists := c.sets[setKey]
+	if !exists {
+		delete(c.leaves, entry)
+		return "", nil, false
+	}
+	ab, found := set.Get(entry)
+	if !found || ab.Count() != 1 {
+		delete(c.leaves, entry)
+		return "", nil, false
+	}
+	return setKey, ab, true
 }
 
 // refreshAncestors recomputes aggregate entries from setKey up to the root.
@@ -555,7 +607,19 @@ func (c *Collection) Complete(root string) Ownership {
 				c.sets[parent] = NewSet()
 			}
 
-			c.sets[parent].Put(previous, c.sets[previous].Abelian())
+			// A zone can be owned before its set exists: Add opens an area as
+			// soon as the parent's running count reaches the delegation size,
+			// while only Shrink materialises sets. Seed it, and leave the count
+			// the parent already carries alone — recomputing the aggregate from
+			// a set that has never held anything would erase it.
+			child, materialised := c.sets[previous]
+			if !materialised {
+				child = NewSet()
+				c.sets[previous] = child
+			}
+			if _, counted := c.sets[parent].Get(previous); materialised || !counted {
+				c.sets[parent].Put(previous, child.Abelian())
+			}
 
 			if _, exist := areas[parent]; !exist {
 				areas[parent] = Delegation{}
@@ -573,8 +637,9 @@ func (c *Collection) Delegate(location string) ([]*Item, bool) {
 	items := make([]*Item, 0)
 	c.traverse(location, func(set string, abelian *Abelian) {
 		delete(c.sets, set)
-	}, func(parent, location, id string, abelian *Abelian) {
-		items = append(items, &Item{Collection: c.name, Location: location, Id: id, Metrics: abelian.Metrics()})
+	}, func(parent, loc, id string, abelian *Abelian) {
+		delete(c.leaves, fmt.Sprintf("%s:%s", loc, id))
+		items = append(items, &Item{Collection: c.name, Location: loc, Id: id, Metrics: abelian.Metrics()})
 	})
 
 	// Carry tombstones so the receiving owner does not resurrect deleted ids.
@@ -678,8 +743,8 @@ func (c *Collection) clean(parent string, processSet func(string, *Abelian), pro
 }
 
 func (c *Collection) Browsable(parent string, key string) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 
 	return c.browsable(parent, key)
 }

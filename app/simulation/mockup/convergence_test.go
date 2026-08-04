@@ -10,6 +10,7 @@ import (
 	"github.com/indexus/go-indexus-core/core"
 	"github.com/indexus/go-indexus-core/domain"
 	"github.com/indexus/go-indexus-core/encoding"
+	"github.com/indexus/go-indexus-core/storage"
 )
 
 // -----------------------------------------------------------------------------
@@ -41,7 +42,7 @@ func newConvergenceNode(t *testing.T, delegation int, bootstraps ...*core.Node) 
 	}
 	settings.SetAdvertise("127.0.0.1")
 
-	node, err := core.NewNode(settings, NewContact, contacts, NewStorage())
+	node, err := core.NewNode(settings, NewContact, contacts, storage.NewMemory())
 	if err != nil {
 		t.Fatalf("NewNode: %v", err)
 	}

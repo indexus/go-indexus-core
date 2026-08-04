@@ -98,6 +98,33 @@ func TestSetShrinkAggregateNotStale(t *testing.T) {
 	}
 }
 
+// Entries do not all carry the same metrics: a counter raised by incr starts
+// with none, an item arrives with its own. Recomputing an aggregate off
+// whichever one the map yields first used to read past the end of the total.
+func TestSetShrinkMixesEntryWidths(t *testing.T) {
+	base := fakeBase{length: 2}
+
+	set := NewSet()
+	sets := map[string]*Set{"@": set}
+
+	set.add("aa:1", NewAbelian(1, nil), base.Length())
+	set.add("ab:2", NewAbelian(1, []float64{2, 3, 4}), base.Length())
+	set.add("ac:3", NewAbelian(1, []float64{1}), base.Length())
+
+	set.Shrink(base, sets, "@", base.Length())
+
+	child, ok := sets["a"]
+	if !ok {
+		t.Fatal("expected shrink to create child set a")
+	}
+	if got := child.Count(); got != 3 {
+		t.Fatalf("child count: got %d, want 3", got)
+	}
+	if got := child.Abelian().Metrics(); len(got) != 3 || got[0] != 3 || got[1] != 3 || got[2] != 4 {
+		t.Fatalf("child metrics: got %v, want [3 3 4]", got)
+	}
+}
+
 // Leaves whose location is the location of the set itself cannot be split any
 // further: shrink must leave them alone instead of slicing into their id.
 func TestSetShrinkKeepsLeavesAtOwnLocation(t *testing.T) {
@@ -152,5 +179,21 @@ func TestSetShrinkRecursesOnDeepLocations(t *testing.T) {
 	}
 	if got := agg.Count(); got != 3 {
 		t.Fatalf("aggregate count: got %d, want 3", got)
+	}
+}
+
+// Incr on a missing key used to nil-deref inside Abelian.Sum and take the node
+// down during Feed / Restore. Same shape as Decr: create an empty entry first.
+func TestSetIncrMissingKey(t *testing.T) {
+	s := NewSet()
+	got := s.Incr("aa:1", leaf())
+	if got == nil {
+		t.Fatal("Incr returned nil")
+	}
+	if got.Count() != 1 {
+		t.Fatalf("count: got %d, want 1", got.Count())
+	}
+	if s.Count() != 1 {
+		t.Fatalf("set count: got %d, want 1", s.Count())
 	}
 }

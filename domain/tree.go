@@ -30,18 +30,17 @@ func (t *tree[N]) Insert(idx int, id []byte, node N) {
 }
 
 func (t *tree[N]) Traverse(idx int, value []byte, process func(int, []byte, N)) {
-
+	// Mutate/restore the path buffer in place to avoid per-node allocations.
+	// Callers must not retain the value slice beyond the process callback.
 	if t.left != nil {
-		tmp := make([]byte, len(value))
-		copy(tmp, value)
-		t.left.Traverse(idx+1, tmp, process)
+		t.left.Traverse(idx+1, value, process)
 	}
 
 	if t.right != nil {
-		tmp := make([]byte, len(value))
-		copy(tmp, value)
-		tmp[idx/8] |= 1 << (7 - uint(idx%8))
-		t.right.Traverse(idx+1, tmp, process)
+		bit := byte(1 << (7 - uint(idx%8)))
+		value[idx/8] |= bit
+		t.right.Traverse(idx+1, value, process)
+		value[idx/8] &^= bit
 	}
 
 	if idx > 0 && t.left == nil && t.right == nil {
@@ -50,9 +49,6 @@ func (t *tree[N]) Traverse(idx int, value []byte, process func(int, []byte, N)) 
 }
 
 func (t *tree[N]) Range(idx int, owner, candidate, value []byte, process func(int, []byte, N)) {
-
-	tmp := make([]byte, len(value))
-	copy(tmp, value)
 
 	if idx/8 == len(owner) {
 		return
@@ -63,22 +59,24 @@ func (t *tree[N]) Range(idx int, owner, candidate, value []byte, process func(in
 
 	if oBit != cBit {
 		if !cBit && t.left != nil {
-			t.left.Traverse(idx+1, tmp, process)
+			t.left.Traverse(idx+1, value, process)
 		} else if cBit && t.right != nil {
-			tmp[idx/8] |= 1 << (7 - uint(idx%8))
-			t.right.Traverse(idx+1, tmp, process)
+			bit := byte(1 << (7 - uint(idx%8)))
+			value[idx/8] |= bit
+			t.right.Traverse(idx+1, value, process)
+			value[idx/8] &^= bit
 		}
 		return
 	}
 
 	if t.left != nil {
-		t.left.Range(idx+1, owner, candidate, tmp, process)
+		t.left.Range(idx+1, owner, candidate, value, process)
 	}
 	if t.right != nil {
-		tmpRight := make([]byte, len(tmp))
-		copy(tmpRight, tmp)
-		tmpRight[idx/8] |= 1 << (7 - uint(idx%8))
-		t.right.Range(idx+1, owner, candidate, tmpRight, process)
+		bit := byte(1 << (7 - uint(idx%8)))
+		value[idx/8] |= bit
+		t.right.Range(idx+1, owner, candidate, value, process)
+		value[idx/8] &^= bit
 	}
 }
 
@@ -205,13 +203,13 @@ func (t *tree[N]) Extract(idx int, value []byte, routing *[160]N) {
 }
 
 type BST[N any] struct {
-	mu   *sync.Mutex
+	mu   *sync.RWMutex
 	tree *tree[N]
 }
 
 func NewBST[N any]() *BST[N] {
 	return &BST[N]{
-		mu:   &sync.Mutex{},
+		mu:   &sync.RWMutex{},
 		tree: &tree[N]{},
 	}
 }
@@ -250,17 +248,24 @@ func (bst *BST[N]) Upsert(idx int, id []byte, new N, process func(int, []byte, N
 }
 
 func (bst *BST[N]) Traverse(idx int, value []byte, process func(int, []byte, N)) {
-	bst.mu.Lock()
-	defer bst.mu.Unlock()
+	// Read-only walk (Observe / Count / listOwnedKeys). The tree walk mutates
+	// the path buffer in place, so copy under RLock — concurrent callers may
+	// share a buffer (tests) and must not race on those bits.
+	bst.mu.RLock()
+	defer bst.mu.RUnlock()
 
-	bst.tree.Traverse(idx, value, process)
+	path := make([]byte, len(value))
+	copy(path, value)
+	bst.tree.Traverse(idx, path, process)
 }
 
 func (bst *BST[N]) Range(idx int, owner, candidate, value []byte, process func(int, []byte, N)) {
-	bst.mu.Lock()
-	defer bst.mu.Unlock()
+	bst.mu.RLock()
+	defer bst.mu.RUnlock()
 
-	bst.tree.Range(idx, owner, candidate, value, process)
+	path := make([]byte, len(value))
+	copy(path, value)
+	bst.tree.Range(idx, owner, candidate, path, process)
 }
 
 func (bst *BST[N]) Truncate(idx int, owner, branch []byte) {
@@ -271,15 +276,15 @@ func (bst *BST[N]) Truncate(idx int, owner, branch []byte) {
 }
 
 func (bst *BST[N]) Get(idx int, value []byte) (N, bool) {
-	bst.mu.Lock()
-	defer bst.mu.Unlock()
+	bst.mu.RLock()
+	defer bst.mu.RUnlock()
 
 	return bst.tree.Get(idx, value)
 }
 
 func (bst *BST[N]) Nearest(idx int, value []byte) N {
-	bst.mu.Lock()
-	defer bst.mu.Unlock()
+	bst.mu.RLock()
+	defer bst.mu.RUnlock()
 
 	return bst.tree.Nearest(idx, value)
 }

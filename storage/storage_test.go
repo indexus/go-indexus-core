@@ -9,10 +9,19 @@ import (
 	"time"
 )
 
+func newStorage(t *testing.T, archiveDir, filename string) *Storage {
+	t.Helper()
+	s, err := NewStorage(archiveDir, filename)
+	if err != nil {
+		t.Fatalf("NewStorage: %v", err)
+	}
+	return s
+}
+
 func TestSaveLoadRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	prefix := filepath.Join(dir, "backup")
-	s := NewStorage(filepath.Join(dir, "archive"), prefix)
+	s := newStorage(t, filepath.Join(dir, "archive"), prefix)
 
 	want := []string{
 		"contact|abc|1.2.3.4|21000",
@@ -42,7 +51,7 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 func TestStartAndCloseDoNotRace(t *testing.T) {
 	dir := t.TempDir()
 	prefix := filepath.Join(dir, "backup")
-	s := NewStorage(filepath.Join(dir, "archive"), prefix)
+	s := newStorage(t, filepath.Join(dir, "archive"), prefix)
 
 	started := make(chan error, 1)
 	go func() { started <- s.Start() }()
@@ -78,7 +87,7 @@ func TestStartAndCloseDoNotRace(t *testing.T) {
 
 func TestLoadMissingSnapshotIsNotAnError(t *testing.T) {
 	dir := t.TempDir()
-	s := NewStorage(filepath.Join(dir, "archive"), filepath.Join(dir, "backup"))
+	s := newStorage(t, filepath.Join(dir, "archive"), filepath.Join(dir, "backup"))
 
 	got, err := s.Load()
 	if err != nil {

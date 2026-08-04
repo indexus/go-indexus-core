@@ -7,13 +7,12 @@ type Abelian struct {
 	metrics []float64
 }
 
-// Implementing json.Marshaler interface
+// Implementing json.Marshaler interface without a nested named-type alloc dance.
 func (a *Abelian) MarshalJSON() ([]byte, error) {
-	type Obj struct {
+	return json.Marshal(struct {
 		Count   int       `json:"count"`
 		Metrics []float64 `json:"metrics"`
-	}
-	return json.Marshal(&Obj{
+	}{
 		Count:   a.count,
 		Metrics: a.metrics,
 	})
@@ -88,16 +87,33 @@ func (a *Abelian) IsEqual(b *Abelian) bool {
 	return true
 }
 
+// Sum folds a delta in, position by position. Deltas come from items and from
+// peer aggregates, and nothing forces a collection to hold items of one metric
+// width, so a narrower delta only touches the positions it carries.
 func (a *Abelian) Sum(delta *Abelian) {
+	if delta == nil {
+		return
+	}
 	a.count += delta.count
+	if a.metrics == nil {
+		a.metrics = make([]float64, len(delta.metrics))
+	}
 	for idx := range a.metrics {
-		a.metrics[idx] += delta.metrics[idx]
+		if idx < len(delta.metrics) {
+			a.metrics[idx] += delta.metrics[idx]
+		}
 	}
 }
 
+// Substract is Sum's inverse, with the same tolerance for a narrower delta.
 func (a *Abelian) Substract(delta *Abelian) {
+	if delta == nil {
+		return
+	}
 	a.count -= delta.count
 	for idx := range a.metrics {
-		a.metrics[idx] -= delta.metrics[idx]
+		if idx < len(delta.metrics) {
+			a.metrics[idx] -= delta.metrics[idx]
+		}
 	}
 }

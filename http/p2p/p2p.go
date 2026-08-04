@@ -1,17 +1,20 @@
 package p2p
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/indexus/go-indexus-core/auth"
 	"github.com/indexus/go-indexus-core/domain"
 	"github.com/indexus/go-indexus-core/encoding"
+	"github.com/indexus/go-indexus-core/logging"
 
 	"github.com/rs/cors"
 )
@@ -21,6 +24,7 @@ type Contact struct {
 	IPs  map[string]any `json:"ips"`
 	Port int            `json:"port"`
 	IP   string         `json:"ip"`
+	Cert *auth.NodeCert `json:"cert,omitempty"`
 }
 
 type Peer struct {
@@ -57,63 +61,107 @@ type Service interface {
 	Get(string, string, int) (domain.Contact, *domain.Set, error)
 	GetMultiple(string, []string, int, []func(*domain.Abelian) int) ([]byte, error)
 	New(*domain.Item, string, string) error
+	Handoff(*domain.Item, string, string) error
 	Delete(*domain.Item, string, string) error
+	DelegationOffer(domain.Peer, domain.DelegationOfferPayload) error
+	WALDelta(domain.Peer, domain.WALDeltaPayload) error
+	CaughtUp(domain.Peer, domain.CaughtUpPayload) error
+	SwitchAck(domain.Peer, domain.SwitchAckPayload) error
 }
 
 type Handler struct {
-	SSLStorage string
 	Service    Service
 	NewContact func(string, map[string]any, int) domain.Contact
+
+	Verifier    *auth.Verifier
+	RequireAuth bool
+	SelfCert    *auth.NodeCert
+
+	tlsDir string
+	server *http.Server
 }
 
-// New - Create a HTTP handler
-func NewHttpHandler(sslStorage string, service Service, newContact func(string, map[string]any, int) domain.Contact) *Handler {
-	return &Handler{
-		SSLStorage: sslStorage,
+func NewHttpHandler(tlsDir string, service Service, newContact func(string, map[string]any, int) domain.Contact) *Handler {
+	handler := &Handler{
 		Service:    service,
 		NewContact: newContact,
+		tlsDir:     tlsDir,
 	}
-}
-
-// Serve - Run the HTTP server
-func (h *Handler) Serve(lis net.Listener) error {
 
 	mux := http.NewServeMux()
 
-	// Discovery
-	mux.HandleFunc("/ping", h.Ping)
+	mux.HandleFunc("/ping", handler.Ping)
 
-	// Peer
-	mux.HandleFunc("/neighbors", h.Neighbors)
-	mux.HandleFunc("/random", h.Random)
-	mux.HandleFunc("/transfer", h.Transfer)
+	mux.HandleFunc("/neighbors", handler.Neighbors)
+	mux.HandleFunc("/random", handler.Random)
+	mux.HandleFunc("/transfer", handler.Transfer)
+	mux.HandleFunc("/delegation/offer", handler.DelegationOffer)
+	mux.HandleFunc("/delegation/wal-delta", handler.WALDelta)
+	mux.HandleFunc("/delegation/caught-up", handler.CaughtUp)
+	mux.HandleFunc("/delegation/switch-ack", handler.SwitchAck)
 
-	// Client
-	mux.HandleFunc("/set", h.Get)
-	mux.HandleFunc("/sets", h.GetMultiple)
-	mux.HandleFunc("/item", h.New)
-	mux.HandleFunc("/item/delete", h.Delete)
+	mux.HandleFunc("/set", handler.Get)
+	mux.HandleFunc("/sets", handler.GetMultiple)
+	mux.HandleFunc("/item", handler.New)
+	mux.HandleFunc("/item/delete", handler.Delete)
 
-	// Configure CORS
-	c := cors.New(cors.Options{
+	cors := cors.New(cors.Options{
 		AllowedOrigins:   []string{"*"},
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowedHeaders:   []string{"Content-Type", "Authorization"},
 		AllowCredentials: true,
 	})
 
-	handler := c.Handler(mux)
-
-	s := &http.Server{Handler: handler}
-
-	if len(h.SSLStorage) > 0 {
-
-		log.Println("Monitoring HTTPS Server started")
-		return s.ServeTLS(lis, fmt.Sprintf("%s/server.crt", h.SSLStorage), fmt.Sprintf("%s/server.key", h.SSLStorage))
+	handler.server = &http.Server{
+		Handler:           cors.Handler(mux),
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       time.Minute,
+		ErrorLog:          logging.StdLogger(slog.LevelWarn),
 	}
 
-	log.Println("Monitoring HTTP Server started")
-	return s.Serve(lis)
+	return handler
+}
+
+func (h *Handler) Serve(lis net.Listener) error {
+	slog.Info("p2p server listening", "addr", lis.Addr().String(), "tls", h.tlsDir != "", "auth", h.RequireAuth)
+
+	if h.tlsDir != "" {
+		return h.server.ServeTLS(lis, h.tlsDir+"/server.crt", h.tlsDir+"/server.key")
+	}
+	return h.server.Serve(lis)
+}
+
+func (h *Handler) Shutdown(ctx context.Context) error {
+	return h.server.Shutdown(ctx)
+}
+
+func (h *Handler) clientTokenOK(r *http.Request, scope string) bool {
+	if h.Verifier == nil {
+		return false
+	}
+	raw := r.Header.Get("Authorization")
+	if !strings.HasPrefix(raw, "Bearer ") {
+		return false
+	}
+	tok, err := auth.DecodeToken(strings.TrimPrefix(raw, "Bearer "))
+	if err != nil {
+		return false
+	}
+	if err := h.Verifier.VerifyClientToken(tok); err != nil {
+		return false
+	}
+	return tok.HasScope(scope)
+}
+
+func (h *Handler) requireClientScope(w http.ResponseWriter, r *http.Request, scope string) bool {
+	if !h.RequireAuth || h.Verifier == nil {
+		return true
+	}
+	if !h.clientTokenOK(r, scope) {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing or invalid bearer token"})
+		return false
+	}
+	return true
 }
 
 func writeJSON(w http.ResponseWriter, code int, data interface{}) {
@@ -122,7 +170,6 @@ func writeJSON(w http.ResponseWriter, code int, data interface{}) {
 	json.NewEncoder(w).Encode(data)
 }
 
-// Ping handles the /ping endpoint
 func (h *Handler) Ping(w http.ResponseWriter, r *http.Request) {
 
 	var bodyReq = struct {
@@ -146,7 +193,30 @@ func (h *Handler) Ping(w http.ResponseWriter, r *http.Request) {
 		bodyReq.Origin.IPs[ip] = nil
 	}
 
+	if h.RequireAuth && h.Verifier != nil {
+
+		if bodyReq.Origin.Cert != nil {
+			if bodyReq.Origin.Cert.NodeID != "" && bodyReq.Origin.Name != "" && bodyReq.Origin.Cert.NodeID != bodyReq.Origin.Name {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "cert node_id mismatch"})
+				return
+			}
+			if err := h.Verifier.VerifyNodeCertForAddr(bodyReq.Origin.Cert, ips); err != nil {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
+				return
+			}
+		} else if !h.clientTokenOK(r, "read") {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing node cert or client token"})
+			return
+		} else {
+
+			bodyReq.Origin.Name = ""
+		}
+	}
+
 	origin := h.NewContact(bodyReq.Origin.Name, bodyReq.Origin.IPs, bodyReq.Origin.Port)
+	if c, ok := origin.(interface{ SetCert(*auth.NodeCert) }); ok && bodyReq.Origin.Cert != nil {
+		c.SetCert(bodyReq.Origin.Cert)
+	}
 
 	contact, err := h.Service.Ping(origin)
 	if err != nil {
@@ -159,19 +229,31 @@ func (h *Handler) Ping(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	respCert := h.SelfCert
+	if respCert == nil {
+		if cc, ok := contact.(interface{ Cert() *auth.NodeCert }); ok {
+			respCert = cc.Cert()
+		}
+	}
+
 	var bodyResp = struct {
-		Contact Contact `json:"contact"`
+		Contact     Contact `json:"contact"`
+		ClientReady bool    `json:"client_ready"`
 	}{
 		Contact: Contact{
 			Name: contact.Name(),
 			IPs:  contact.IPs(),
 			Port: contact.Port(),
+			Cert: respCert,
 		},
+		ClientReady: true,
+	}
+	if cr, ok := h.Service.(interface{ ClientReady() bool }); ok {
+		bodyResp.ClientReady = cr.ClientReady()
 	}
 	writeJSON(w, http.StatusOK, bodyResp)
 }
 
-// Neighbors handles the /neighbors endpoint
 func (h *Handler) Neighbors(w http.ResponseWriter, r *http.Request) {
 
 	origin, err := NewPeer(r.URL.Query().Get("origin"))
@@ -202,7 +284,6 @@ func (h *Handler) Neighbors(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, body)
 }
 
-// Random handles the /random endpoint
 func (h *Handler) Random(w http.ResponseWriter, r *http.Request) {
 
 	origin, err := NewPeer(r.URL.Query().Get("origin"))
@@ -235,8 +316,11 @@ func (h *Handler) Random(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, body)
 }
 
-// Transfer handles the /transfer endpoint
 func (h *Handler) Transfer(w http.ResponseWriter, r *http.Request) {
+
+	if !h.requireClientScope(w, r, "write") {
+		return
+	}
 
 	var body struct {
 		Origin string         `json:"origin"`
@@ -255,14 +339,121 @@ func (h *Handler) Transfer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.Service.Transfer(origin, body.Key, body.Items); err != nil {
+		if errors.Is(err, domain.ErrLeaving) {
+
+			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+			return
+		}
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
 	}
 	w.WriteHeader(http.StatusCreated)
 }
 
-// Get handles the /set endpoint
+func (h *Handler) DelegationOffer(w http.ResponseWriter, r *http.Request) {
+	if !h.requireClientScope(w, r, "write") {
+		return
+	}
+	var body struct {
+		Origin string                        `json:"origin"`
+		Offer  domain.DelegationOfferPayload `json:"offer"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	origin, err := NewPeer(body.Origin)
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		return
+	}
+	if err := h.Service.DelegationOffer(origin, body.Offer); err != nil {
+		if errors.Is(err, domain.ErrLeaving) {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func (h *Handler) WALDelta(w http.ResponseWriter, r *http.Request) {
+	if !h.requireClientScope(w, r, "write") {
+		return
+	}
+	var body struct {
+		Origin string                 `json:"origin"`
+		Delta  domain.WALDeltaPayload `json:"delta"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	origin, err := NewPeer(body.Origin)
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		return
+	}
+	if err := h.Service.WALDelta(origin, body.Delta); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func (h *Handler) CaughtUp(w http.ResponseWriter, r *http.Request) {
+	if !h.requireClientScope(w, r, "write") {
+		return
+	}
+	var body struct {
+		Origin  string                 `json:"origin"`
+		Payload domain.CaughtUpPayload `json:"payload"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	origin, err := NewPeer(body.Origin)
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		return
+	}
+	if err := h.Service.CaughtUp(origin, body.Payload); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func (h *Handler) SwitchAck(w http.ResponseWriter, r *http.Request) {
+	if !h.requireClientScope(w, r, "write") {
+		return
+	}
+	var body struct {
+		Origin  string                  `json:"origin"`
+		Payload domain.SwitchAckPayload `json:"payload"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	origin, err := NewPeer(body.Origin)
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		return
+	}
+	if err := h.Service.SwitchAck(origin, body.Payload); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
 func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
+	if !h.requireClientScope(w, r, "read") {
+		return
+	}
 	collection := r.URL.Query().Get("collection")
 	location := r.URL.Query().Get("location")
 
@@ -279,16 +470,11 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var list map[string]*domain.Abelian
-	if set != nil {
-		list = set.List()
-	}
-
 	var body = struct {
-		Contact Contact                    `json:"contact"`
-		Set     map[string]*domain.Abelian `json:"set"`
+		Contact Contact     `json:"contact"`
+		Set     *domain.Set `json:"set"`
 	}{
-		Set: list,
+		Set: set,
 	}
 	if contact != nil {
 		body.Contact = Contact{
@@ -302,23 +488,23 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, body)
 }
 
-// Get handles the /sets endpoint -- ADAPTED for one collection, multiple locations
 func (h *Handler) GetMultiple(w http.ResponseWriter, r *http.Request) {
-	// We expect a single collection
+	if !h.requireClientScope(w, r, "read") {
+		return
+	}
+
 	collection := r.URL.Query().Get("collection")
 	if collection == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "collection parameter is required"})
 		return
 	}
 
-	// Potentially multiple locations (comma-separated)
 	locationsParam := r.URL.Query().Get("location")
 	if locationsParam == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "location parameter is required"})
 		return
 	}
 
-	// Split the location(s) on commas
 	locations := strings.Split(locationsParam, ",")
 
 	precision := 6
@@ -345,13 +531,15 @@ func (h *Handler) GetMultiple(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/octet-stream")
-	if _, writeErr := w.Write(sets); writeErr != nil {
-		log.Println("Error writing response:", writeErr)
+	if _, err := w.Write(sets); err != nil {
+		slog.Warn("sets response truncated", "err", err)
 	}
 }
 
-// New handles the /item endpoint
 func (h *Handler) New(w http.ResponseWriter, r *http.Request) {
+	if !h.requireClientScope(w, r, "write") {
+		return
+	}
 	var body struct {
 		Item    *domain.Item `json:"item"`
 		Root    string       `json:"root"`
@@ -361,20 +549,24 @@ func (h *Handler) New(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
 		return
 	}
-	if err := h.Service.New(body.Item, body.Root, body.Current); err != nil {
-		if strings.Contains(err.Error(), "ingress queue full") {
-			w.Header().Set("Retry-After", "1")
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "ingress queue full"})
-			return
-		}
+	accept := h.Service.New
+	if r.Header.Get(domain.HandoffHeader) != "" {
+		accept = h.Service.Handoff
+	}
+	if err := accept(body.Item, body.Root, body.Current); err != nil {
+
+		w.Header().Set("Retry-After", "1")
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
 	}
+
 	w.WriteHeader(http.StatusCreated)
 }
 
-// Delete handles POST /item/delete
 func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
+	if !h.requireClientScope(w, r, "write") {
+		return
+	}
 	var body struct {
 		Item    *domain.Item `json:"item"`
 		Root    string       `json:"root"`
@@ -385,22 +577,16 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.Service.Delete(body.Item, body.Root, body.Current); err != nil {
-		if strings.Contains(err.Error(), "ingress queue full") {
-			w.Header().Set("Retry-After", "1")
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "ingress queue full"})
-			return
-		}
+		w.Header().Set("Retry-After", "1")
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
 	}
 	w.WriteHeader(http.StatusCreated)
 }
 
-// getClientIPs extracts all IPv4 and IPv6 addresses from the HTTP request.
 func getClientIPs(r *http.Request) ([]string, error) {
 	var ips []string
 
-	// Helper function to parse and append IPs from a comma-separated string.
 	parseAndAppendIPs := func(ipStr string) {
 		ipList := strings.Split(ipStr, ",")
 		for _, ip := range ipList {
@@ -415,23 +601,20 @@ func getClientIPs(r *http.Request) ([]string, error) {
 		}
 	}
 
-	// Check the X-Real-IP header.
 	if ip := r.Header.Get("X-Real-IP"); ip != "" {
 		parseAndAppendIPs(ip)
 	}
 
-	// Check the X-Forwarded-For header.
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		parseAndAppendIPs(xff)
 	}
 
-	// Fall back to r.RemoteAddr.
 	remoteIP := r.RemoteAddr
 	if remoteIP != "" {
-		// Attempt to split the host and port.
+
 		host, _, err := net.SplitHostPort(remoteIP)
 		if err != nil {
-			// If splitting fails, use the entire RemoteAddr.
+
 			host = remoteIP
 		}
 		host = strings.TrimSpace(host)
