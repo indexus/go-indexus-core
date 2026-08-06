@@ -17,6 +17,19 @@ func (n *Node) Rebalancing() bool {
 	return n != nil && n.rebalancing.Load()
 }
 
+// TransferBusy is true while ownership is moving (rebalance flag or open
+// inbound/outbound delegation sessions). Feed/ingress pause on this; autoscale
+// may still spawn but must exclude outbound zones from PreferNear / item load.
+func (n *Node) TransferBusy() bool {
+	if n == nil {
+		return false
+	}
+	if n.rebalancing.Load() {
+		return true
+	}
+	return n.pendingOutbound() > 0 || n.pendingInbound() > 0
+}
+
 func (n *Node) Refresh() error {
 
 	if !n.refreshBusy.CompareAndSwap(false, true) {
@@ -61,6 +74,9 @@ func (n *Node) Refresh() error {
 			}()
 		}
 		wg.Wait()
+		// S3 offers finish asynchronously (CaughtUp). Do NOT hold rebalancing for
+		// the whole mirror — that stalls Feed and balloons the ingress queue while
+		// CaughtUp is still in flight. Flip freezes Feed only inside CaughtUp.
 		n.rebalancing.Store(false)
 		n.transferMu.Unlock()
 		if total := int(transferred.Load()); total > 0 {
@@ -174,6 +190,9 @@ func (n *Node) transferToPeer(candidate domain.Contact, keys []domain.Key) int {
 		if count >= 64 {
 			releaseHeapAfterTransfer(count)
 		}
+		// Parent abelian still holds the pre-handoff child entry — pull the
+		// receiver's summary so parent blocks start converging immediately.
+		n.pullDelegatedAggregate(key.Collection, key.Location, candidate)
 	}
 	return handed
 }

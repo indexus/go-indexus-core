@@ -109,7 +109,8 @@ startOutboundDelegation(peer, keys):
   DelegationOffer(refs S3) → receiver pulls snaps
   mirror inbound writes while ownership stays local
   WALDelta(filtered lines) → receiver CaughtUp
-  SwitchAck → donor Delegate+removeOwnedKey      # ACK-before-drop preserved
+  donor: flush cutover queue → SwitchAck(receiver) → Delegate+removeOwnedKey
+  # ACK-before-drop (R1/R4): ownership never drops if SwitchAck fails
 
 transferToPeer(peer, keys):                      # small zones / fallback
   for key in keys:
@@ -141,8 +142,13 @@ Guarantees:
   `app/simulation/mockup/convergence_test.go`.
 - **R4 (no thrash while moving).** `rebalancing` pauses Feed apply on the
   classic Transfer path; the S3 delegation path keeps the donor as owner
-  (and serving) until SwitchAck, so Feed is only paused for the micro-window
-  of the ownership flip. A suspended peer is never planned for.
+  (and serving) until SwitchAck succeeds, flushes cutover-queued writes, then
+  Delegates — so `Items()` never dips into a prep-only hole. Get serves local
+  data while the donor still owns the location even if XOR nearest is already
+  the receiver. A suspended peer is never planned for.
+  Tests: `TestCaughtUpAckBeforeDropKeepsOwnershipOnAckFail`,
+  `TestGetServesLocalWhileOwnedEvenIfNearerPeer`,
+  `TestCaughtUpFlushesCutoverQueueBeforeDrop`.
 - **R5 (metering).** Transfers and peer handoffs never count toward the
   autoscale insert window (`meter=false`); only client writes do. Test:
   `TestHandoffDoesNotMeterAutoscale`.
@@ -322,4 +328,4 @@ brute-force XOR arithmetic and end-to-end scenarios:
 | `core/autoscale*.go` | scaling decisions (owns no protocol state) |
 | `worker/worker.go` | scheduling |
 | `domain/` | trees, sets, queue, cache — all internally locked |
-| `peer/contact.go` | RPC transport (2 s discovery, 30 s transfer) |
+| `peer/contact.go` | RPC transport (2 s discovery, 5 m transfer; `INDEXUS_TRANSFER_TIMEOUT`) |

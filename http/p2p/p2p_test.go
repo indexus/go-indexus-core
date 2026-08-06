@@ -26,10 +26,10 @@ func (s *countingService) Transfer(domain.Peer, domain.Key, []*domain.Item) erro
 	s.transfers++
 	return nil
 }
-func (s *countingService) Get(string, string, int) (domain.Contact, *domain.Set, error) {
+func (s *countingService) Get(string, string, bool, int) (domain.Contact, *domain.Set, error) {
 	return nil, nil, nil
 }
-func (s *countingService) GetMultiple(string, []string, int, []func(*domain.Abelian) int) ([]byte, error) {
+func (s *countingService) GetMultiple(string, []string, int, []func(*domain.Abelian) int, bool, int) ([]byte, error) {
 	return nil, nil
 }
 func (s *countingService) New(*domain.Item, string, string) error     { return nil }

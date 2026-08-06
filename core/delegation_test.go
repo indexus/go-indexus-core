@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -183,7 +184,7 @@ func TestDelegationOfferApplyAndSwitch(t *testing.T) {
 	if got := len(donor.listOwnedKeys()); got != 0 {
 		t.Fatalf("donor still owns %d keys", got)
 	}
-
+	// SwitchAck is invoked inside CaughtUp (ACK-before-drop); a second call is idempotent.
 	if err := recv.SwitchAck(donor, domain.SwitchAckPayload{SessionID: "sess-1", Keys: keys}); err != nil {
 		t.Fatalf("SwitchAck: %v", err)
 	}
@@ -211,5 +212,178 @@ func TestUploadWALRecordsManifest(t *testing.T) {
 	}
 	if len(man.WALSegs) != 1 {
 		t.Fatalf("wal segs=%d want 1", len(man.WALSegs))
+	}
+}
+
+// switchAckFailPeer wraps a node so SwitchAck fails (P0: donor must not drop).
+type switchAckFailPeer struct {
+	*Node
+}
+
+func (p *switchAckFailPeer) SwitchAck(domain.Peer, domain.SwitchAckPayload) error {
+	return fmt.Errorf("injected switch-ack failure")
+}
+
+func TestCaughtUpAckBeforeDropKeepsOwnershipOnAckFail(t *testing.T) {
+	donor := newNodeOn(t, &memStorage{}, 64)
+	recv := newNodeOn(t, &memStorage{}, 64)
+	store := NewMemStore()
+	donor.SetStore(store)
+	recv.SetStore(store)
+	donor.SetDelegation(true)
+	recv.SetDelegation(true)
+	t.Setenv("INDEXUS_ZONE_SNAP_MIN", "1ns")
+	t.Setenv("INDEXUS_TRANSFER_THRESHOLD", "1")
+
+	root := encoding.BASE64.Root()
+	if err := donor.New(item("keep"), root, "aa"); err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	drain(t, donor)
+	keys := donor.listOwnedKeys()
+	if err := donor.forceZones(context.Background(), keys); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	zones := make([]domain.ZoneSnapshotRef, 0)
+	for _, k := range keys {
+		if e, ok := donor.zoneRef(k); ok {
+			zones = append(zones, e)
+		}
+	}
+	offer := domain.DelegationOfferPayload{
+		Donor: donor.Name(), SessionID: "sess-ack-fail", Zones: zones, WALSeq: 1,
+	}
+	if err := recv.DelegationOffer(donor, offer); err != nil {
+		t.Fatalf("offer: %v", err)
+	}
+	if err := recv.WALDelta(donor, domain.WALDeltaPayload{SessionID: "sess-ack-fail", Done: true}); err != nil {
+		t.Fatalf("delta: %v", err)
+	}
+
+	failPeer := &switchAckFailPeer{Node: recv}
+	donor.delegMu.Lock()
+	donor.delegOut[recv.Name()] = &delegationSession{
+		ID: "sess-ack-fail", PeerName: recv.Name(), Peer: failPeer,
+		Keys: keys, State: delegCatchingUp, Started: time.Now(),
+	}
+	donor.delegMu.Unlock()
+
+	err := donor.CaughtUp(failPeer, domain.CaughtUpPayload{SessionID: "sess-ack-fail"})
+	if err == nil {
+		t.Fatal("CaughtUp should fail when SwitchAck fails")
+	}
+	if got := len(donor.listOwnedKeys()); got == 0 {
+		t.Fatal("P0: donor must keep ownership when SwitchAck fails")
+	}
+	owned := donor.listOwnedKeys()
+	loc := owned[0].Location
+	contact, set, gerr := donor.Get(owned[0].Collection, loc, false, 0)
+	if gerr != nil || set == nil || set.Count() == 0 {
+		t.Fatalf("donor should still serve %s/%s: contact=%v set=%v err=%v owned=%v",
+			owned[0].Collection, loc, contact, set, gerr, owned)
+	}
+	if contact.Name() != donor.Name() {
+		t.Fatalf("P1: contact should be self while owned, got %s", contact.Name())
+	}
+}
+
+func TestGetServesLocalWhileOwnedEvenIfNearerPeer(t *testing.T) {
+	donor := newNodeOn(t, &memStorage{}, 64)
+	nearer := newNodeOn(t, &memStorage{}, 64)
+	root := encoding.BASE64.Root()
+	if err := donor.New(item("local"), root, "aa"); err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	drain(t, donor)
+
+	owned := donor.listOwnedKeys()
+	if len(owned) == 0 {
+		t.Fatal("expected owned keys")
+	}
+	// Register a peer so Nearest may prefer someone else; ownership stays on donor.
+	donor.subscribe([]domain.Contact{nearer})
+
+	contact, set, err := donor.Get(owned[0].Collection, owned[0].Location, true, DefaultDeepHops)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if set == nil || set.Count() == 0 {
+		t.Fatalf("expected local set at %q", owned[0].Location)
+	}
+	if contact == nil || contact.Name() != donor.Name() {
+		t.Fatalf("P1: want self as contact while owned, got %v", contact)
+	}
+}
+
+func TestCaughtUpFlushesCutoverQueueBeforeDrop(t *testing.T) {
+	donor := newNodeOn(t, &memStorage{}, 64)
+	recv := newNodeOn(t, &memStorage{}, 64)
+	store := NewMemStore()
+	donor.SetStore(store)
+	recv.SetStore(store)
+	donor.SetDelegation(true)
+	recv.SetDelegation(true)
+	t.Setenv("INDEXUS_ZONE_SNAP_MIN", "1ns")
+	t.Setenv("INDEXUS_TRANSFER_THRESHOLD", "1")
+
+	root := encoding.BASE64.Root()
+	for i := 0; i < 2; i++ {
+		if err := donor.New(item("c"+string(rune('a'+i))), root, "aa"); err != nil {
+			t.Fatalf("New: %v", err)
+		}
+	}
+	drain(t, donor)
+	keys := donor.listOwnedKeys()
+	if err := donor.forceZones(context.Background(), keys); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	zones := make([]domain.ZoneSnapshotRef, 0)
+	for _, k := range keys {
+		if e, ok := donor.zoneRef(k); ok {
+			zones = append(zones, e)
+		}
+	}
+	offer := domain.DelegationOfferPayload{
+		Donor: donor.Name(), SessionID: "sess-cutover", Zones: zones, WALSeq: 1,
+	}
+	if err := recv.DelegationOffer(donor, offer); err != nil {
+		t.Fatalf("offer: %v", err)
+	}
+	if err := recv.WALDelta(donor, domain.WALDeltaPayload{SessionID: "sess-cutover", Done: true}); err != nil {
+		t.Fatalf("delta: %v", err)
+	}
+
+	donor.delegMu.Lock()
+	sess := &delegationSession{
+		ID: "sess-cutover", PeerName: recv.Name(), Peer: recv,
+		Keys: keys, State: delegCatchingUp, Started: time.Now(),
+	}
+	donor.delegOut[recv.Name()] = sess
+	donor.delegMu.Unlock()
+
+	// Simulate a write that lands after Done but before CaughtUp completes:
+	// enter cutover and queue, then CaughtUp flushes.
+	late := item("late-cutover")
+	donor.delegMu.Lock()
+	sess.cutover = true
+	sess.State = delegReady
+	sess.cutoverQ = append(sess.cutoverQ, late.Content())
+	donor.delegMu.Unlock()
+	// Also apply locally so donor still has it for the flush race window.
+	_ = donor.add(late, false)
+
+	beforeRecv, _ := recv.Count()
+	if err := donor.CaughtUp(recv, domain.CaughtUpPayload{SessionID: "sess-cutover"}); err != nil {
+		t.Fatalf("CaughtUp: %v", err)
+	}
+	if got := len(donor.listOwnedKeys()); got != 0 {
+		t.Fatalf("donor still owns %d after successful cutover", got)
+	}
+	afterRecv, _ := recv.Count()
+	if afterRecv <= beforeRecv {
+		t.Fatalf("P2: receiver should gain flushed cutover item: before=%d after=%d", beforeRecv, afterRecv)
+	}
+	if recv.pendingInbound() != 0 {
+		t.Fatal("inbound should be closed after SwitchAck inside CaughtUp")
 	}
 }

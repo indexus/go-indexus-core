@@ -128,12 +128,12 @@ func parseFlags() (Config, error) {
 	autoscale := &config.Autoscale
 	flag.BoolVar(&autoscale.Enabled, "autoscale", false, "Let this node request scale-ups and scale-downs")
 	flag.StringVar(&autoscale.Role, "autoscaleRole", envOr("INDEXUS_ROLE", "bootstrap"), "bootstrap or spawned")
-	flag.DurationVar(&autoscale.Window, "scaleWindow", 2*time.Minute, "Sliding window used to count inserts")
-	flag.Int64Var(&autoscale.DownThreshold, "scaleDownThreshold", 200, "Scale down when inserts in the window stay below this")
-	flag.DurationVar(&autoscale.DownHold, "scaleDownHold", 8*time.Minute, "How long the scale-down condition must hold")
-	flag.DurationVar(&autoscale.Cooldown, "scaleCooldown", 3*time.Minute, "Quiet period after a scale-up")
-	flag.IntVar(&autoscale.QueueAbsThreshold, "queuePressure", 0, "Pending work that blocks scale-down (0 keeps the default; not a scale-up trigger)")
-	flag.DurationVar(&autoscale.PressureHold, "pressureHold", 0, "How long a resource signal must last before asking for a node (0 keeps the default)")
+	flag.DurationVar(&autoscale.Window, "scaleWindow", time.Minute, "Sliding window used to count inserts")
+	flag.Int64Var(&autoscale.DownThreshold, "scaleDownThreshold", 100, "Scale down when inserts in the window stay below this")
+	flag.DurationVar(&autoscale.DownHold, "scaleDownHold", 15*time.Minute, "How long the scale-down condition must hold")
+	flag.DurationVar(&autoscale.Cooldown, "scaleCooldown", 15*time.Second, "Quiet period after a scale-up")
+	flag.IntVar(&autoscale.QueueAbsThreshold, "queuePressure", 50000, "Pending work that blocks scale-down (not a scale-up trigger)")
+	flag.DurationVar(&autoscale.PressureHold, "pressureHold", 30*time.Second, "How long a resource signal must last before asking for a node")
 
 	flag.Parse()
 
@@ -186,6 +186,12 @@ func nameNearEnv() (string, error) {
 	raw := os.Getenv("INDEXUS_PREFER_NEAR")
 	if raw == "" {
 		return "", nil
+	}
+	// Load-split already emits a full node ID steered away from peers. Re-rolling
+	// RandomNameNear(keepBits=20) drifts back onto the requester and yields
+	// stuck joiners (0 zones, client_ready=false).
+	if _, err := encoding.BASE64.Decode(raw); err == nil && len(raw) == encoding.BASE64.IDLength() {
+		return raw, nil
 	}
 	target, err := encoding.BASE64.Decode(raw)
 	if err != nil {
@@ -285,10 +291,9 @@ func run(config Config) error {
 		return fmt.Errorf("node: %w", err)
 	}
 
-	if obj, err := core.NewS3Store(context.Background()); err != nil {
-		slog.Warn("s3 object store unavailable", "err", err)
-	} else if obj != nil {
-		node.SetStore(obj)
+	attachStore := func(store core.Store, kind string) {
+		node.SetStore(store)
+		slog.Info("object store attached", "kind", kind)
 		if wal != nil {
 			n := node
 			wal.OnLogRotated = func(path string) {
@@ -297,6 +302,15 @@ func run(config Config) error {
 				}
 			}
 		}
+	}
+	if obj, err := core.NewS3Store(context.Background()); err != nil {
+		slog.Warn("s3 object store unavailable", "err", err)
+	} else if obj != nil {
+		attachStore(obj, "s3")
+	} else if dir, err := core.NewDirStore(); err != nil {
+		slog.Warn("dir object store unavailable", "err", err)
+	} else if dir != nil {
+		attachStore(dir, "dir:"+dir.Root())
 	}
 
 	verifier, cert, err := setupAuth(config, node)

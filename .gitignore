@@ -11,6 +11,12 @@ deploy/terraform/.terraform.lock.hcl
 deploy/terraform/terraform.tfvars
 deploy/terraform/ami.auto.tfvars
 deploy/terraform/*.tfstate*
+scripts/deploy/terraform/.terraform/
+scripts/deploy/terraform/*.tfstate*
+scripts/deploy/terraform/.terraform.lock.hcl
+scripts/deploy/terraform/terraform.tfvars
+scripts/deploy/terraform/ami.auto.tfvars
+scripts/deploy/terraform/load_ami_id
 
 scripts/bench/out/
 scripts/bench/node_modules/

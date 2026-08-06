@@ -12,7 +12,9 @@ type Contact interface {
 	Neighbors(Peer) ([]Contact, error)
 	Random(Peer) (Contact, error)
 	Transfer(Peer, Key, []*Item) error
-	Get(collection, location string, depth int) (Contact, *Set, error)
+	// Get resolves a set. deep path-fills via peers; hop is the remaining
+	// recursion budget (0 with deep=true means use the peer default).
+	Get(collection, location string, deep bool, hop int) (Contact, *Set, error)
 	New(*Item, string, string) error
 	Delete(*Item, string, string) error
 }

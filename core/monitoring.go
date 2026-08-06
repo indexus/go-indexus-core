@@ -1,12 +1,17 @@
 package core
 
 import (
+	"context"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/indexus/go-indexus-core/domain"
 	"github.com/indexus/go-indexus-core/encoding"
 )
+
+// Snapshot store prefixes used by zone snaps, node manifests, and legacy latest dumps.
+var snapshotPrefixes = []string{"zones/", "nodes/", "snapshots/"}
 
 func (n *Node) Routing() ([]domain.Contact, error) {
 	return n.traverseRouting(true), nil
@@ -39,7 +44,9 @@ func (n *Node) Ownership() (map[string]map[string]map[string]any, error) {
 }
 
 func (n *Node) Count() (int, error) {
+	pending := n.pendingInboundKeySet()
 	total := 0
+	prep := 0
 
 	n.owned.Traverse(0, encoding.BASE64.NewID(), func(i int, b []byte, keys map[domain.Key]any) {
 		for key := range keys {
@@ -47,24 +54,42 @@ func (n *Node) Count() (int, error) {
 			if !exist {
 				continue
 			}
+			count := 0
 			collection.Traverse(
 				key.Location,
 				func(s string, a *domain.Abelian) {},
-				func(s1, s2, s3 string, a *domain.Abelian) { total++ },
+				func(s1, s2, s3 string, a *domain.Abelian) { count++ },
 			)
+			if keyInPendingInbound(pending, key) {
+				prep += count
+				continue
+			}
+			total += count
 		}
 	})
 	n.items.Store(int64(total))
+	n.itemsPrep.Store(int64(prep))
 	return total, nil
 }
 
 func (n *Node) Items() int {
-	if n.items.Load() == 0 && n.lastCountAt.Load() == 0 {
+	if n.items.Load() == 0 && n.itemsPrep.Load() == 0 && n.lastCountAt.Load() == 0 {
 		total, _ := n.Count()
 		n.lastCountAt.Store(time.Now().UnixNano())
 		return total
 	}
 	return int(n.items.Load())
+}
+
+// ItemsPreparing is the item count under inbound snapshot-delegation sessions
+// (loaded, not yet SwitchAck'd). Official Items() excludes these so the donor
+// remains the serving count until the receiver is ready.
+func (n *Node) ItemsPreparing() int {
+	if n.items.Load() == 0 && n.itemsPrep.Load() == 0 && n.lastCountAt.Load() == 0 {
+		_, _ = n.Count()
+		n.lastCountAt.Store(time.Now().UnixNano())
+	}
+	return int(n.itemsPrep.Load())
 }
 
 func (n *Node) MeasureItems() {
@@ -132,16 +157,23 @@ func (n *Node) Queue() int {
 
 func (n *Node) SnapshotInfo() map[string]any {
 	info := map[string]any{
-		"store":        n.Store() != nil,
-		"delegation":   n.Delegation(),
-		"deleg_in":     n.pendingInbound(),
-		"deleg_out":    0,
-		"dirty":        0,
-		"snapped":      0,
-		"wal_segments": 0,
+		"store":              n.Store() != nil,
+		"delegation":         n.Delegation(), // S3 / DirStore snapshot path enabled
+		"delegation_size":    0,               // -delegation / INDEXUS_DELEGATION
+		"transfer_threshold": TransferThreshold(),
+		"delegation_timeout": DelegationTimeout().String(),
+		"transfer_timeout":   ClassicTransferTimeout().String(),
+		"deleg_in":           n.pendingInbound(),
+		"deleg_out":          0,
+		"dirty":              0,
+		"snapped":            0,
+		"wal_segments":       0,
 	}
 	if n == nil {
 		return info
+	}
+	if n.settings != nil {
+		info["delegation_size"] = n.settings.DelegationSize()
 	}
 	n.delegMu.Lock()
 	out := 0
@@ -160,4 +192,61 @@ func (n *Node) SnapshotInfo() map[string]any {
 		n.zoneSnap.mu.Unlock()
 	}
 	return info
+}
+
+// ListSnapshots returns object-store keys under zones/, nodes/, and snapshots/.
+func (n *Node) ListSnapshots(ctx context.Context) (map[string]any, error) {
+	store := n.Store()
+	if store == nil {
+		return map[string]any{"available": false, "objects": []ObjectInfo{}}, nil
+	}
+	seen := make(map[string]struct{})
+	objects := make([]ObjectInfo, 0)
+	for _, prefix := range snapshotPrefixes {
+		listed, err := store.List(ctx, prefix)
+		if err != nil {
+			return nil, err
+		}
+		for _, o := range listed {
+			if _, ok := seen[o.Key]; ok {
+				continue
+			}
+			seen[o.Key] = struct{}{}
+			objects = append(objects, o)
+		}
+	}
+	sort.Slice(objects, func(i, j int) bool {
+		if objects[i].LastModified.Equal(objects[j].LastModified) {
+			return objects[i].Key > objects[j].Key
+		}
+		return objects[i].LastModified.After(objects[j].LastModified)
+	})
+	return map[string]any{
+		"available": true,
+		"objects":   objects,
+		"count":     len(objects),
+	}, nil
+}
+
+// ClearSnapshots deletes object-store keys under zones/, nodes/, and snapshots/.
+func (n *Node) ClearSnapshots(ctx context.Context) (map[string]any, error) {
+	store := n.Store()
+	if store == nil {
+		return map[string]any{"available": false, "cleared": 0}, nil
+	}
+	cleared := 0
+	for _, prefix := range snapshotPrefixes {
+		listed, err := store.List(ctx, prefix)
+		if err != nil {
+			return nil, err
+		}
+		if err := store.DeletePrefix(ctx, prefix); err != nil {
+			return nil, err
+		}
+		cleared += len(listed)
+	}
+	return map[string]any{
+		"available": true,
+		"cleared":   cleared,
+	}, nil
 }

@@ -204,12 +204,18 @@ func encodeBits(values []int, bitsPerValue int) []byte {
 }
 
 func (c *Collection) GetMultiple(locations []string, precision int, properties []func(*Abelian) int) ([]byte, error) {
-	// Encode is read-only over sets; exclusive Lock used to stall every Add
-	// for the whole /sets response.
+	// Encode is read-only over sets; RLock stalls writers for the whole encode.
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	return EncodeSets(c.sets, locations, precision, properties)
+}
 
-	var result []byte
+// EncodeSets builds the /sets binary from an arbitrary location→Set map
+// (local ownership, LRU path-fill, or both). Missing locations are skipped.
+func EncodeSets(sets map[string]*Set, locations []string, precision int, properties []func(*Abelian) int) ([]byte, error) {
+	if precision < 1 {
+		return nil, nil
+	}
 
 	type t struct {
 		size    int
@@ -226,15 +232,14 @@ func (c *Collection) GetMultiple(locations []string, precision int, properties [
 			values:  make([][]int, 0),
 			content: make([]byte, 0),
 		}
-
 		for v := 0; v < len(properties); v++ {
 			data[idx].values = append(data[idx].values, make([]int, 0))
 		}
 	}
 
 	for _, location := range locations {
-		set, exist := c.sets[location]
-		if !exist {
+		set, exist := sets[location]
+		if !exist || set == nil {
 			continue
 		}
 
@@ -250,6 +255,9 @@ func (c *Collection) GetMultiple(locations []string, precision int, properties [
 			}
 
 			l := len(key) - 1
+			if l < 0 || l >= precision {
+				return
+			}
 
 			data[l].size++
 			data[l].content = append(data[l].content, []byte(key)...)
@@ -271,21 +279,18 @@ func (c *Collection) GetMultiple(locations []string, precision int, properties [
 		return bits.Len(uint(n))
 	}
 
+	var result []byte
 	for i := 0; i < precision; i++ {
 		if data[i].size == 0 {
 			continue
 		}
 
-		header := []byte{}
-		header = append(header, byte(i))
-
-		// Encode size as four bytes (Big Endian)
+		header := []byte{byte(i)}
 		sizeBytes := make([]byte, 4)
 		binary.BigEndian.PutUint32(sizeBytes, uint32(data[i].size))
 		header = append(header, sizeBytes...)
 
 		content := data[i].content
-
 		for j := 0; j < len(properties); j++ {
 			bitCount := bitsNeeded(data[i].bits[j])
 			header = append(header, byte(bitCount))

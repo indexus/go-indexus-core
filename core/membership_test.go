@@ -106,7 +106,7 @@ func TestGetDoesNotRedirectToUndialable(t *testing.T) {
 
 	n.registered.Insert(0, dead.ID(), dead)
 
-	contact, set, err := n.Get("demo", root, 2)
+	contact, set, err := n.Get("demo", root, true, DefaultDeepHops)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}

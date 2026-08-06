@@ -7,4 +7,6 @@ type Storage interface {
 	Load() ([]string, error)
 	Append(string)
 	Stream(int) <-chan string
+	// Dirty reports pending WAL changes since the last successful Save.
+	Dirty() bool
 }

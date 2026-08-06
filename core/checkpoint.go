@@ -15,10 +15,12 @@ func (n *Node) Checkpoint() error {
 	n.checkpointMu.Lock()
 	defer n.checkpointMu.Unlock()
 
-	if err := n.storage.Save(n.Snapshot()); err != nil {
-		return err
+	if n.storage.Dirty() {
+		if err := n.storage.Save(n.Snapshot()); err != nil {
+			return err
+		}
+		n.uploadLatestSnapshot()
 	}
-	n.uploadLatestSnapshot()
 	if err := n.checkpointZones(context.Background()); err != nil {
 		slog.Warn("zone checkpoint failed", "err", err)
 	}

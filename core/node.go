@@ -57,6 +57,7 @@ type Node struct {
 	joinFirstOwn atomic.Int64
 
 	items       atomic.Int64
+	itemsPrep   atomic.Int64
 	lastCountAt atomic.Int64
 
 	storeMu     sync.Mutex

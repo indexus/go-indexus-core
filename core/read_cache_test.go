@@ -14,7 +14,7 @@ type getPeer struct {
 	calls atomic.Int64
 }
 
-func (p *getPeer) Get(string, string, int) (domain.Contact, *domain.Set, error) {
+func (p *getPeer) Get(string, string, bool, int) (domain.Contact, *domain.Set, error) {
 	p.calls.Add(1)
 	return p, p.set, nil
 }
@@ -37,7 +37,7 @@ func TestGetPathFillsOnceThenServesFromCache(t *testing.T) {
 	n := newNodeOn(t, &memStorage{}, 64)
 	owner := ownerPeerAt(t, n, "demo", "qr", 1)
 
-	_, set, err := n.Get("demo", "qr", 2)
+	_, set, err := n.Get("demo", "qr", true, DefaultDeepHops)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
@@ -51,7 +51,7 @@ func TestGetPathFillsOnceThenServesFromCache(t *testing.T) {
 		t.Fatalf("sparse leaf stamped hops=%d want 1", got)
 	}
 
-	if _, set, err = n.Get("demo", "qr", 2); err != nil || set == nil {
+	if _, set, err = n.Get("demo", "qr", true, DefaultDeepHops); err != nil || set == nil {
 		t.Fatalf("cached Get: set=%v err=%v", set != nil, err)
 	}
 	if got := owner.calls.Load(); got != 1 {
@@ -63,7 +63,7 @@ func TestGetDenseLeafStampsShorterTTLClass(t *testing.T) {
 	n := newNodeOn(t, &memStorage{}, 64)
 	ownerPeerAt(t, n, "demo", "qq", n.settings.leafRedirect)
 
-	if _, set, err := n.Get("demo", "qq", 2); err != nil || set == nil {
+	if _, set, err := n.Get("demo", "qq", true, DefaultDeepHops); err != nil || set == nil {
 		t.Fatalf("Get: set=%v err=%v", set != nil, err)
 	}
 	if got := n.cache.Hops("demo", "qq"); got != 2 {
@@ -71,22 +71,22 @@ func TestGetDenseLeafStampsShorterTTLClass(t *testing.T) {
 	}
 }
 
-func TestGetDepthZeroRedirectsWithoutPull(t *testing.T) {
+func TestGetDeepFalseRedirectsWithoutPull(t *testing.T) {
 	n := newNodeOn(t, &memStorage{}, 64)
 	owner := ownerPeerAt(t, n, "demo", "qt", 1)
 
-	contact, set, err := n.Get("demo", "qt", 0)
+	contact, set, err := n.Get("demo", "qt", false, 0)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
 	if set != nil {
-		t.Fatal("depth=0 returned a set — client asked for a redirect")
+		t.Fatal("deep=false returned a set — client asked for a redirect")
 	}
 	if contact == nil || contact.Name() != owner.Name() {
-		t.Fatal("depth=0 did not redirect to the owner")
+		t.Fatal("deep=false did not redirect to the owner")
 	}
 	if owner.calls.Load() != 0 {
-		t.Fatalf("depth=0 dialed the owner %d times", owner.calls.Load())
+		t.Fatalf("deep=false dialed the owner %d times", owner.calls.Load())
 	}
 	if cached, exist := n.cache.Get("demo", "qt"); !exist || cached != nil {
 		t.Fatalf("expected a nil placeholder, got exist=%v set=%v", exist, cached != nil)

@@ -1,4 +1,0 @@
-out/
-node_modules/
-scripts/bench/data/*.csv
-data/*.csv

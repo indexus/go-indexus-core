@@ -58,8 +58,8 @@ type Service interface {
 	Neighbors(domain.Peer) ([]domain.Contact, error)
 	Random(domain.Peer) (domain.Contact, error)
 	Transfer(domain.Peer, domain.Key, []*domain.Item) error
-	Get(string, string, int) (domain.Contact, *domain.Set, error)
-	GetMultiple(string, []string, int, []func(*domain.Abelian) int) ([]byte, error)
+	Get(string, string, bool, int) (domain.Contact, *domain.Set, error)
+	GetMultiple(string, []string, int, []func(*domain.Abelian) int, bool, int) ([]byte, error)
 	New(*domain.Item, string, string) error
 	Handoff(*domain.Item, string, string) error
 	Delete(*domain.Item, string, string) error
@@ -456,15 +456,9 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	}
 	collection := r.URL.Query().Get("collection")
 	location := r.URL.Query().Get("location")
+	deep, hop := parseDeepHop(r)
 
-	depth := 2
-	if d := r.URL.Query().Get("depth"); d != "" {
-		if v, err := strconv.Atoi(d); err == nil {
-			depth = v
-		}
-	}
-
-	contact, set, err := h.Service.Get(collection, location, depth)
+	contact, set, err := h.Service.Get(collection, location, deep, hop)
 	if err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
@@ -506,6 +500,7 @@ func (h *Handler) GetMultiple(w http.ResponseWriter, r *http.Request) {
 	}
 
 	locations := strings.Split(locationsParam, ",")
+	deep, hop := parseDeepHop(r)
 
 	precision := 6
 
@@ -524,7 +519,7 @@ func (h *Handler) GetMultiple(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	sets, err := h.Service.GetMultiple(collection, locations, precision, properties)
+	sets, err := h.Service.GetMultiple(collection, locations, precision, properties, deep, hop)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
 		return
@@ -534,6 +529,34 @@ func (h *Handler) GetMultiple(w http.ResponseWriter, r *http.Request) {
 	if _, err := w.Write(sets); err != nil {
 		slog.Warn("sets response truncated", "err", err)
 	}
+}
+
+// parseDeepHop: deep defaults true. hop defaults 8 when deep. Legacy depth:
+// depth=0 → deep=false; depth>0 → deep=true (hop still default unless set).
+func parseDeepHop(r *http.Request) (deep bool, hop int) {
+	deep = true
+	if raw := r.URL.Query().Get("deep"); raw != "" {
+		switch strings.ToLower(raw) {
+		case "0", "false", "no":
+			deep = false
+		default:
+			deep = true
+		}
+	} else if d := r.URL.Query().Get("depth"); d != "" {
+		if v, err := strconv.Atoi(d); err == nil && v <= 0 {
+			deep = false
+		}
+	}
+	hop = 0
+	if deep {
+		hop = 8
+		if h := r.URL.Query().Get("hop"); h != "" {
+			if v, err := strconv.Atoi(h); err == nil {
+				hop = v
+			}
+		}
+	}
+	return deep, hop
 }
 
 func (h *Handler) New(w http.ResponseWriter, r *http.Request) {
