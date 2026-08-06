@@ -16,6 +16,7 @@ type memStorage struct {
 	mu       sync.Mutex
 	lines    []string
 	snapshot []string
+	dirty    bool
 }
 
 func (m *memStorage) Exist() bool {
@@ -28,6 +29,7 @@ func (m *memStorage) Reset() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.lines, m.snapshot = nil, nil
+	m.dirty = false
 	return nil
 }
 
@@ -36,6 +38,7 @@ func (m *memStorage) Save(commands []string) error {
 	defer m.mu.Unlock()
 	m.snapshot = append([]string(nil), commands...)
 	m.lines = nil
+	m.dirty = false
 	return nil
 }
 
@@ -49,11 +52,18 @@ func (m *memStorage) Append(line string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.lines = append(m.lines, line)
+	m.dirty = true
 }
 
 func (m *memStorage) SyncAppend(line string) error {
 	m.Append(line)
 	return nil
+}
+
+func (m *memStorage) Dirty() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.dirty || len(m.lines) > 0
 }
 
 func (m *memStorage) Stream(start int) <-chan string {
@@ -111,7 +121,7 @@ func (p *dialPeer) Neighbors(domain.Peer) ([]domain.Contact, error) {
 	return nil, nil
 }
 func (p *dialPeer) Random(domain.Peer) (domain.Contact, error) { return nil, nil }
-func (p *dialPeer) Get(string, string, int) (domain.Contact, *domain.Set, error) {
+func (p *dialPeer) Get(string, string, bool, int) (domain.Contact, *domain.Set, error) {
 	return p, nil, nil
 }
 func (p *dialPeer) New(*domain.Item, string, string) error                 { return nil }

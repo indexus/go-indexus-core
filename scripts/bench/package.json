@@ -1,9 +1,0 @@
-{
-  "name": "indexus-aws-bench",
-  "private": true,
-  "type": "module",
-  "dependencies": {
-    "axios": "^1.7.9",
-    "js-indexus-sdk": "file:../../../sdk-js"
-  }
-}

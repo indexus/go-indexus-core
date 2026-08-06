@@ -77,12 +77,12 @@ func TestPathFillFromOwnerNeighbor(t *testing.T) {
 		owner, other = n2, n1
 	}
 
-	_, ownedSet, err := owner.Get(collection, "@", 0)
+	_, ownedSet, err := owner.Get(collection, "@", false, 0)
 	if err != nil || ownedSet == nil {
 		t.Fatalf("owner must serve locally: err=%v set=%v", err, ownedSet != nil)
 	}
 
-	_, filled, err := other.Get(collection, "@", 2)
+	_, filled, err := other.Get(collection, "@", true, 8)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +90,7 @@ func TestPathFillFromOwnerNeighbor(t *testing.T) {
 		t.Fatal("non-owner should path-fill from owner neighbor")
 	}
 
-	_, cached, err := other.Get(collection, "@", 0)
+	_, cached, err := other.Get(collection, "@", false, 0)
 	if err != nil || cached == nil {
 		t.Fatalf("expected cache hit on edge after path-fill: err=%v set=%v", err, cached != nil)
 	}

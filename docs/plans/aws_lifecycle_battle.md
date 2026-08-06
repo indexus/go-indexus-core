@@ -6,6 +6,10 @@ saved: 2026-08-03
 
 # DEFERRED — AWS lifecycle battle
 
+> **Note (2026-08):** `scripts/bench/` was removed. Density/DVF loaders live in
+> sibling `dashboard/`. AWS paths are under `scripts/deploy/` (was `deploy/`).
+> This plan is historical.
+
 > Saved aside until the core+aws monorepo merge is done. Paths below assume deploy/scripts live in this repo.
 
 # Campagne AWS : lifecycle, hotspots, consistance

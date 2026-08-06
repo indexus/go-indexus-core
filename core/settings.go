@@ -52,9 +52,13 @@ func NewSettings(name string, port int, delay, expiration time.Duration, delegat
 		feedWorkers:  32,
 		leafRedirect: 64,
 
-		memRefusePct: 68,
+		memRefusePct: 60,
 	}
 
+	// Env overrides the -delegation flag when set (same pattern as queue/forward).
+	if v := envInt("INDEXUS_DELEGATION", 0); v > 0 {
+		settings.delegation = v
+	}
 	if v := envInt("INDEXUS_QUEUE_MAX", 0); v > 0 {
 		settings.queueMax = v
 	}
@@ -119,6 +123,15 @@ func (s *Settings) SetLeafRedirect(threshold int) {
 
 func (s *Settings) SetMemRefusePct(pct float64) {
 	s.memRefusePct = pct
+}
+
+// DelegationSize is the soft item count at which a location range is owned
+// and may split (-delegation / INDEXUS_DELEGATION).
+func (s *Settings) DelegationSize() int {
+	if s == nil {
+		return 0
+	}
+	return s.delegation
 }
 
 func (s *Settings) SetAdvertise(addrs ...string) {

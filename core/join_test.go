@@ -124,8 +124,38 @@ func TestJoinPublishGraceOverridesBacklog(t *testing.T) {
 	for i := 0; i < 6; i++ {
 		_ = node.queue.TryAdd(NewElement(item("q"), "@", "aa"), 8)
 	}
-	node.joinFirstOwn.Store(time.Now().Add(-joinPublishGrace - time.Second).UnixNano())
+	node.joinFirstOwn.Store(time.Now().Add(-DefaultJoinPublishGrace - time.Second).UnixNano())
 	if !node.ClientReady() {
 		t.Fatal("grace should publish even with a Transfer backlog")
+	}
+}
+
+func TestSpawnedNodeWaitsForInboundDelegation(t *testing.T) {
+	node := newNodeOn(t, &memStorage{}, 4)
+	node.EnableAutoscale(AutoscaleConfig{
+		Enabled: true,
+		Role:    "spawned",
+	})
+	// Inbound session must exist before ownership so we never latch ready early.
+	node.delegMu.Lock()
+	node.delegIn["donor"] = &delegationSession{
+		ID:       "sess",
+		PeerName: "donor",
+		Keys:     []domain.Key{{Collection: "demo", Location: "aa"}},
+		State:    delegCatchingUp,
+		Started:  time.Now(),
+		inbound:  true,
+	}
+	node.delegMu.Unlock()
+	node.create("demo", "aa")
+	node.joinFirstOwn.Store(time.Now().Add(-DefaultJoinPublishGrace - time.Second).UnixNano())
+	if node.ClientReady() {
+		t.Fatal("must not publish client_ready while inbound delegation is open")
+	}
+	node.delegMu.Lock()
+	delete(node.delegIn, "donor")
+	node.delegMu.Unlock()
+	if !node.ClientReady() {
+		t.Fatal("expected client_ready after inbound session cleared")
 	}
 }

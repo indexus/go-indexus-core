@@ -209,7 +209,7 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	collection := r.URL.Query().Get("collection")
 	location := r.URL.Query().Get("location")
 
-	contact, set, err := node.Get(collection, location, 2)
+	contact, set, err := node.Get(collection, location, true, 8)
 	if err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
@@ -280,7 +280,7 @@ func (h *Handler) GetMultiple(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	sets, err := node.GetMultiple(collection, locations, precision, properties)
+	sets, err := node.GetMultiple(collection, locations, precision, properties, true, 8)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
 		return

@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/indexus/go-indexus-core/domain"
 	"github.com/indexus/go-indexus-core/encoding"
 )
 
@@ -29,9 +30,8 @@ type AutoscaleConfig struct {
 	DownHold      time.Duration
 	Cooldown      time.Duration
 
-	QueueAbsThreshold  int
-	QueueRiseThreshold int
-	PressureHold       time.Duration
+	QueueAbsThreshold int
+	PressureHold      time.Duration
 
 	MemLimitPct    float64
 	DiskMinFreePct float64
@@ -42,7 +42,12 @@ type AutoscaleConfig struct {
 	MemRisePct     float64
 	CPURisePct     float64
 	RiseHold       time.Duration
-	MemRefusePct   float64
+	// MemRefusePct: emergency instant scale-up + same env as Settings write refuse
+	// (INDEXUS_MEM_REFUSE_PCT). Soft mem scale uses MemLimitPct + hold instead.
+	MemRefusePct float64
+	// ItemsLimit: owned official item count that forces scale-up even without
+	// mem/CPU pressure (0 disables). Env: INDEXUS_ITEMS_LIMIT.
+	ItemsLimit int
 }
 
 type InsertWindow struct {
@@ -114,63 +119,6 @@ func (w *InsertWindow) rotateLocked() {
 	w.start = w.start.Add(time.Duration(elapsed) * w.bucket)
 }
 
-type hotTracker struct {
-	mu     sync.Mutex
-	counts map[string]int64
-	hits   int64
-}
-
-func newHotTracker() *hotTracker {
-	return &hotTracker{counts: make(map[string]int64)}
-}
-
-func (h *hotTracker) hit(collection, location string) {
-	if h == nil {
-		return
-	}
-	p := location
-	if p == "" {
-		p = encoding.BASE64.Root()
-	}
-	if len(p) > 4 {
-		p = p[:4]
-	}
-	key := collection + "|" + p
-	h.mu.Lock()
-	h.counts[key]++
-	h.hits++
-
-	if h.hits%2048 == 0 {
-		for k, v := range h.counts {
-			v /= 2
-			if v == 0 {
-				delete(h.counts, k)
-			} else {
-				h.counts[k] = v
-			}
-		}
-	}
-	h.mu.Unlock()
-}
-
-func (h *hotTracker) hottest() (collection, prefix string, n int64) {
-	if h == nil {
-		return "", "", 0
-	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	for k, v := range h.counts {
-		if v > n {
-			n = v
-			parts := strings.SplitN(k, "|", 2)
-			if len(parts) == 2 {
-				collection, prefix = parts[0], parts[1]
-			}
-		}
-	}
-	return collection, prefix, n
-}
-
 type ScaleUpRequest struct {
 	PreferNear string
 
@@ -183,17 +131,15 @@ type ScaleUpRequest struct {
 type PressureInput struct {
 	Queue      int
 	OwnedZones int
+	OwnedItems int
 	Resources  ResourceSample
 	SelfName   string
-
-	Rebalancing bool
 }
 
 type AutoscaleController struct {
 	cfg AutoscaleConfig
 
 	window *InsertWindow
-	hot    *hotTracker
 
 	mu           sync.Mutex
 	lastUpAt     time.Time
@@ -224,38 +170,38 @@ type AutoscaleController struct {
 	lastPressure   map[string]any
 
 	reliefArrived bool
+
+	// nearBuilder partitions retained owned load into PreferNear tags (~1/N each).
+	nearBuilder func(spawnN int, fallback string) []string
 }
 
 func NewAutoscaleController(cfg AutoscaleConfig) *AutoscaleController {
 	if cfg.Window <= 0 {
-		cfg.Window = 2 * time.Minute
+		cfg.Window = time.Minute
 	}
 	if cfg.DownThreshold <= 0 {
-		cfg.DownThreshold = 200
+		cfg.DownThreshold = 100
 	}
 	if cfg.DownHold <= 0 {
 
-		cfg.DownHold = 8 * time.Minute
+		cfg.DownHold = 15 * time.Minute
 	}
 	if cfg.Cooldown <= 0 {
-		cfg.Cooldown = 3 * time.Minute
+		cfg.Cooldown = 15 * time.Second
 	}
 	if cfg.Role == "" {
 		cfg.Role = "bootstrap"
 	}
 	if cfg.QueueAbsThreshold <= 0 {
-		cfg.QueueAbsThreshold = 500
-	}
-	if cfg.QueueRiseThreshold <= 0 {
-		cfg.QueueRiseThreshold = 50
+		cfg.QueueAbsThreshold = 50000
 	}
 	if cfg.PressureHold <= 0 {
 
-		cfg.PressureHold = 15 * time.Second
+		cfg.PressureHold = 30 * time.Second
 	}
 
 	if cfg.MemLimitPct <= 0 {
-		cfg.MemLimitPct = 50
+		cfg.MemLimitPct = 40
 	}
 
 	if cfg.DiskMinFreePct <= 0 {
@@ -277,15 +223,15 @@ func NewAutoscaleController(cfg AutoscaleConfig) *AutoscaleController {
 	if cfg.MemRisePct <= 0 {
 		cfg.MemRisePct = 2.0
 	}
+	if cfg.CPURisePct <= 0 {
+		cfg.CPURisePct = 2.0
+	}
 	if cfg.RiseHold <= 0 {
 		cfg.RiseHold = 12 * time.Second
 	}
 
 	if v := envInt("INDEXUS_QUEUE_ABS", 0); v > 0 {
 		cfg.QueueAbsThreshold = v
-	}
-	if v := envInt("INDEXUS_QUEUE_RISE", 0); v > 0 {
-		cfg.QueueRiseThreshold = v
 	}
 	if raw := os.Getenv("INDEXUS_PRESSURE_HOLD"); raw != "" {
 		if parsed, err := time.ParseDuration(raw); err == nil && parsed > 0 {
@@ -295,6 +241,11 @@ func NewAutoscaleController(cfg AutoscaleConfig) *AutoscaleController {
 	if raw := os.Getenv("INDEXUS_RISE_HOLD"); raw != "" {
 		if parsed, err := time.ParseDuration(raw); err == nil && parsed > 0 {
 			cfg.RiseHold = parsed
+		}
+	}
+	if raw := os.Getenv("INDEXUS_MEM_LEAD"); raw != "" {
+		if parsed, err := time.ParseDuration(raw); err == nil && parsed > 0 {
+			cfg.MemLead = parsed
 		}
 	}
 	if v := envFloat("INDEXUS_MEM_LIMIT_PCT", 0); v > 0 {
@@ -319,10 +270,13 @@ func NewAutoscaleController(cfg AutoscaleConfig) *AutoscaleController {
 		cfg.CPURisePct = v
 	}
 	if cfg.MemRefusePct <= 0 {
-		cfg.MemRefusePct = 68
+		cfg.MemRefusePct = 60
 	}
 	if v := envFloat("INDEXUS_MEM_REFUSE_PCT", 0); v > 0 {
 		cfg.MemRefusePct = v
+	}
+	if v := envInt("INDEXUS_ITEMS_LIMIT", 0); v > 0 {
+		cfg.ItemsLimit = v
 	}
 	hold := cfg.DownHold
 	if cfg.Role == "spawned" && hold > 0 {
@@ -332,7 +286,6 @@ func NewAutoscaleController(cfg AutoscaleConfig) *AutoscaleController {
 	return &AutoscaleController{
 		cfg:               cfg,
 		window:            NewInsertWindow(cfg.Window),
-		hot:               newHotTracker(),
 		joinedAt:          time.Now(),
 		effectiveDownHold: hold,
 		lastPressure:      map[string]any{},
@@ -343,14 +296,15 @@ func (a *AutoscaleController) RecordInsert() {
 	a.RecordInsertAt("", "")
 }
 
+// RecordInsertAt counts an insert in the pressure window. Location is ignored
+// for placement — PreferNear comes from weighted zone split only.
 func (a *AutoscaleController) RecordInsertAt(collection, location string) {
 	if a == nil || !a.cfg.Enabled {
 		return
 	}
+	_ = collection
+	_ = location
 	a.window.Record(1)
-	if collection != "" || location != "" {
-		a.hot.hit(collection, location)
-	}
 }
 
 func (a *AutoscaleController) Snapshot() map[string]any {
@@ -358,7 +312,6 @@ func (a *AutoscaleController) Snapshot() map[string]any {
 		return map[string]any{"enabled": false}
 	}
 	sum := a.window.Sum()
-	_, pref, hotN := a.hot.hottest()
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	out := map[string]any{
@@ -376,7 +329,6 @@ func (a *AutoscaleController) Snapshot() map[string]any {
 		"last_up_at":       a.lastUpAt,
 		"last_down_at":     a.lastDownAt,
 		"queue_abs":        a.cfg.QueueAbsThreshold,
-		"queue_rise":       a.cfg.QueueRiseThreshold,
 		"pressure_hold":    a.cfg.PressureHold.String(),
 		"mem_limit_pct":    a.cfg.MemLimitPct,
 		"mem_floor_pct":    a.cfg.MemFloorPct,
@@ -388,10 +340,9 @@ func (a *AutoscaleController) Snapshot() map[string]any {
 		"cpu_rise_pct":     a.cfg.CPURisePct,
 		"rise_hold":        a.cfg.RiseHold.String(),
 		"mem_refuse_pct":   a.cfg.MemRefusePct,
+		"items_limit":      a.cfg.ItemsLimit,
 		"rising_fast":      a.risingFast,
 		"admit_blocked":    a.clientWritesBlockedLocked(),
-		"hot_prefix":       pref,
-		"hot_prefix_hits":  hotN,
 		"last_reason":      a.lastReason,
 		"last_prefer_near": a.lastPreferNear,
 		"pressure":         a.lastPressure,
@@ -399,17 +350,21 @@ func (a *AutoscaleController) Snapshot() map[string]any {
 	return out
 }
 
-func (a *AutoscaleController) PreferNearKey(selfName string) string {
+func (a *AutoscaleController) SetNearBuilder(fn func(spawnN int, fallback string) []string) {
 	if a == nil {
-		return selfName
+		return
 	}
-	_, prefix, n := a.hot.hottest()
-	if n > 0 && prefix != "" {
-		if key := locationToNearKey(prefix); key != "" {
-			return key
-		}
+	a.nearBuilder = fn
+}
+
+func (a *AutoscaleController) buildPreferNears(spawnN int, fallback string) []string {
+	if a != nil && a.nearBuilder != nil {
+		// Empty means "no stable placement" (e.g. no exclusive load) — do not
+		// invent a PreferNear that would collide with the local mesh.
+		return a.nearBuilder(spawnN, fallback)
 	}
-	return selfName
+	nears, _ := encoding.BASE64.PreferNearTargets(fallback, spawnN)
+	return nears
 }
 
 func locationToNearKey(location string) string {
@@ -499,6 +454,7 @@ func (a *AutoscaleController) evaluatePressure(in PressureInput) (fire bool, rea
 		"hot_signal":     sustained,
 		"hot_for":        held.Round(time.Second).String(),
 		"inserts_window": sum,
+		"owned_items":    in.OwnedItems,
 		"cpu_pct":        res.CPUPct,
 		"cpu_rise":       cpuRise,
 		"mem_pct":        res.MemPct,
@@ -510,7 +466,14 @@ func (a *AutoscaleController) evaluatePressure(in PressureInput) (fire bool, rea
 	}
 	a.mu.Unlock()
 
-	if a.cfg.MemLimitPct > 0 && res.MemPct >= a.cfg.MemLimitPct {
+	if a.cfg.ItemsLimit > 0 && in.OwnedItems >= a.cfg.ItemsLimit {
+		a.mu.Lock()
+		a.lastPressure["hot_signal"] = "items"
+		a.mu.Unlock()
+		return true, "items"
+	}
+	// Emergency: at/above write-refuse threshold — spawn immediately (no hold).
+	if a.cfg.MemRefusePct > 0 && res.MemPct >= a.cfg.MemRefusePct {
 		return true, "mem"
 	}
 	if a.cfg.DiskMinFreePct > 0 && res.DiskOK && res.DiskFreePct < a.cfg.DiskMinFreePct {
@@ -520,32 +483,6 @@ func (a *AutoscaleController) evaluatePressure(in PressureInput) (fire bool, rea
 		return false, ""
 	}
 	return true, sustained
-}
-
-func SpawnCountFor(reason string, memPct, memRefusePct float64) int {
-	nearRefuse := memRefusePct > 0 && memPct >= memRefusePct*0.9
-	n := 1
-	switch reason {
-	case "mem_rise", "cpu_rise":
-		n = 2
-		if nearRefuse {
-			n = 3
-		}
-	case "mem":
-		n = 2
-		if nearRefuse {
-			n = 3
-		}
-	case "mem_filling", "cpu", "disk":
-		n = 1
-	}
-	if n < 1 {
-		n = 1
-	}
-	if n > 3 {
-		n = 3
-	}
-	return n
 }
 
 func (a *AutoscaleController) ClientWritesBlocked() bool {
@@ -651,11 +588,11 @@ func (a *AutoscaleController) Tick(in PressureInput, scaleUp func(ScaleUpRequest
 	now := time.Now()
 
 	fire, reason := a.evaluatePressure(in)
-	preferNear := a.PreferNearKey(in.SelfName)
 
-	if in.Rebalancing && reason != "" && reason != "mem" && reason != "disk" {
-		fire = false
-		reason = ""
+	if !fire {
+		a.mu.Lock()
+		a.lastReason = ""
+		a.mu.Unlock()
 	}
 
 	a.mu.Lock()
@@ -663,8 +600,15 @@ func (a *AutoscaleController) Tick(in PressureInput, scaleUp func(ScaleUpRequest
 	a.mu.Unlock()
 
 	if fire && !inCooldown && !a.upInFlight.Load() && !a.downInFlight.Load() {
-		spawnN := SpawnCountFor(reason, in.Resources.MemPct, a.cfg.MemRefusePct)
-		nears, _ := encoding.BASE64.PreferNearTargets(preferNear, spawnN)
+		const spawnN = 1
+		// Dichotomy over exclusive owned zones (~½ items), avoiding known peers.
+		nears := a.buildPreferNears(spawnN, in.SelfName)
+		if len(nears) == 0 {
+			slog.Info("scale-up skipped: no stable PreferNear (no exclusive load among known peers)",
+				"reason", reason, "self", in.SelfName)
+			return
+		}
+		preferNear := nears[0]
 		req := ScaleUpRequest{PreferNear: preferNear, PreferNears: nears, Reason: reason, SpawnCount: spawnN}
 		a.mu.Lock()
 		a.lastReason = reason
@@ -914,6 +858,200 @@ func IMDSInstanceID() (string, error) {
 
 func (n *Node) EnableAutoscale(cfg AutoscaleConfig) {
 	n.autoscale = NewAutoscaleController(cfg)
+	n.autoscale.SetNearBuilder(n.preferNearsForLoadSplit)
+}
+
+// preferNearsForLoadSplit: PreferNearSplit on residual exclusive leaves (~½).
+// No exclusive load → mild PreferNear near self.
+func (n *Node) preferNearsForLoadSplit(spawnN int, fallback string) []string {
+	if spawnN < 1 {
+		spawnN = 1
+	}
+	outbound := n.pendingOutboundKeySet()
+	keys := n.listOwnedKeys()
+	known := n.knownPeerIDs()
+	selfID := n.ID()
+
+	exclusive := make([]weightedZone, 0, len(keys))
+	claimed := make([][]byte, 0)
+	skippedClaimed := 0
+	for _, key := range keys {
+		if keyInPendingSet(outbound, key) {
+			continue
+		}
+		ownID, err := encoding.MergeEncodings(encoding.BASE64, encoding.BASE64, key.Location, key.Collection)
+		if err != nil || len(ownID) == 0 {
+			continue
+		}
+		if closestKnownPeer(ownID, selfID, known) >= 0 {
+			skippedClaimed++
+			claimed = append(claimed, ownID)
+			continue
+		}
+		w := n.zoneItemCount(key)
+		if w < 1 {
+			w = 1
+		}
+		exclusive = append(exclusive, weightedZone{key: key, ownID: ownID, weight: w})
+	}
+	if len(exclusive) == 0 {
+		nears, _ := encoding.BASE64.PreferNearTargets(fallback, spawnN)
+		return nears
+	}
+
+	leaves := residualExclusiveZones(exclusive)
+	if len(leaves) == 0 {
+		leaves = exclusive
+	}
+
+	ownIDs := make([][]byte, len(leaves))
+	weights := make([]int, len(leaves))
+	total := 0
+	for i, z := range leaves {
+		ownIDs[i] = z.ownID
+		weights[i] = z.weight
+		total += z.weight
+	}
+
+	name, cand, err := encoding.BASE64.PreferNearSplit(selfID, ownIDs, weights, claimed, known)
+	if err != nil || name == "" {
+		slog.Info("load-split skipped: no PreferNearSplit",
+			"leaf_zones", len(leaves), "leaf_items", total, "owned_items", n.Items(),
+			"skipped_claimed", skippedClaimed, "err", err)
+		return nil
+	}
+
+	slog.Info("load-split prefer_near",
+		"prefer_near", name,
+		"fork_bit", cand.ForkBit,
+		"donate_items", cand.Donate,
+		"keep_items", cand.Keep,
+		"leaf_items", total,
+		"owned_items", n.Items(),
+		"claimed_zones", skippedClaimed,
+	)
+	return []string{name}
+}
+
+type weightedZone struct {
+	key    domain.Key
+	ownID  []byte
+	weight int
+}
+
+// residualExclusiveZones keeps every exclusive zone with a non-overlapping
+// item weight: parent Traverse includes children, so weight = parent − Σ children
+// under the same collection. Pure parents (residual 0) are dropped; leaves and
+// parents with leftover items both participate in the XOR split.
+func residualExclusiveZones(zones []weightedZone) []weightedZone {
+	out := make([]weightedZone, 0, len(zones))
+	for _, z := range zones {
+		loc := z.key.Location
+		root := loc == "" || loc == "@" || loc == encoding.BASE64.Root()
+		childSum := 0
+		for _, o := range zones {
+			if o.key.Collection != z.key.Collection || o.key.Location == loc {
+				continue
+			}
+			ol := o.key.Location
+			if root || (loc != "" && strings.HasPrefix(ol, loc) && len(ol) > len(loc)) {
+				childSum += o.weight
+			}
+		}
+		residual := z.weight - childSum
+		if residual < 1 {
+			continue
+		}
+		zz := z
+		zz.weight = residual
+		out = append(out, zz)
+	}
+	return out
+}
+
+func (n *Node) knownPeerNames() []string {
+	peers := n.traverseRegistered(false)
+	out := make([]string, 0, len(peers)+1)
+	seen := map[string]struct{}{}
+	if name := n.Name(); name != "" {
+		seen[name] = struct{}{}
+		out = append(out, name)
+	}
+	for _, c := range peers {
+		name := c.Name()
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		out = append(out, name)
+	}
+	return out
+}
+
+func (n *Node) knownPeerIDs() [][]byte {
+	peers := n.traverseRegistered(false)
+	out := make([][]byte, 0, len(peers))
+	seen := map[string]struct{}{n.Name(): {}}
+	for _, c := range peers {
+		name := c.Name()
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		id := c.ID()
+		if len(id) == 0 {
+			continue
+		}
+		seen[name] = struct{}{}
+		out = append(out, id)
+	}
+	return out
+}
+
+// closestKnownPeer mirrors encoding.closestPeer: index of XOR-closest known
+// peer that beats owner, or -1 if owner remains closest.
+func closestKnownPeer(key, owner []byte, peers [][]byte) int {
+	best := -1
+	bestD := xorBytes(key, owner)
+	for i, p := range peers {
+		d := xorBytes(key, p)
+		if bytes.Compare(d, bestD) < 0 {
+			bestD = d
+			best = i
+		}
+	}
+	return best
+}
+
+func xorBytes(a, b []byte) []byte {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	out := make([]byte, n)
+	for i := 0; i < n; i++ {
+		out[i] = a[i] ^ b[i]
+	}
+	return out
+}
+
+func (n *Node) zoneItemCount(key domain.Key) int {
+	collection, ok := n.collections.Get(key.Collection)
+	if !ok {
+		return 0
+	}
+	count := 0
+	collection.Traverse(
+		key.Location,
+		func(string, *domain.Abelian) {},
+		func(string, string, string, *domain.Abelian) { count++ },
+	)
+	return count
 }
 
 func (n *Node) AutoscaleSnapshot() map[string]any {
@@ -927,6 +1065,23 @@ func (n *Node) ownedZoneCount() int {
 	return len(n.listOwnedKeys())
 }
 
+// retainedOwnedMetrics counts zones/items that will remain after outbound
+// handoffs complete (excludes pendingOutbound keys).
+func (n *Node) retainedOwnedMetrics() (zones, items int) {
+	outbound := n.pendingOutboundKeySet()
+	if len(outbound) == 0 {
+		return n.ownedZoneCount(), n.Items()
+	}
+	for _, key := range n.listOwnedKeys() {
+		if keyInPendingSet(outbound, key) {
+			continue
+		}
+		zones++
+		items += n.zoneItemCount(key)
+	}
+	return zones, items
+}
+
 func (n *Node) AutoscaleTick() {
 	if n.autoscale == nil {
 		return
@@ -936,12 +1091,13 @@ func (n *Node) AutoscaleTick() {
 	if diskPath == "" {
 		diskPath = "."
 	}
+	zones, items := n.retainedOwnedMetrics()
 	in := PressureInput{
-		Queue:       n.Queue(),
-		OwnedZones:  n.ownedZoneCount(),
-		Resources:   SampleResources(diskPath),
-		SelfName:    n.Name(),
-		Rebalancing: n.Rebalancing(),
+		Queue:      n.Queue(),
+		OwnedZones: zones,
+		OwnedItems: items,
+		Resources:  SampleResources(diskPath),
+		SelfName:   n.Name(),
 	}
 	n.autoscale.Tick(in,
 		func(req ScaleUpRequest) error {
@@ -957,12 +1113,13 @@ func (n *Node) AutoscaleTick() {
 				"prefer_nears", req.PreferNears,
 				"queue", in.Queue,
 				"inserts_window", inserts,
+				"owned_items_retained", in.OwnedItems,
 				"cpu_pct", in.Resources.CPUPct,
 				"mem_pct", in.Resources.MemPct,
 				"disk_free_pct", in.Resources.DiskFreePct,
 			)
 			return n.autoscale.PostScale(
-				cfg.IssuerURL, n.Name(), inserts, n.ownedZoneCount(),
+				cfg.IssuerURL, n.Name(), inserts, zones,
 				req.PreferNear, req.Reason, spawnN, req.PreferNears,
 			)
 		},

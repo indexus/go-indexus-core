@@ -26,7 +26,7 @@ func (f *fakeOrigin) Ping(domain.Contact) (domain.Contact, error)            { r
 func (f *fakeOrigin) Neighbors(domain.Peer) ([]domain.Contact, error)        { return nil, nil }
 func (f *fakeOrigin) Random(domain.Peer) (domain.Contact, error)             { return nil, nil }
 func (f *fakeOrigin) Transfer(domain.Peer, domain.Key, []*domain.Item) error { return nil }
-func (f *fakeOrigin) Get(string, string, int) (domain.Contact, *domain.Set, error) {
+func (f *fakeOrigin) Get(string, string, bool, int) (domain.Contact, *domain.Set, error) {
 	return nil, nil, nil
 }
 func (f *fakeOrigin) New(*domain.Item, string, string) error    { return nil }

@@ -69,13 +69,13 @@ func TestEdgeAbsorbReadWriteDeleteEndToEnd(t *testing.T) {
 	// single path-fill has run, instead of hitting the owner again.
 	edges := 0
 	for _, n := range nodes {
-		if _, set, _ := n.Get(collection, root, 0); set != nil {
+		if _, set, _ := n.Get(collection, root, false, 0); set != nil {
 			continue // this node owns the root or already cached it
 		}
-		if _, set, err := n.Get(collection, root, 2); err != nil || set == nil {
+		if _, set, err := n.Get(collection, root, true, 8); err != nil || set == nil {
 			t.Fatalf("path-fill failed on %s: err=%v set=%v", n.Name(), err, set != nil)
 		}
-		if _, set, _ := n.Get(collection, root, 0); set == nil {
+		if _, set, _ := n.Get(collection, root, false, 0); set == nil {
 			t.Fatalf("edge %s did not cache the set after path-fill", n.Name())
 		}
 		edges++

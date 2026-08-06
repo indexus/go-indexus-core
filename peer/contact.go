@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/indexus/go-indexus-core/auth"
@@ -28,8 +29,15 @@ var HttpClient = &http.Client{
 	},
 }
 
+// TransferClient carries bulk ownership handoffs (classic /transfer). Large
+// zones (~100k items) routinely exceed 30s on a single POST, so the default
+// is DefaultTransferTimeout. Override with INDEXUS_TRANSFER_TIMEOUT (Go
+// duration, e.g. 10m). Prefer INDEXUS_DELEGATION_S3 + SNAPSHOT_DIR /
+// SNAPSHOT_BUCKET so large zones move via object-store snapshots instead.
+const DefaultTransferTimeout = 5 * time.Minute
+
 var TransferClient = &http.Client{
-	Timeout: 30 * time.Second,
+	Timeout: transferTimeout(),
 	Transport: &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
@@ -40,6 +48,18 @@ var TransferClient = &http.Client{
 		TLSHandshakeTimeout:   5 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	},
+}
+
+func transferTimeout() time.Duration {
+	raw := os.Getenv("INDEXUS_TRANSFER_TIMEOUT")
+	if raw == "" {
+		return DefaultTransferTimeout
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return DefaultTransferTimeout
+	}
+	return d
 }
 
 var OutboundBearer string
@@ -399,14 +419,15 @@ func (c *Contact) Transfer(origin domain.Peer, key domain.Key, items []*domain.I
 	return lastErr
 }
 
-func (c *Contact) Get(collection string, location string, depth int) (domain.Contact, *domain.Set, error) {
+func (c *Contact) Get(collection string, location string, deep bool, hop int) (domain.Contact, *domain.Set, error) {
 	ip, parsedIP := c.ip, net.ParseIP(c.ip)
 
 	if parsedIP != nil && parsedIP.To4() == nil {
 		ip = fmt.Sprintf("[%s]", ip)
 	}
 
-	url := fmt.Sprintf("http://%s:%d/set?collection=%s&location=%s&depth=%d", ip, c.port, collection, location, depth)
+	url := fmt.Sprintf("http://%s:%d/set?collection=%s&location=%s&deep=%t&hop=%d",
+		ip, c.port, collection, location, deep, hop)
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, nil, err

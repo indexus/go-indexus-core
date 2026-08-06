@@ -1,0 +1,114 @@
+#!/bin/bash
+set -euxo pipefail
+dnf install -y awscli jq
+
+install -d -m 0755 /opt/indexus /etc/indexus /var/lib/indexus /var/lib/indexus/leave
+
+# deploy.sh uploads after terraform apply, so both objects can lag the instance
+# boot. Wait for the pair: taking issuer alone leaves node missing and aborts
+# before any unit is installed.
+for i in $(seq 1 120); do
+  if aws s3 ls "s3://${bucket}/bin/issuer" --region "${region}" >/dev/null 2>&1 \
+    && aws s3 ls "s3://${bucket}/bin/node" --region "${region}" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 5
+done
+
+aws s3 cp "s3://${bucket}/bin/issuer" /opt/indexus/issuer --region "${region}"
+aws s3 cp "s3://${bucket}/bin/node" /opt/indexus/node --region "${region}"
+chmod +x /opt/indexus/issuer /opt/indexus/node
+
+# Refresh public IP on every service start (EC2 stop/start can change it).
+# Writes systemd drop-ins with Environment=PUBLIC_IP=...
+cat >/usr/local/bin/indexus-refresh-public-ip <<'REFRESH'
+#!/bin/bash
+set -euo pipefail
+TOKEN=$(curl -sf -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" || true)
+if [[ -n "$${TOKEN:-}" ]]; then
+  PUBLIC_IP=$(curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4 || true)
+else
+  PUBLIC_IP=$(curl -sf http://169.254.169.254/latest/meta-data/public-ipv4 || true)
+fi
+if [[ -z "$${PUBLIC_IP:-}" ]]; then
+  PUBLIC_IP=$(curl -sf https://checkip.amazonaws.com || true)
+fi
+PUBLIC_IP=$(echo "$PUBLIC_IP" | tr -d '[:space:]')
+test -n "$PUBLIC_IP"
+install -d -m 0755 /etc/indexus
+printf '%s\n' "$PUBLIC_IP" >/etc/indexus/public_ip
+install -d /etc/systemd/system/indexus-node.service.d /etc/systemd/system/indexus-issuer.service.d
+cat >/etc/systemd/system/indexus-node.service.d/public-ip.conf <<EOF
+[Service]
+Environment=PUBLIC_IP=$PUBLIC_IP
+EOF
+cat >/etc/systemd/system/indexus-issuer.service.d/public-ip.conf <<EOF
+[Service]
+Environment=PUBLIC_IP=$PUBLIC_IP
+EOF
+REFRESH
+chmod +x /usr/local/bin/indexus-refresh-public-ip
+/usr/local/bin/indexus-refresh-public-ip
+
+# Issuer ExecStart uses escaped PUBLIC_IP so systemd expands it from the drop-in.
+cat >/etc/systemd/system/indexus-issuer.service <<EOF
+[Unit]
+Description=Indexus Issuer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Environment=AWS_REGION=${region}
+Environment=LAUNCH_TEMPLATE_ID=${launch_template_id}
+ExecStartPre=/usr/local/bin/indexus-refresh-public-ip
+ExecStart=/opt/indexus/issuer -addr :22000 -network ${network_id} -key /etc/indexus/issuer.ed25519 -bootstrap \$${PUBLIC_IP} -scale -launchTemplate ${launch_template_id} -region ${region} -spawnMax ${spawn_max} -scaleCooldown ${scale_cooldown} -downCooldown ${down_cooldown}
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat >/etc/systemd/system/indexus-node.service <<EOF
+[Unit]
+Description=Indexus Bootstrap Node
+After=indexus-issuer.service
+Requires=indexus-issuer.service
+
+[Service]
+Environment=HOME=/var/lib/indexus
+Environment=AWS_REGION=${region}
+Environment=SNAPSHOT_BUCKET=${bucket}
+Environment=INDEXUS_DELEGATION_S3=1
+Environment=INDEXUS_TRANSFER_THRESHOLD=${transfer_threshold}
+Environment=INDEXUS_ZONE_SNAP_MIN=30s
+Environment=INDEXUS_STORAGE=/var/lib/indexus/backup
+Environment=INDEXUS_LEAVE_DIR=/var/lib/indexus/leave
+Environment=INDEXUS_LEAVE_TIMEOUT=90s
+Environment=INDEXUS_LEAVE_MAX=15m
+Environment=INDEXUS_SPAWN_GRACE=30s
+Environment=INDEXUS_ROLE=bootstrap
+Environment=INDEXUS_QUEUE_ABS=${queue_pressure}
+Environment=INDEXUS_FEED_WORKERS=32
+Environment=INDEXUS_QUEUE_MAX=50000
+Environment=INDEXUS_MEM_LIMIT_PCT=40
+Environment=INDEXUS_MEM_FLOOR_PCT=25
+Environment=INDEXUS_CPU_LIMIT_PCT=70
+Environment=INDEXUS_CPU_FLOOR_PCT=25
+Environment=INDEXUS_MEM_RISE=2.0
+Environment=INDEXUS_RISE_HOLD=12s
+Environment=INDEXUS_MEM_REFUSE_PCT=60
+WorkingDirectory=/var/lib/indexus
+ExecStartPre=/usr/local/bin/indexus-refresh-public-ip
+ExecStart=/opt/indexus/node -p2pPort 21000 -monitoringPort 19000 -advertise \$${PUBLIC_IP} -issuer http://127.0.0.1:22000 -network ${network_id} -requireAuth -delegation ${delegation} -autoscale -autoscaleRole bootstrap -queuePressure ${queue_pressure} -pressureHold ${pressure_hold} -scaleWindow ${scale_window} -scaleDownThreshold ${scale_down_threshold} -scaleDownHold ${scale_down_hold} -scaleCooldown ${scale_cooldown} -storage /var/lib/indexus/backup -archive /var/lib/indexus/archive -nodeKey /etc/indexus/node.ed25519 -cert /etc/indexus/node.cert.json
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now indexus-issuer.service
+sleep 2
+systemctl enable --now indexus-node.service

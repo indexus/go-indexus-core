@@ -14,7 +14,7 @@ type getService struct {
 	set *domain.Set
 }
 
-func (s *getService) Get(string, string, int) (domain.Contact, *domain.Set, error) {
+func (s *getService) Get(string, string, bool, int) (domain.Contact, *domain.Set, error) {
 	return nil, s.set, nil
 }
 
@@ -23,7 +23,7 @@ func TestGetSetJSONCompatibleWithMapShape(t *testing.T) {
 	set.Put("aa:x", domain.NewAbelian(1, []float64{1, 2}))
 
 	h := &Handler{Service: &getService{set: set}}
-	req := httptest.NewRequest(http.MethodGet, "/set?collection=c&location=@&depth=0", nil)
+	req := httptest.NewRequest(http.MethodGet, "/set?collection=c&location=@&deep=false", nil)
 	rr := httptest.NewRecorder()
 	h.Get(rr, req)
 

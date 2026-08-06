@@ -271,6 +271,42 @@ func TestRefreshSavesNodeState(t *testing.T) {
 	}
 }
 
+func TestCheckpointSkipsSaveWhenClean(t *testing.T) {
+	dir := t.TempDir()
+	prefix := filepath.Join(dir, "backup")
+	archive := filepath.Join(dir, "archive")
+
+	store, err := storage.NewStorage(archive, prefix)
+	if err != nil {
+		t.Fatalf("NewStorage: %v", err)
+	}
+	go func() { _ = store.Start() }()
+	t.Cleanup(store.Close)
+
+	node := ownedNode(t, store)
+	if err := node.Checkpoint(); err != nil {
+		t.Fatalf("first Checkpoint: %v", err)
+	}
+	first, err := os.ReadFile(prefix + ".snapshot")
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if store.Dirty() {
+		t.Fatal("storage must be clean after Checkpoint")
+	}
+
+	if err := node.Checkpoint(); err != nil {
+		t.Fatalf("idle Checkpoint: %v", err)
+	}
+	second, err := os.ReadFile(prefix + ".snapshot")
+	if err != nil {
+		t.Fatalf("ReadFile after idle: %v", err)
+	}
+	if string(first) != string(second) {
+		t.Fatal("idle Checkpoint rewrote the snapshot")
+	}
+}
+
 func TestRestoreRebuildsOwnershipFromSnapshotAlone(t *testing.T) {
 	storage := &memStorage{}
 	node := ownedNode(t, storage)

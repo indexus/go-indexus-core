@@ -53,6 +53,9 @@ type Storage struct {
 	OnLogRotated func(archivedPath string)
 	// lastArchived is the path of the most recently rotated WAL (empty if none).
 	lastArchived string
+	// dirty is set on Append/SyncAppend (and when reopening a non-empty WAL)
+	// and cleared after a successful Save. Checkpoint skips Save when false.
+	dirty atomic.Bool
 }
 
 // NewStorage prepares the snapshot and log pair sitting at filename, filename
@@ -136,7 +139,18 @@ func (s *Storage) Reset() error {
 		}
 	}
 
+	s.dirty.Store(false)
 	return nil
+}
+
+// Dirty reports WAL changes since the last successful Save. True when Append
+// ran, or when a non-empty log is still on disk (e.g. crash before checkpoint).
+func (s *Storage) Dirty() bool {
+	if s.dirty.Load() {
+		return true
+	}
+	st, err := os.Stat(s.logPath())
+	return err == nil && st.Size() > 0
 }
 
 // Save writes a checkpoint atomically, then rotates the write-ahead log.
@@ -178,6 +192,7 @@ func (s *Storage) Save(commands []string) error {
 	} else if archived != "" && s.OnLogRotated != nil {
 		s.OnLogRotated(archived)
 	}
+	s.dirty.Store(false)
 	return nil
 }
 
@@ -252,6 +267,7 @@ func (s *Storage) Load() ([]string, error) {
 }
 
 func (s *Storage) Append(log string) {
+	s.dirty.Store(true)
 	s.input <- log
 }
 
@@ -273,6 +289,7 @@ func (s *Storage) ensureOpenLocked() error {
 // SyncAppend durable-writes one line for ingress ACK. Reuses the open WAL fd
 // and coalesces fsync across concurrent callers (group commit).
 func (s *Storage) SyncAppend(log string) error {
+	s.dirty.Store(true)
 	s.mu.Lock()
 	if err := s.ensureOpenLocked(); err != nil {
 		s.mu.Unlock()

@@ -24,12 +24,16 @@ type Service interface {
 	IngressStats() map[string]any
 	Count() (int, error)
 	Items() int
+	ItemsPreparing() int
 	Leaving() bool
 	Leave(timeoutSeconds int) any
 	AutoscaleSnapshot() map[string]any
 	ClientReady() bool
 	Rebalancing() bool
 	SnapshotInfo() map[string]any
+	Checkpoint() error
+	ListSnapshots(ctx context.Context) (map[string]any, error)
+	ClearSnapshots(ctx context.Context) (map[string]any, error)
 }
 
 type Handler struct {
@@ -61,6 +65,9 @@ func NewHttpHandler(tlsDir string, service Service, version string) *Handler {
 	mux.HandleFunc("/count", handler.Count)
 	mux.HandleFunc("/leave", handler.Leave)
 	mux.HandleFunc("/autoscale", handler.Autoscale)
+	mux.HandleFunc("/checkpoint", handler.Checkpoint)
+	mux.HandleFunc("/snapshots", handler.Snapshots)
+	mux.HandleFunc("/snapshots/clear", handler.SnapshotsClear)
 
 	handler.server = &http.Server{
 		Handler:           mux,
@@ -127,6 +134,7 @@ func (h *Handler) Status(w http.ResponseWriter, r *http.Request) {
 		"collections":  len(ownership),
 		"zones":        zones,
 		"items":        h.service.Items(),
+		"items_prep":   h.service.ItemsPreparing(),
 		"leaving":      h.service.Leaving(),
 		"client_ready": h.service.ClientReady(),
 		"rebalancing":  h.service.Rebalancing(),
@@ -180,6 +188,50 @@ func (h *Handler) Leave(w http.ResponseWriter, r *http.Request) {
 // Autoscale exposes the insert window and the hysteresis state behind scaling.
 func (h *Handler) Autoscale(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, h.service.AutoscaleSnapshot())
+}
+
+// Checkpoint flushes a local snapshot when the WAL is dirty, then zone snaps.
+func (h *Handler) Checkpoint(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := h.service.Checkpoint(); err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":   true,
+		"info": h.service.SnapshotInfo(),
+	})
+}
+
+// Snapshots lists object-store keys under zones/, nodes/, and snapshots/.
+func (h *Handler) Snapshots(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	body, err := h.service.ListSnapshots(r.Context())
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, body)
+}
+
+// SnapshotsClear deletes object-store keys under zones/, nodes/, and snapshots/.
+func (h *Handler) SnapshotsClear(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	body, err := h.service.ClearSnapshots(r.Context())
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 // hosts renders one of the routing tables as a list of hosts.

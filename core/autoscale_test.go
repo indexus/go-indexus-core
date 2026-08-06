@@ -54,6 +54,7 @@ func underPressure() core.AutoscaleConfig {
 		PressureHold:   time.Millisecond,
 		MemLimitPct:    65,
 		MemFloorPct:    20,
+		MemRefusePct:   60,
 		DiskMinFreePct: 1,
 		CPULimitPct:    99,
 		MemRisePct:     1000,
@@ -98,7 +99,6 @@ func TestAutoscaleIgnoresQueueBacklog(t *testing.T) {
 	var ups atomic.Int64
 	cfg := underPressure()
 	cfg.QueueAbsThreshold = 10
-	cfg.QueueRiseThreshold = 5
 	a := core.NewAutoscaleController(cfg)
 
 	up := func(core.ScaleUpRequest) error { ups.Add(1); return nil }
@@ -146,6 +146,54 @@ func TestAutoscaleReportsMemoryReason(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("a node past its memory limit never asked for a node")
+	}
+}
+
+func TestAutoscaleAllowsScaleUpWhileTransferBusy(t *testing.T) {
+	var ups atomic.Int64
+	a := core.NewAutoscaleController(underPressure())
+	a.SetNearBuilder(func(spawnN int, fallback string) []string {
+		return []string{"splitNearKey0000000"}
+	})
+
+	busy := memHot(80)
+	busy.SelfName = "selfName0000000000"
+	var gotNear atomic.Value
+	a.Tick(busy, func(req core.ScaleUpRequest) error {
+		ups.Add(1)
+		gotNear.Store(req.PreferNear)
+		return nil
+	}, nil)
+	time.Sleep(30 * time.Millisecond)
+	if ups.Load() != 1 {
+		t.Fatalf("ups=%d want 1 while transfer busy (split placement)", ups.Load())
+	}
+	near, _ := gotNear.Load().(string)
+	if near != "splitNearKey0000000" {
+		t.Fatalf("prefer_near=%q want load-split builder result", near)
+	}
+}
+
+func TestAutoscalePreferNearUsesLoadSplitNotHeat(t *testing.T) {
+	a := core.NewAutoscaleController(underPressure())
+	// Heat inserts must not drive PreferNear.
+	for i := 0; i < 50; i++ {
+		a.RecordInsertAt("col", "AAAA...")
+	}
+	a.SetNearBuilder(func(spawnN int, fallback string) []string {
+		return []string{"dichotomyKey000000"}
+	})
+	var got core.ScaleUpRequest
+	a.Tick(memHot(80), func(req core.ScaleUpRequest) error {
+		got = req
+		return nil
+	}, nil)
+	time.Sleep(30 * time.Millisecond)
+	if got.PreferNear != "dichotomyKey000000" {
+		t.Fatalf("prefer_near=%q want dichotomy split, not hot prefix", got.PreferNear)
+	}
+	if len(got.PreferNears) != 1 || got.PreferNears[0] != "dichotomyKey000000" {
+		t.Fatalf("prefer_nears=%v", got.PreferNears)
 	}
 }
 
@@ -240,6 +288,7 @@ func TestAutoscaleAsksBeforeMemoryRunsOut(t *testing.T) {
 	cfg.MemLimitPct = 85
 	cfg.MemLead = 3 * time.Minute
 	cfg.MemFloorPct = 50
+	cfg.MemRefusePct = 95
 	a := core.NewAutoscaleController(cfg)
 
 	up := func(req core.ScaleUpRequest) error { reason.Store(req.Reason); return nil }
@@ -266,6 +315,7 @@ func TestAutoscaleIgnoresFlatMemory(t *testing.T) {
 	var ups atomic.Int64
 	cfg := underPressure()
 	cfg.MemLimitPct = 85
+	cfg.MemRefusePct = 95
 	a := core.NewAutoscaleController(cfg)
 
 	flat := core.PressureInput{
@@ -288,6 +338,7 @@ func TestAutoscaleIgnoresAColdStartRamp(t *testing.T) {
 	cfg := underPressure()
 	cfg.MemLimitPct = 85
 	cfg.MemFloorPct = 50
+	cfg.MemRefusePct = 95
 	a := core.NewAutoscaleController(cfg)
 
 	for _, pct := range []float64{2, 9, 17, 24} {
@@ -333,26 +384,6 @@ func TestAutoscaleHardMemTriggers(t *testing.T) {
 	}
 }
 
-func TestAutoscaleHotPreferNear(t *testing.T) {
-	a := core.NewAutoscaleController(core.AutoscaleConfig{
-		Enabled: true,
-		Role:    "bootstrap",
-	})
-	for i := 0; i < 20; i++ {
-		a.RecordInsertAt("World", "AbCdEfGh")
-	}
-	for i := 0; i < 3; i++ {
-		a.RecordInsertAt("World", "zzzz")
-	}
-	key := a.PreferNearKey("fallbackName00000000000000000000")
-	if key == "" || key == "fallbackName00000000000000000000" {
-		t.Fatalf("prefer_near=%q want hot location key", key)
-	}
-	if key[:4] != "AbCd" {
-		t.Fatalf("prefer_near=%q want AbCd prefix", key)
-	}
-}
-
 func TestAutoscaleDownNeedsHold(t *testing.T) {
 	var downs atomic.Int64
 	a := core.NewAutoscaleController(core.AutoscaleConfig{
@@ -363,7 +394,6 @@ func TestAutoscaleDownNeedsHold(t *testing.T) {
 		Window:             time.Minute,
 		Cooldown:           0,
 		QueueAbsThreshold:  10000,
-		QueueRiseThreshold: 10000,
 		MemLimitPct:        99,
 		DiskMinFreePct:     1,
 	})
@@ -382,7 +412,6 @@ func TestAutoscaleDownNeedsHold(t *testing.T) {
 		Window:             2 * time.Second,
 		Cooldown:           0,
 		QueueAbsThreshold:  10000,
-		QueueRiseThreshold: 10000,
 		MemLimitPct:        99,
 		DiskMinFreePct:     1,
 	})
@@ -419,7 +448,6 @@ func TestAutoscaleDownSkipsVirgin(t *testing.T) {
 		Window:             time.Minute,
 		Cooldown:           0,
 		QueueAbsThreshold:  10000,
-		QueueRiseThreshold: 10000,
 		MemLimitPct:        99,
 		DiskMinFreePct:     1,
 	})
@@ -442,7 +470,6 @@ func TestAutoscaleDownWithPendingQueue(t *testing.T) {
 		Window:             2 * time.Second,
 		Cooldown:           0,
 		QueueAbsThreshold:  100000,
-		QueueRiseThreshold: 100000,
 		MemLimitPct:        99,
 		DiskMinFreePct:     1,
 	})
@@ -545,36 +572,7 @@ func TestAutoscaleCPURiseBelowFloorIgnored(t *testing.T) {
 	}
 }
 
-func TestSpawnCountFor(t *testing.T) {
-	refuse := 68.0
-	cases := []struct {
-		reason string
-		mem    float64
-		want   int
-	}{
-		{"mem_filling", 40, 1},
-		{"cpu", 40, 1},
-		{"disk", 40, 1},
-		{"mem_rise", 40, 2},
-		{"cpu_rise", 40, 2},
-		{"mem", 56, 2},
-		{"mem", 62, 3},
-		{"mem_rise", 62, 3},
-		{"unknown", 90, 1},
-		{"", 90, 1},
-	}
-	for _, tc := range cases {
-		if got := core.SpawnCountFor(tc.reason, tc.mem, refuse); got != tc.want {
-			t.Fatalf("SpawnCountFor(%q, %.0f)=%d want %d", tc.reason, tc.mem, got, tc.want)
-		}
-	}
-
-	if got := core.SpawnCountFor("mem", 90, 0); got != 2 {
-		t.Fatalf("SpawnCountFor mem with refuse=0: %d want 2", got)
-	}
-}
-
-func TestAutoscaleRapidMemRiseAsksSpawnCountTwo(t *testing.T) {
+func TestAutoscaleRapidMemRiseAsksSpawnCountOne(t *testing.T) {
 	var gotCount atomic.Int64
 	var reason atomic.Value
 	cfg := underPressure()
@@ -604,8 +602,8 @@ func TestAutoscaleRapidMemRiseAsksSpawnCountTwo(t *testing.T) {
 	if reason.Load() != "mem_rise" {
 		t.Fatalf("reason=%v want mem_rise", reason.Load())
 	}
-	if gotCount.Load() != 2 {
-		t.Fatalf("spawn_count=%d want 2", gotCount.Load())
+	if gotCount.Load() != 1 {
+		t.Fatalf("spawn_count=%d want 1", gotCount.Load())
 	}
 }
 
@@ -615,25 +613,37 @@ func TestAutoscaleHardMemSpawnCount(t *testing.T) {
 	cfg.MemRefusePct = 68
 	a := core.NewAutoscaleController(cfg)
 
+	var reason atomic.Value
 	var count atomic.Int64
-	a.Tick(memHot(56), func(req core.ScaleUpRequest) error {
+	up := func(req core.ScaleUpRequest) error {
+		reason.Store(req.Reason)
 		count.Store(int64(req.SpawnCount))
 		return nil
-	}, nil)
-	time.Sleep(50 * time.Millisecond)
-	if count.Load() != 2 {
-		t.Fatalf("hard mem spawn_count=%d want 2", count.Load())
+	}
+	// Below refuse: soft path only (mem_filling with hold), not instant mem.
+	for _, pct := range []float64{56, 56, 56} {
+		a.Tick(memHot(pct), up, nil)
+		time.Sleep(20 * time.Millisecond)
+	}
+	time.Sleep(40 * time.Millisecond)
+	if reason.Load() != "mem_filling" {
+		t.Fatalf("below refuse reason=%v want mem_filling", reason.Load())
+	}
+	if count.Load() != 1 {
+		t.Fatalf("soft mem spawn_count=%d want 1", count.Load())
 	}
 
 	a = core.NewAutoscaleController(cfg)
+	reason = atomic.Value{}
 	count.Store(0)
-	a.Tick(memHot(65), func(req core.ScaleUpRequest) error {
-		count.Store(int64(req.SpawnCount))
-		return nil
-	}, nil)
+	// At/above refuse: instant emergency "mem".
+	a.Tick(memHot(70), up, nil)
 	time.Sleep(50 * time.Millisecond)
-	if count.Load() != 3 {
-		t.Fatalf("near-refuse spawn_count=%d want 3", count.Load())
+	if reason.Load() != "mem" {
+		t.Fatalf("at refuse reason=%v want mem", reason.Load())
+	}
+	if count.Load() != 1 {
+		t.Fatalf("emergency mem spawn_count=%d want 1", count.Load())
 	}
 }
 

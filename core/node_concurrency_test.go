@@ -16,6 +16,7 @@ func (noopStorage) Reset() error            { return nil }
 func (noopStorage) Save([]string) error     { return nil }
 func (noopStorage) Load() ([]string, error) { return nil, nil }
 func (noopStorage) Append(string)           {}
+func (noopStorage) Dirty() bool             { return false }
 func (noopStorage) Stream(int) <-chan string {
 	c := make(chan string)
 	close(c)

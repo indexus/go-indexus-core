@@ -35,6 +35,9 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	if !s.Exist() {
 		t.Fatalf("Exist must be true after Save")
 	}
+	if s.Dirty() {
+		t.Fatalf("Dirty must be false after Save")
+	}
 
 	got, err := s.Load()
 	if err != nil {
@@ -42,6 +45,48 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("Load mismatch:\n got=%v\nwant=%v", got, want)
+	}
+}
+
+func TestDirtyTracksAppendAndPendingLog(t *testing.T) {
+	dir := t.TempDir()
+	prefix := filepath.Join(dir, "backup")
+	s := newStorage(t, filepath.Join(dir, "archive"), prefix)
+
+	if s.Dirty() {
+		t.Fatal("fresh storage must not be dirty")
+	}
+
+	go func() { _ = s.Start() }()
+	t.Cleanup(s.Close)
+
+	s.Append("collection|coll")
+	if !s.Dirty() {
+		t.Fatal("Append must mark dirty")
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for !func() bool {
+		st, err := os.Stat(prefix + ".logs")
+		return err == nil && st.Size() > 0
+	}() && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if err := s.Save([]string{"collection|coll"}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if s.Dirty() {
+		t.Fatal("Save must clear dirty")
+	}
+
+	// Pending WAL on disk without the in-memory flag (crash before checkpoint).
+	if err := os.WriteFile(prefix+".logs", []byte("item|demo|aa|x|1\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	reopened := newStorage(t, filepath.Join(dir, "archive"), prefix)
+	if !reopened.Dirty() {
+		t.Fatal("non-empty WAL must report dirty after reopen")
 	}
 }
 

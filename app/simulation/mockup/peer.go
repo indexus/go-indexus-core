@@ -233,14 +233,14 @@ func (p *Peer) Transfer(origin domain.Peer, key domain.Key, items []*domain.Item
 	return nil
 }
 
-func (p *Peer) Get(collection string, location string, depth int) (domain.Contact, *domain.Set, error) {
+func (p *Peer) Get(collection string, location string, deep bool, hop int) (domain.Contact, *domain.Set, error) {
 
 	distant, ok := network.Get(p.Name())
 	if !ok {
 		return nil, nil, fmt.Errorf("error code: 404")
 	}
 
-	contact, set, err := distant.Get(collection, location, depth)
+	contact, set, err := distant.Get(collection, location, deep, hop)
 	if err != nil {
 		return nil, nil, fmt.Errorf("error making request: %s", err.Error())
 	}

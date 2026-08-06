@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Start one local spawned node. Prints the instance id (local-<n>) on stdout.
 # Invoked by the issuer when -localDir / LaunchTemplate=local is set.
+# Node name comes from app/node (RandomName / INDEXUS_PREFER_NEAR) — do not pass -name.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -26,15 +27,12 @@ if [[ ! -x "$BIN_DIR/node" ]]; then
   echo "missing $BIN_DIR/node — run scripts/local/mesh_up.sh first" >&2
   exit 1
 fi
-if [[ ! -x "$BIN_DIR/randomname" ]]; then
-  (cd "$ROOT" && go build -o "$BIN_DIR/randomname" ./scripts/randomname)
-fi
 
-if [[ -n "${INDEXUS_PREFER_NEAR:-}" ]]; then
-  NAME=$("$BIN_DIR/randomname" --near "$INDEXUS_PREFER_NEAR")
-else
-  NAME=$("$BIN_DIR/randomname")
-fi
+# Always drop sticky identity for this slot. app/node stickyNodeName prefers
+# an existing .cert.json over -name / PreferNear — leftover local-N keys from a
+# prior mesh leave the peer with 0 zones and client_ready=false forever.
+rm -f "$KEYS_DIR/${ID}.ed25519" "$KEYS_DIR/${ID}.cert.json"
+
 LOG="$RUN_DIR/logs/$ID.log"
 
 INDEXUS_INSTANCE_ID="$ID" \
@@ -42,9 +40,15 @@ INDEXUS_ROLE=spawned \
 INDEXUS_LEAVE_DIR="$RUN_DIR/leave" \
 INDEXUS_STORAGE="$DATA/backup" \
 INDEXUS_PREFER_NEAR="${INDEXUS_PREFER_NEAR:-}" \
+SNAPSHOT_DIR="$SNAPSHOT_DIR" \
+INDEXUS_SNAPSHOT_DIR="$SNAPSHOT_DIR" \
+INDEXUS_DELEGATION_S3="${INDEXUS_DELEGATION_S3:-1}" \
+INDEXUS_DELEGATION="${INDEXUS_DELEGATION:-$DELEGATION}" \
+INDEXUS_DELEGATION_TIMEOUT="${INDEXUS_DELEGATION_TIMEOUT:-2m}" \
+INDEXUS_TRANSFER_TIMEOUT="${INDEXUS_TRANSFER_TIMEOUT:-5m}" \
+INDEXUS_TRANSFER_THRESHOLD="${INDEXUS_TRANSFER_THRESHOLD:-200}" \
 HOME="$DATA" \
-nohup "$BIN_DIR/node" \
-  -name "$NAME" \
+nohup "$SCRIPT_DIR/detach.sh" -- "$BIN_DIR/node" \
   -p2pPort "$P2P" \
   -monitoringPort "$MON" \
   -advertise 127.0.0.1 \
@@ -55,18 +59,35 @@ nohup "$BIN_DIR/node" \
   -delegation "$DELEGATION" \
   -autoscale \
   -autoscaleRole spawned \
-  -queuePressure "${QUEUE_PRESSURE:-50}" \
-  -pressureHold "${PRESSURE_HOLD:-3s}" \
-  -scaleWindow "${SCALE_WINDOW:-20s}" \
-  -scaleDownThreshold "${SCALE_DOWN_THRESHOLD:-50}" \
-  -scaleDownHold "${SCALE_DOWN_HOLD:-10s}" \
-  -scaleCooldown "${SCALE_COOLDOWN:-5s}" \
+  -queuePressure "${QUEUE_PRESSURE:-50000}" \
+  -pressureHold "${PRESSURE_HOLD:-30s}" \
+  -scaleWindow "${SCALE_WINDOW:-60s}" \
+  -scaleDownThreshold "${SCALE_DOWN_THRESHOLD:-100}" \
+  -scaleDownHold "${SCALE_DOWN_HOLD:-15m}" \
+  -scaleCooldown "${SCALE_COOLDOWN:-15s}" \
   -storage "$DATA/backup" \
   -archive "$DATA/archive" \
   -nodeKey "$KEYS_DIR/${ID}.ed25519" \
   -cert "$KEYS_DIR/${ID}.cert.json" \
   >"$LOG" 2>&1 &
 PID=$!
+
+# Wait until monitoring answers (or die early).
+NAME=""
+for _ in $(seq 1 40); do
+  if ! kill -0 "$PID" 2>/dev/null; then
+    echo "spawned process died; see $LOG" >&2
+    tail -n 40 "$LOG" >&2 || true
+    rm -f "$SPAWNED_DIR/$ID.json"
+    exit 1
+  fi
+  if curl -sf --max-time 1 "http://127.0.0.1:${MON}/count" >/dev/null; then
+    NAME=$(curl -sf --max-time 1 "http://127.0.0.1:${MON}/status" \
+      | python3 -c 'import sys,json; print(json.load(sys.stdin).get("name",""))' 2>/dev/null || true)
+    break
+  fi
+  sleep 0.25
+done
 
 python3 - <<PY
 import json, pathlib
@@ -81,19 +102,5 @@ path.write_text(json.dumps({
   "log": "$LOG",
 }, indent=2))
 PY
-
-# Wait until monitoring answers (or die early).
-for _ in $(seq 1 40); do
-  if ! kill -0 "$PID" 2>/dev/null; then
-    echo "spawned process died; see $LOG" >&2
-    tail -n 40 "$LOG" >&2 || true
-    rm -f "$SPAWNED_DIR/$ID.json"
-    exit 1
-  fi
-  if curl -sf --max-time 1 "http://127.0.0.1:${MON}/count" >/dev/null; then
-    break
-  fi
-  sleep 0.25
-done
 
 echo "$ID"

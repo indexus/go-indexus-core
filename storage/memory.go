@@ -20,6 +20,8 @@ func (m *Memory) Append(string) {}
 
 func (m *Memory) SyncAppend(string) error { return nil }
 
+func (m *Memory) Dirty() bool { return false }
+
 func (m *Memory) Stream(int) <-chan string {
 	stream := make(chan string)
 	close(stream)

@@ -49,7 +49,7 @@ func TestControlCollectThenDelegate(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 20; i++ {
-			_, _, _ = node.Get(col, root, 0)
+			_, _, _ = node.Get(col, root, false, 0)
 		}
 	}()
 
