@@ -64,3 +64,33 @@ mkdir -p "$SPAWNED_DIR" "$KEYS_DIR" "$BIN_DIR" "$RUN_DIR/leave" "$RUN_DIR/logs"
 if [[ -n "${SNAPSHOT_DIR:-}" ]]; then
   mkdir -p "$SNAPSHOT_DIR"
 fi
+
+# Lab TLS for P2P+monitoring (Go ServeTLS → HTTP/2). Off by default so an
+# already-running http mesh keeps answering; set INDEXUS_P2P_TLS=1 to enable.
+p2p_tls_on() {
+  case "${INDEXUS_P2P_TLS:-0}" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Populate TLS_ARGS=(-sslStorage DIR) when TLS is on; empty otherwise.
+# Echoes nothing; sets TLS_DIR / TLS_ARGS / P2P_SCHEME in the caller.
+ensure_p2p_tls_args() {
+  # Always define arrays so `set -u` callers can expand "${TLS_ARGS[@]}" safely.
+  TLS_ARGS=()
+  CURL_TLS=()
+  TLS_DIR="${INDEXUS_TLS_DIR:-$RUN_DIR/tls}"
+  P2P_SCHEME=http
+  if p2p_tls_on; then
+    TLS_DIR="$("$LOCAL_DIR/ensure_tls.sh")"
+    TLS_ARGS=(-sslStorage "$TLS_DIR")
+    P2P_SCHEME=https
+    CURL_TLS=(-k)
+    export INDEXUS_TLS_DIR="$TLS_DIR"
+  fi
+  export P2P_SCHEME
+  # bash 3.2 + set -u: empty array expand still errors unless set +u around use,
+  # so export a single optional flag string for scripts that prefer it.
+  export INDEXUS_SSL_STORAGE_ARGS="${TLS_ARGS[*]-}"
+}

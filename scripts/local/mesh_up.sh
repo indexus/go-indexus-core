@@ -46,6 +46,13 @@ if [[ -n "${SNAPSHOT_DIR:-}" ]]; then
   mkdir -p "$SNAPSHOT_DIR"
 fi
 
+ensure_p2p_tls_args
+if p2p_tls_on; then
+  echo "==> P2P TLS/HTTP/2  sslStorage=$TLS_DIR"
+else
+  echo "==> P2P plain HTTP (set INDEXUS_P2P_TLS=1 for HTTPS/HTTP/2)"
+fi
+
 # Cap on concurrent spawned processes (not including bootstrap). Lab default
 # 15 — room past items_limit without starving hot nodes at SPAWN_MAX.
 SPAWN_MAX="${SPAWN_MAX:-15}"
@@ -132,13 +139,14 @@ nohup "$SCRIPT_DIR/detach.sh" -- "$BIN_DIR/node" \
   -scaleDownHold "$SCALE_DOWN_HOLD" \
   -scaleCooldown "$SCALE_COOLDOWN" \
   "${BOOT_STORAGE_ARGS[@]}" \
+  ${TLS_ARGS[@]+"${TLS_ARGS[@]}"} \
   -nodeKey "$KEYS_DIR/bootstrap.ed25519" \
   -cert "$KEYS_DIR/bootstrap.cert.json" \
   >"$RUN_DIR/logs/bootstrap.log" 2>&1 &
 echo $! >"$RUN_DIR/bootstrap.pid"
 
 for _ in $(seq 1 40); do
-  curl -sf "http://127.0.0.1:${BOOT_MON}/count" >/dev/null && break
+  curl -sf ${CURL_TLS[@]+"${CURL_TLS[@]}"} "${P2P_SCHEME}://127.0.0.1:${BOOT_MON}/count" >/dev/null && break
   sleep 0.25
 done
 
@@ -150,7 +158,7 @@ TOKEN=$(curl -sf -X POST "$ISSUER_URL/v1/issue/token" \
 
 # Opt-in connectivity check. Default off so Ops/Data start empty (no phantom local-smoke).
 if [[ "${SMOKE:-0}" == "1" ]]; then
-  CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:${BOOT_P2P}/item" \
+  CODE=$(curl -s ${CURL_TLS[@]+"${CURL_TLS[@]}"} -o /dev/null -w '%{http_code}' -X POST "${P2P_SCHEME}://127.0.0.1:${BOOT_P2P}/item" \
     -H "Authorization: Bearer $TOKEN" \
     -H 'Content-Type: application/json' \
     -d '{"item":{"collection":"local-smoke","location":"a","id":"1","metrics":[1,2,3,4,5]},"root":"@","current":"a"}')
@@ -161,14 +169,14 @@ else
 fi
 
 echo "issuer:    $ISSUER_URL"
-echo "bootstrap: http://127.0.0.1:${BOOT_P2P}  mon :${BOOT_MON}"
+echo "bootstrap: ${P2P_SCHEME}://127.0.0.1:${BOOT_P2P}  mon :${BOOT_MON}"
 if in_memory_on; then
   echo "mode:      in-memory (INDEXUS_IN_MEMORY=1, no snapshots / WAL dir)"
 else
   echo "snapshots: $SNAPSHOT_DIR"
 fi
-echo "autoscale: $(curl -sf http://127.0.0.1:${BOOT_MON}/autoscale)"
-store=$(curl -sf "http://127.0.0.1:${BOOT_MON}/status" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("snapshot",{}).get("store"))' 2>/dev/null || echo "?")
+echo "autoscale: $(curl -sf ${CURL_TLS[@]+"${CURL_TLS[@]}"} "${P2P_SCHEME}://127.0.0.1:${BOOT_MON}/autoscale")"
+store=$(curl -sf ${CURL_TLS[@]+"${CURL_TLS[@]}"} "${P2P_SCHEME}://127.0.0.1:${BOOT_MON}/status" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("snapshot",{}).get("store"))' 2>/dev/null || echo "?")
 if in_memory_on; then
   echo "object_store attached: $store (expect False)"
 else
