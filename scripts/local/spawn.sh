@@ -48,6 +48,8 @@ else
   export INDEXUS_SNAPSHOT_DIR="$SNAPSHOT_DIR"
 fi
 
+ensure_p2p_tls_args
+
 INDEXUS_INSTANCE_ID="$ID" \
 INDEXUS_ROLE=spawned \
 INDEXUS_LEAVE_DIR="$RUN_DIR/leave" \
@@ -75,6 +77,7 @@ nohup "$SCRIPT_DIR/detach.sh" -- "$BIN_DIR/node" \
   -scaleDownHold "${SCALE_DOWN_HOLD:-15m}" \
   -scaleCooldown "${SCALE_COOLDOWN:-15s}" \
   "${STORAGE_ARGS[@]}" \
+  ${TLS_ARGS[@]+"${TLS_ARGS[@]}"} \
   -nodeKey "$KEYS_DIR/${ID}.ed25519" \
   -cert "$KEYS_DIR/${ID}.cert.json" \
   >"$LOG" 2>&1 &
@@ -89,8 +92,8 @@ for _ in $(seq 1 40); do
     rm -f "$SPAWNED_DIR/$ID.json"
     exit 1
   fi
-  if curl -sf --max-time 1 "http://127.0.0.1:${MON}/count" >/dev/null; then
-    NAME=$(curl -sf --max-time 1 "http://127.0.0.1:${MON}/status" \
+  if curl -sf ${CURL_TLS[@]+"${CURL_TLS[@]}"} --max-time 1 "${P2P_SCHEME}://127.0.0.1:${MON}/count" >/dev/null; then
+    NAME=$(curl -sf ${CURL_TLS[@]+"${CURL_TLS[@]}"} --max-time 1 "${P2P_SCHEME}://127.0.0.1:${MON}/status" \
       | python3 -c 'import sys,json; print(json.load(sys.stdin).get("name",""))' 2>/dev/null || true)
     break
   fi

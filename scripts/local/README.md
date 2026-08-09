@@ -38,6 +38,7 @@ Ops console + dataset loaders: sibling repo [`dashboard/`](../../../dashboard/) 
 | `QUEUE_PRESSURE` | `50000` | Scale-down backlog guard (not SoftLeave) |
 | `SNAPSHOT_DIR` | `.data-local/snapshots` | Shared DirStore (S3-equivalent) |
 | `INDEXUS_IN_MEMORY` | `0` | Lab: RAM-only (`-storage ""`), no DirStore |
+| `INDEXUS_P2P_TLS` | `0` | `1` → mint `.data-local/tls` and pass `-sslStorage` (HTTPS/HTTP/2 on P2P+mon). Dashboard: `P2P_PROTOCOL=https` |
 
 Data and logs live under `.data-local/` (gitignored).
 
