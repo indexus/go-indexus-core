@@ -1,0 +1,6 @@
+aws_region       = "eu-west-3"
+vpc_id           = "vpc-090341ce12422054e"
+public_subnet_id = "subnet-07b5fabb49ec95bfc"
+worker_count     = 1
+admin_cidrs      = ["0.0.0.0/0"]
+# ssh_public_key = "ssh-ed25519 AAAA... comment"

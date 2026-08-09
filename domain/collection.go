@@ -6,44 +6,24 @@ import (
 	"math/bits"
 	"strings"
 	"sync"
+	"time"
 )
 
 type Collections struct {
-	mu              *sync.Mutex
-	data            map[string]*Collection
-	settings        *Settings
-	operationBuffer []*CollectionOperation
-	bufferMu        *sync.Mutex
-	stopFlusher     chan struct{}
+	mu   *sync.RWMutex
+	data map[string]*Collection
 }
 
-type Settings struct {
-	delegation int
-	dataDir    string
-}
-
-func NewCollections(delegation int, dataDir string) *Collections {
-	c := &Collections{
-		mu:   &sync.Mutex{},
+func NewCollections() *Collections {
+	return &Collections{
+		mu:   &sync.RWMutex{},
 		data: make(map[string]*Collection),
-		settings: &Settings{
-			delegation: delegation,
-			dataDir:    dataDir,
-		},
-		operationBuffer: make([]*CollectionOperation, 0, 1000),
-		bufferMu:        &sync.Mutex{},
-		stopFlusher:     make(chan struct{}),
 	}
-
-	// Start background flusher
-	go c.periodicFlush()
-
-	return c
 }
 
 func (c *Collections) Get(name string) (*Collection, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 
 	collection, ok := c.data[name]
 	return collection, ok
@@ -56,6 +36,21 @@ func (c *Collections) Set(collection *Collection) {
 	c.data[collection.Name()] = collection
 }
 
+// Ensure returns the named collection and creates it under the lock that looked
+// it up. Two callers missing at the same time used to build one collection each
+// and the later Set threw away everything the other had already stored.
+func (c *Collections) Ensure(name, root string, base Encoder) *Collection {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	collection, exist := c.data[name]
+	if !exist {
+		collection = NewCollection(name, root, base)
+		c.data[name] = collection
+	}
+	return collection
+}
+
 func (c *Collections) Delete(name string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -64,8 +59,8 @@ func (c *Collections) Delete(name string) {
 }
 
 func (c *Collections) List() []*Collection {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 
 	collections := make([]*Collection, 0)
 	for _, collection := range c.data {
@@ -77,20 +72,22 @@ func (c *Collections) List() []*Collection {
 type Collection struct {
 	name       string
 	base       Encoder
-	metricSize int
 	sets       map[string]*Set
 	owned      Ownership
-	mu         *sync.Mutex
+	tombstones map[string]uint64 // "location:id" -> generation
+	leaves     map[string]string // "location:id" -> setKey (O(1) findLeaf)
+	mu         *sync.RWMutex
 }
 
-func NewCollection(name string, root string, base Encoder, metricSize int) *Collection {
+func NewCollection(name string, root string, base Encoder) *Collection {
 	return &Collection{
 		name:       name,
 		base:       base,
-		metricSize: metricSize,
 		sets:       map[string]*Set{root: NewSet()},
 		owned:      map[string]Delegation{root: {}},
-		mu:         &sync.Mutex{},
+		tombstones: make(map[string]uint64),
+		leaves:     make(map[string]string),
+		mu:         &sync.RWMutex{},
 	}
 }
 
@@ -102,33 +99,29 @@ func (c *Collection) Base() Encoder {
 	return c.base
 }
 
-func (c *Collection) MetricSize() int {
-	return c.metricSize
-}
-
-func (c *Collection) Ownership() Ownership {
-	return c.owned
-}
-
 func (c *Collection) Allowing(location string) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 
 	for child, parent := "", location; parent != ""; child, parent = parent, c.base.Parent(parent) {
 		if delegation, owned := c.owned[parent]; owned {
-			_, delegated := delegation[child]
-			return !delegated
+			handoff, delegated := delegation[child]
+			// Legacy snapshots carry anonymous marks. They are unresolved
+			// topology hints, not authority, and must never block a write.
+			return !delegated || !handoff.Blocks()
 		}
 	}
 	return false
 }
 
-func (c *Collection) Browse(processOwnership func(string), processDelegation func(string, string)) {
+func (c *Collection) Browse(processOwnership func(string), processDelegation func(string, string, Handoff)) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 
 	for ownership, delegations := range c.owned {
 		processOwnership(ownership)
-		for delegation := range delegations {
-			processDelegation(ownership, delegation)
+		for child, handoff := range delegations {
+			processDelegation(ownership, child, handoff)
 		}
 	}
 }
@@ -137,6 +130,23 @@ func (c *Collection) New(location string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	c.new(location)
+}
+
+// EnsureSet materialises a location that has no set yet. New replaces, so two
+// callers racing on the same location left one of them adding to a set the
+// other had already thrown away.
+func (c *Collection) EnsureSet(location string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if _, exist := c.sets[location]; exist {
+		return
+	}
+	c.new(location)
+}
+
+func (c *Collection) new(location string) {
 	c.sets[location] = NewSet()
 
 	parent := c.base.Parent(location)
@@ -150,12 +160,12 @@ func (c *Collection) New(location string) {
 		return
 	}
 
-	set.Put(location, c.sets[location].abelian(c.MetricSize()))
+	set.Put(location, c.sets[location].abelian())
 }
 
 func (c *Collection) Get(location string) (*Set, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 
 	set, ok := c.sets[location]
 	return set, ok
@@ -197,7 +207,18 @@ func encodeBits(values []int, bitsPerValue int) []byte {
 }
 
 func (c *Collection) GetMultiple(locations []string, precision int, properties []func(*Abelian) int) ([]byte, error) {
-	var result []byte
+	// Encode is read-only over sets; RLock stalls writers for the whole encode.
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return EncodeSets(c.sets, locations, precision, properties)
+}
+
+// EncodeSets builds the /sets binary from an arbitrary location→Set map
+// (local ownership, LRU path-fill, or both). Missing locations are skipped.
+func EncodeSets(sets map[string]*Set, locations []string, precision int, properties []func(*Abelian) int) ([]byte, error) {
+	if precision < 1 {
+		return nil, nil
+	}
 
 	type t struct {
 		size    int
@@ -214,25 +235,32 @@ func (c *Collection) GetMultiple(locations []string, precision int, properties [
 			values:  make([][]int, 0),
 			content: make([]byte, 0),
 		}
-
 		for v := 0; v < len(properties); v++ {
 			data[idx].values = append(data[idx].values, make([]int, 0))
 		}
 	}
 
 	for _, location := range locations {
-		set, exist := c.sets[location]
-		if !exist {
+		set, exist := sets[location]
+		if !exist || set == nil {
 			continue
 		}
 
-		for key, value := range set.list {
-			idxColon := strings.IndexByte(key, ':')
-			if idxColon >= 0 {
+		set.Traverse(func(key string, value *Abelian) {
+			if idx := strings.IndexByte(key, ':'); idx >= 0 {
+				key = key[:idx]
+			}
+			if len(key) > precision {
 				key = key[:precision]
+			}
+			if key == "" {
+				return
 			}
 
 			l := len(key) - 1
+			if l < 0 || l >= precision {
+				return
+			}
 
 			data[l].size++
 			data[l].content = append(data[l].content, []byte(key)...)
@@ -244,7 +272,7 @@ func (c *Collection) GetMultiple(locations []string, precision int, properties [
 					data[l].bits[idx] = p
 				}
 			}
-		}
+		})
 	}
 
 	bitsNeeded := func(n int) int {
@@ -254,21 +282,18 @@ func (c *Collection) GetMultiple(locations []string, precision int, properties [
 		return bits.Len(uint(n))
 	}
 
+	var result []byte
 	for i := 0; i < precision; i++ {
 		if data[i].size == 0 {
 			continue
 		}
 
-		header := []byte{}
-		header = append(header, byte(i))
-
-		// Encode size as four bytes (Big Endian)
+		header := []byte{byte(i)}
 		sizeBytes := make([]byte, 4)
 		binary.BigEndian.PutUint32(sizeBytes, uint32(data[i].size))
 		header = append(header, sizeBytes...)
 
 		content := data[i].content
-
 		for j := 0; j < len(properties); j++ {
 			bitCount := bitsNeeded(data[i].bits[j])
 			header = append(header, byte(bitCount))
@@ -283,10 +308,14 @@ func (c *Collection) GetMultiple(locations []string, precision int, properties [
 }
 
 func (c *Collection) List() map[string]*Set {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 
-	return c.sets
+	out := make(map[string]*Set, len(c.sets))
+	for k, v := range c.sets {
+		out[k] = v
+	}
+	return out
 }
 
 func (c *Collection) Add(location string, id string, metrics []float64, delegation int) Ownership {
@@ -296,7 +325,8 @@ func (c *Collection) Add(location string, id string, metrics []float64, delegati
 	delegated := true
 	for child, parent := "", location; parent != ""; child, parent = parent, c.base.Parent(parent) {
 		if delegation, owned := c.owned[parent]; owned {
-			_, delegated = delegation[child]
+			handoff, marked := delegation[child]
+			delegated = marked && handoff.Blocks()
 			break
 		}
 	}
@@ -305,10 +335,24 @@ func (c *Collection) Add(location string, id string, metrics []float64, delegati
 		return nil
 	}
 
-	added, areas := false, Ownership{}
 	entry := fmt.Sprintf("%s:%s", location, id)
 	abelian := NewAbelian(1, metrics)
 
+	// Idempotent / replace-with-delta when the leaf already exists.
+	if setKey, previous, ok := c.findLeaf(entry); ok {
+		if previous.IsEqual(abelian) {
+			return Ownership{} // no-op success
+		}
+		c.sets[setKey].Put(entry, abelian)
+		c.refreshAncestors(setKey)
+		delete(c.tombstones, entry)
+		return Ownership{}
+	}
+
+	// Re-add after delete: clear tombstone (gen advanced by ApplyTombstone/Remove).
+	delete(c.tombstones, entry)
+
+	added, areas := false, Ownership{}
 	child, parent := "", location
 
 	for len(parent) > 0 {
@@ -319,14 +363,14 @@ func (c *Collection) Add(location string, id string, metrics []float64, delegati
 			continue
 		}
 
-		if added && set.list[child] == nil {
-			set.list[child] = abelian.Clone()
-			continue
-		}
-
-		if !added && set.Add(entry, abelian, c.base.Length()) {
-			set.Shrink(c.base, c.sets, parent, c.base.Length(), c.MetricSize())
-		} else if added && set.Incr(child, abelian).Count() == delegation {
+		if !added {
+			if set.Add(entry, abelian, c.base.Length()) {
+				set.Shrink(c.base, c.sets, parent, c.base.Length(), c.leaves)
+			}
+			if _, ok := c.leaves[entry]; !ok {
+				c.leaves[entry] = parent
+			}
+		} else if set.Incr(child, abelian).Count() == delegation {
 			areas[child] = Delegation{}
 		}
 		added = true
@@ -338,26 +382,196 @@ func (c *Collection) Add(location string, id string, metrics []float64, delegati
 			continue
 		}
 		if _, exist := c.owned[parent]; exist {
-			c.owned[parent][area] = nil
+			c.owned[parent][area] = Handoff{At: time.Now().UnixNano()}
 		}
 		if _, exist := areas[parent]; exist {
-			areas[parent][area] = nil
+			areas[parent][area] = Handoff{At: time.Now().UnixNano()}
 		}
 	}
 
 	return areas
 }
 
-func (c *Collection) Update(sublocation string, abelian *Abelian) {
+// Remove deletes a live leaf, subtracts its Abelian up the tree, and plants a tombstone.
+// Returns (removed, gen, true) on success; (nil, 0, false) if the location is not owned.
+// Already-tombstoned ids are a successful no-op.
+func (c *Collection) Remove(location, id string) (*Abelian, uint64, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	delegated := true
+	for child, parent := "", location; parent != ""; child, parent = parent, c.base.Parent(parent) {
+		if delegation, owned := c.owned[parent]; owned {
+			handoff, marked := delegation[child]
+			delegated = marked && handoff.Blocks()
+			break
+		}
+	}
+	if delegated {
+		return nil, 0, false
+	}
+
+	entry := fmt.Sprintf("%s:%s", location, id)
+	if gen, exists := c.tombstones[entry]; exists {
+		if _, _, ok := c.findLeaf(entry); !ok {
+			return nil, gen, true // already deleted
+		}
+	}
+
+	setKey, previous, ok := c.findLeaf(entry)
+	if !ok {
+		gen := c.tombstones[entry]
+		if gen == 0 {
+			gen = 1
+		}
+		c.tombstones[entry] = gen
+		return nil, gen, true
+	}
+
+	c.sets[setKey].Delete(entry)
+	delete(c.leaves, entry)
+	c.refreshAncestors(setKey)
+
+	gen := c.tombstones[entry] + 1
+	if gen == 0 {
+		gen = 1
+	}
+	c.tombstones[entry] = gen
+	return previous, gen, true
+}
+
+// ApplyTombstone records a remote/transferred tombstone without requiring a live leaf.
+func (c *Collection) ApplyTombstone(location, id string, gen uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	entry := fmt.Sprintf("%s:%s", location, id)
+	if setKey, _, ok := c.findLeaf(entry); ok {
+		c.sets[setKey].Delete(entry)
+		delete(c.leaves, entry)
+		c.refreshAncestors(setKey)
+	}
+	if gen == 0 {
+		gen = 1
+	}
+	if cur, ok := c.tombstones[entry]; !ok || gen > cur {
+		c.tombstones[entry] = gen
+	}
+}
+
+// TombstonesUnder returns tombstones whose location is under the given ownership root.
+func (c *Collection) TombstonesUnder(root string) []*Item {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	out := make([]*Item, 0)
+	for entry, gen := range c.tombstones {
+		arr := strings.SplitN(entry, ":", 2)
+		if len(arr) != 2 {
+			continue
+		}
+		loc, id := arr[0], arr[1]
+		if root != c.base.Root() && loc != root && !strings.HasPrefix(loc, root) {
+			continue
+		}
+		out = append(out, &Item{
+			Collection: c.name,
+			Location:   loc,
+			Id:         id,
+			Tombstone:  true,
+			Gen:        gen,
+		})
+	}
+	return out
+}
+
+// ClearTombstonesUnder drops tombstones under root (after a successful Transfer).
+func (c *Collection) ClearTombstonesUnder(root string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for entry := range c.tombstones {
+		arr := strings.SplitN(entry, ":", 2)
+		if len(arr) != 2 {
+			continue
+		}
+		loc := arr[0]
+		if root == c.base.Root() || loc == root || strings.HasPrefix(loc, root) {
+			delete(c.tombstones, entry)
+		}
+	}
+}
+
+// IsTombstoned reports whether location:id carries an active tombstone and no live leaf.
+func (c *Collection) IsTombstoned(location, id string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	entry := fmt.Sprintf("%s:%s", location, id)
+	if _, ok := c.tombstones[entry]; !ok {
+		return false
+	}
+	_, _, live := c.findLeaf(entry)
+	return !live
+}
+
+// findLeaf locates a count==1 entry via the leaves index. Caller must hold c.mu.
+func (c *Collection) findLeaf(entry string) (setKey string, abelian *Abelian, ok bool) {
+	setKey, indexed := c.leaves[entry]
+	if !indexed {
+		return "", nil, false
+	}
+	set, exists := c.sets[setKey]
+	if !exists {
+		delete(c.leaves, entry)
+		return "", nil, false
+	}
+	ab, found := set.Get(entry)
+	if !found || ab.Count() != 1 {
+		delete(c.leaves, entry)
+		return "", nil, false
+	}
+	return setKey, ab, true
+}
+
+// refreshAncestors recomputes aggregate entries from setKey up to the root.
+func (c *Collection) refreshAncestors(setKey string) {
+	child := setKey
+	parent := c.base.Parent(setKey)
+	for parent != "" {
+		set, ok := c.sets[parent]
+		if !ok {
+			return
+		}
+		if childSet, ok := c.sets[child]; ok {
+			set.Put(child, childSet.Abelian())
+		}
+		child, parent = parent, c.base.Parent(parent)
+	}
+}
+
+// SetChildSummary replaces the parent stub for sublocation and folds the delta
+// up the ancestor chain. The value must come from the current owner of
+// sublocation — /aggregates answers for owned locations only, so a response to
+// it certifies authority. Caches and path-filled reads are not authorities and
+// must not reach here; see protocol.md §2.
+func (c *Collection) SetChildSummary(sublocation string, abelian *Abelian) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if abelian == nil {
+		return
+	}
+
 	location := c.base.Parent(sublocation)
+	if location == "" || !IsDirectChild(c.base, location, sublocation) {
+		return
+	}
 
 	set, exist := c.sets[location]
 	if !exist {
 		return
 	}
+	// Heal a corrupt self-key if a past shrink left one on the parent set.
+	set.Delete(location)
 
 	previous, exist := set.Get(sublocation)
 	if exist && abelian.IsEqual(previous) {
@@ -367,7 +581,9 @@ func (c *Collection) Update(sublocation string, abelian *Abelian) {
 	set.Put(sublocation, abelian)
 
 	delta := abelian.Clone()
-	delta.Substract(previous)
+	if previous != nil {
+		delta.Substract(previous)
+	}
 
 	parent, child := location, sublocation
 	for {
@@ -382,13 +598,13 @@ func (c *Collection) Update(sublocation string, abelian *Abelian) {
 	}
 }
 
-func (c *Collection) Own(location string, delegation map[string]any) {
+func (c *Collection) Own(location string, delegation Delegation) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if current, exist := c.owned[location]; exist {
-		for delegated := range current {
-			delegation[delegated] = nil
+		for delegated, handoff := range current {
+			delegation[delegated] = handoff
 		}
 	}
 	c.owned[location] = delegation
@@ -415,12 +631,24 @@ func (c *Collection) Complete(root string) Ownership {
 				c.sets[parent] = NewSet()
 			}
 
-			c.sets[parent].Put(previous, c.sets[previous].Abelian(c.metricSize))
+			// A zone can be owned before its set exists: Add opens an area as
+			// soon as the parent's running count reaches the delegation size,
+			// while only Shrink materialises sets. Seed it, and leave the count
+			// the parent already carries alone — recomputing the aggregate from
+			// a set that has never held anything would erase it.
+			child, materialised := c.sets[previous]
+			if !materialised {
+				child = NewSet()
+				c.sets[previous] = child
+			}
+			if _, counted := c.sets[parent].Get(previous); materialised || !counted {
+				c.sets[parent].Put(previous, child.Abelian())
+			}
 
 			if _, exist := areas[parent]; !exist {
 				areas[parent] = Delegation{}
 			}
-			areas[parent][previous] = nil
+			areas[parent][previous] = Handoff{At: time.Now().UnixNano()}
 		}
 	}
 	return areas
@@ -433,15 +661,35 @@ func (c *Collection) Delegate(location string) ([]*Item, bool) {
 	items := make([]*Item, 0)
 	c.traverse(location, func(set string, abelian *Abelian) {
 		delete(c.sets, set)
-	}, func(parent, location, id string, abelian *Abelian) {
-		items = append(items, &Item{Collection: c.name, Location: location, Id: id, Metrics: abelian.Metrics()})
+	}, func(parent, loc, id string, abelian *Abelian) {
+		delete(c.leaves, fmt.Sprintf("%s:%s", loc, id))
+		items = append(items, &Item{Collection: c.name, Location: loc, Id: id, Metrics: abelian.Metrics()})
 	})
+
+	// Carry tombstones so the receiving owner does not resurrect deleted ids.
+	for entry, gen := range c.tombstones {
+		arr := strings.SplitN(entry, ":", 2)
+		if len(arr) != 2 {
+			continue
+		}
+		loc, id := arr[0], arr[1]
+		if location == c.base.Root() || loc == location || strings.HasPrefix(loc, location) {
+			items = append(items, &Item{
+				Collection: c.name,
+				Location:   loc,
+				Id:         id,
+				Tombstone:  true,
+				Gen:        gen,
+			})
+			delete(c.tombstones, entry)
+		}
+	}
 
 	parent := c.base.Parent(location)
 
 	_, exist := c.owned[parent]
 	if exist {
-		c.owned[parent][location] = nil
+		c.owned[parent][location] = Handoff{At: time.Now().UnixNano()}
 	}
 
 	delete(c.owned, location)
@@ -450,31 +698,113 @@ func (c *Collection) Delegate(location string) ([]*Item, bool) {
 }
 
 func (c *Collection) Traverse(parent string, processSet func(string, *Abelian), processItem func(string, string, string, *Abelian)) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	// Read-only walk: RLock so Count/Snapshot/monitoring share the mutex and
+	// do not exclusively stall writers for the whole tree scan.
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 
 	c.traverse(parent, processSet, processItem)
 }
 
+// ItemCount returns how many leaves sit under parent (processItem keys only).
+func (c *Collection) ItemCount(parent string) int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	count := 0
+	c.traverse(parent, func(string, *Abelian) {}, func(string, string, string, *Abelian) { count++ })
+	return count
+}
+
+// HasLeaf reports whether location:id is present under this collection.
+func (c *Collection) HasLeaf(location, id string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	_, _, ok := c.findLeaf(fmt.Sprintf("%s:%s", location, id))
+	return ok
+}
+
+// TryOwnershipBrowse copies owned→delegations under TryRLock. ok=false if the
+// collection is write-locked (caller should serve a stale snapshot).
+func (c *Collection) TryOwnershipBrowse() (map[string]map[string]any, bool) {
+	if !c.mu.TryRLock() {
+		return nil, false
+	}
+	defer c.mu.RUnlock()
+	out := make(map[string]map[string]any, len(c.owned))
+	for ownership, delegations := range c.owned {
+		m := make(map[string]any, len(delegations))
+		for child, handoff := range delegations {
+			if handoff.Peer != "" {
+				entry := map[string]any{"peer": handoff.Peer}
+				if handoff.At != 0 {
+					entry["at"] = handoff.At
+				}
+				m[child] = entry
+			} else {
+				m[child] = nil
+			}
+		}
+		out[ownership] = m
+	}
+	return out, true
+}
+
 func (c *Collection) traverse(parent string, processSet func(string, *Abelian), processItem func(string, string, string, *Abelian)) {
+	c.traverseWalk(parent, processSet, processItem, make(map[string]struct{}))
+}
+
+func (c *Collection) traverseWalk(
+	parent string,
+	processSet func(string, *Abelian),
+	processItem func(string, string, string, *Abelian),
+	visited map[string]struct{},
+) {
+	if _, seen := visited[parent]; seen {
+		return
+	}
+	visited[parent] = struct{}{}
+
+	set, exist := c.sets[parent]
+	if !exist {
+		return
+	}
+
+	// Copy entries under Set.mu, then recurse without holding it. Nested
+	// set.Traverse → child set.Traverse deadlocks on cycles / lock inversion
+	// with escaped *Set MarshalJSON (Collection.Lock held across the wait).
+	type ent struct {
+		key string
+		ab  *Abelian
+	}
+	set.mu.Lock()
+	entries := make([]ent, 0, len(set.list))
+	for key, abelian := range set.list {
+		entries = append(entries, ent{key, abelian})
+	}
+	set.mu.Unlock()
 
 	var total *Abelian
-	c.sets[parent].Traverse(func(key string, abelian *Abelian) {
-
+	for _, e := range entries {
+		key, abelian := e.key, e.ab
 		if total == nil {
 			total = NewAbelian(abelian.Count(), abelian.Metrics())
 		}
 
-		if abelian.Count() == 1 {
-			arr := strings.Split(key, ":")
+		// Items are keyed location:id, sub-sets by location alone. The count is
+		// not a discriminator: deleting items can leave a sub-set holding one.
+		if arr := strings.SplitN(key, ":", 2); len(arr) == 2 {
 			processItem(parent, arr[0], arr[1], abelian)
-			return
+			continue
 		}
 
-		if c.browsable(parent, key) {
-			c.traverse(key, processSet, processItem)
+		// Skip corrupt edges (self-ref / non-child) — never recurse into them.
+		if !IsDirectChild(c.base, parent, key) {
+			continue
 		}
-	})
+		if c.browsable(parent, key) && c.sets[key] != nil {
+			c.traverseWalk(key, processSet, processItem, visited)
+		}
+	}
 
 	processSet(parent, total)
 }
@@ -488,10 +818,25 @@ func (c *Collection) Clean(parent string, processSet func(string, *Abelian), pro
 
 func (c *Collection) clean(parent string, processSet func(string, *Abelian), processItem func(string, string, string, *Abelian)) {
 
-	c.sets[parent].Traverse(func(key string, abelian *Abelian) {
-		if abelian.Count() == 1 {
-			arr := strings.Split(key, ":")
+	set, exist := c.sets[parent]
+	if !exist {
+		return
+	}
 
+	type ent struct {
+		key string
+		ab  *Abelian
+	}
+	set.mu.Lock()
+	entries := make([]ent, 0, len(set.list))
+	for key, abelian := range set.list {
+		entries = append(entries, ent{key, abelian})
+	}
+	set.mu.Unlock()
+
+	for _, e := range entries {
+		key, abelian := e.key, e.ab
+		if arr := strings.SplitN(key, ":", 2); len(arr) == 2 {
 			k := arr[0][:len(parent)]
 			if parent != c.base.Root() {
 				k = arr[0][:len(parent)+1]
@@ -500,18 +845,21 @@ func (c *Collection) clean(parent string, processSet func(string, *Abelian), pro
 			if !c.browsable(parent, k) {
 				processItem(parent, arr[0], arr[1], abelian)
 			}
-			return
+			continue
 		}
 
-		if !c.browsable(parent, key) && c.owned[key] == nil && c.sets[key] != nil {
-			c.traverse(key, processSet, processItem)
+		if !IsDirectChild(c.base, parent, key) {
+			continue
 		}
-	})
+		if !c.browsable(parent, key) && c.owned[key] == nil && c.sets[key] != nil {
+			c.traverseWalk(key, processSet, processItem, make(map[string]struct{}))
+		}
+	}
 }
 
 func (c *Collection) Browsable(parent string, key string) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 
 	return c.browsable(parent, key)
 }
@@ -520,8 +868,11 @@ func (c *Collection) browsable(parent string, key string) bool {
 	if _, exist := c.owned[parent]; !exist {
 		return true
 	}
-	if _, exist := c.owned[parent][key]; exist {
-		return false
+	if handoff, exist := c.owned[parent][key]; exist {
+		_, childOwned := c.owned[key]
+		if childOwned || handoff.Blocks() {
+			return false
+		}
 	}
 	return true
 }
@@ -533,7 +884,10 @@ func (c *Collection) Refresh() map[string]any {
 	result := make(map[string]any)
 
 	for _, ownership := range c.owned {
-		for delegation := range ownership {
+		for delegation, handoff := range ownership {
+			if !handoff.Blocks() {
+				continue
+			}
 			if _, exist := c.owned[delegation]; !exist {
 				result[delegation] = nil
 			}
@@ -541,4 +895,151 @@ func (c *Collection) Refresh() map[string]any {
 	}
 
 	return result
+}
+
+// Owns reports whether this collection is the local SoT for location.
+func (c *Collection) Owns(location string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	_, ok := c.owned[location]
+	return ok
+}
+
+// IsDelegated reports whether child is marked under a locally owned parent
+// without the child itself being owned here.
+func (c *Collection) IsDelegated(parent, child string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	d, ok := c.owned[parent]
+	if !ok {
+		return false
+	}
+	handoff, marked := d[child]
+	if !marked || !handoff.Blocks() {
+		return false
+	}
+	_, childOwned := c.owned[child]
+	return !childOwned
+}
+
+// DelegationOf returns the named handoff for child under parent, if any.
+func (c *Collection) DelegationOf(parent, child string) (Handoff, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	d, ok := c.owned[parent]
+	if !ok {
+		return Handoff{}, false
+	}
+	h, marked := d[child]
+	if !marked || !h.Blocks() {
+		return Handoff{}, false
+	}
+	if _, childOwned := c.owned[child]; childOwned {
+		return Handoff{}, false
+	}
+	return h, true
+}
+
+// DelegatedCover is the child zone mark that makes Add refuse location: the
+// deepest locally owned ancestor of location that lists the next hop as
+// delegated elsewhere. ok=false means this node either owns a placeable zone
+// for the item or owns nothing on its ancestry.
+func (c *Collection) DelegatedCover(location string) (child string, handoff Handoff, ok bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for next, parent := "", location; parent != ""; next, parent = parent, c.base.Parent(parent) {
+		delegation, owned := c.owned[parent]
+		if !owned {
+			continue
+		}
+		h, marked := delegation[next]
+		if !marked || !h.Blocks() {
+			return "", Handoff{}, false
+		}
+		return next, h, true
+	}
+	return "", Handoff{}, false
+}
+
+// MarkDelegated records that child under parent lives elsewhere. No-op unless
+// parent is locally owned. Ensures the parent set exists so Update can apply.
+func (c *Collection) MarkDelegated(parent, child string) {
+	c.MarkDelegatedTo(parent, child, "")
+}
+
+// MarkDelegatedTo records that child under parent is held by peer. peer "" is
+// the anonymous/legacy mark used by MarkDelegated.
+func (c *Collection) MarkDelegatedTo(parent, child, peer string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, owned := c.owned[parent]; !owned {
+		return
+	}
+	if !IsDirectChild(c.base, parent, child) {
+		return
+	}
+	if c.owned[parent] == nil {
+		c.owned[parent] = Delegation{}
+	}
+	c.owned[parent][child] = Handoff{Peer: peer, At: time.Now().UnixNano()}
+	if _, exist := c.sets[parent]; !exist {
+		c.new(parent)
+	}
+}
+
+// NoteDelegatedHandoff overwrites peer/at on an existing delegation mark (snapshot restore).
+func (c *Collection) NoteDelegatedHandoff(child string, h Handoff) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	parent := c.base.Parent(child)
+	d, ok := c.owned[parent]
+	if !ok {
+		return
+	}
+	if _, marked := d[child]; marked {
+		d[child] = h
+	}
+}
+
+// OwnedChildren returns abelian summaries for zones this collection Owns whose
+// Parent equals parent (direct children only).
+func (c *Collection) OwnedChildren(parent string) map[string]*Abelian {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make(map[string]*Abelian)
+	for loc := range c.owned {
+		if c.base.Parent(loc) != parent {
+			continue
+		}
+		var ab *Abelian
+		if set, ok := c.sets[loc]; ok {
+			ab = set.Abelian().Clone()
+		} else {
+			ab = NewAbelian(0, nil)
+		}
+		out[loc] = ab
+	}
+	return out
+}
+
+// DelegatedChildren lists child locations marked under parent that are not
+// locally owned (handoff targets still tracked on the parent shell).
+func (c *Collection) DelegatedChildren(parent string) []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	d, ok := c.owned[parent]
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(d))
+	for child, handoff := range d {
+		if _, owned := c.owned[child]; owned {
+			continue
+		}
+		if !handoff.Blocks() {
+			continue
+		}
+		out = append(out, child)
+	}
+	return out
 }

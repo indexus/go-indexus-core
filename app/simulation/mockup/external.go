@@ -3,7 +3,7 @@ package mockup
 import (
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"math/rand"
 	"net"
 	"net/http"
@@ -14,15 +14,16 @@ import (
 
 	"github.com/indexus/go-indexus-core/core"
 	"github.com/indexus/go-indexus-core/domain"
+	"github.com/indexus/go-indexus-core/encoding"
+	"github.com/indexus/go-indexus-core/storage"
 	"github.com/indexus/go-indexus-core/worker"
 )
 
 type Contact struct {
-	Name     string         `json:"name"`
-	IPs      map[string]any `json:"ips"`
-	Port     int            `json:"port"`
-	IP       string         `json:"ip"`
-	Location string         `json:"location"`
+	Name string         `json:"name"`
+	IPs  map[string]any `json:"ips"`
+	Port int            `json:"port"`
+	IP   string         `json:"ip"`
 }
 
 type Handler struct {
@@ -83,7 +84,7 @@ func (h *Handler) Serve(lis net.Listener) error {
 
 	s := &http.Server{Handler: mux}
 
-	log.Println("HTTP Server started")
+	slog.Info("simulation server listening", "addr", lis.Addr().String())
 
 	return s.Serve(lis)
 }
@@ -154,7 +155,7 @@ func (h *Handler) Ping(w http.ResponseWriter, r *http.Request) {
 
 	destination := r.Header.Get("Destination")
 
-	node, ok := network.nodes[destination]
+	node, ok := network.Get(destination)
 	if !ok {
 		w.WriteHeader(http.StatusNotFound)
 		return
@@ -199,7 +200,7 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 
 	destination := r.Header.Get("Destination")
 
-	node, ok := network.nodes[destination]
+	node, ok := network.Get(destination)
 	if !ok {
 		w.WriteHeader(http.StatusNotFound)
 		return
@@ -208,16 +209,18 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	collection := r.URL.Query().Get("collection")
 	location := r.URL.Query().Get("location")
 
-	contact, set, err := node.Get(collection, location)
+	contact, set, err := node.Get(collection, location, true, nil, false)
 	if err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
 	}
 
 	var body = struct {
-		Contact Contact                    `json:"contact"`
-		Set     map[string]*domain.Abelian `json:"set"`
-	}{}
+		Contact Contact     `json:"contact"`
+		Set     *domain.Set `json:"set"`
+	}{
+		Set: set,
+	}
 
 	if contact != nil {
 		body.Contact = Contact{
@@ -226,10 +229,6 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 			Port: contact.Port(),
 			IP:   contact.IP(),
 		}
-	}
-
-	if set != nil {
-		body.Set = set.List()
 	}
 
 	writeJSON(w, http.StatusOK, body)
@@ -241,7 +240,7 @@ func (h *Handler) GetMultiple(w http.ResponseWriter, r *http.Request) {
 
 	destination := r.Header.Get("Destination")
 
-	node, ok := network.nodes[destination]
+	node, ok := network.Get(destination)
 	if !ok {
 		w.WriteHeader(http.StatusNotFound)
 		return
@@ -271,49 +270,25 @@ func (h *Handler) GetMultiple(w http.ResponseWriter, r *http.Request) {
 			return a.Count()
 		},
 		func(a *domain.Abelian) int {
-			return int(a.Metrics()[2])
+			return int(a.Metric(2))
 		},
 		func(a *domain.Abelian) int {
-			return int(1_000_000 * a.Metrics()[3])
+			return int(1_000_000 * a.Metric(3))
 		},
 		func(a *domain.Abelian) int {
-			return int(1_000_000 * a.Metrics()[4])
+			return int(1_000_000 * a.Metric(4))
 		},
 	}
 
-	response, err := node.GetMultiple(collection, locations, precision, properties)
+	sets, err := node.GetMultiple(collection, locations, precision, properties, true, nil, false, false)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
 		return
 	}
 
-	// If we have remote locations, return them along with any local data
-	if len(response.RemoteLocations) > 0 {
-		remoteContacts := make([]Contact, len(response.RemoteLocations))
-		for i, remote := range response.RemoteLocations {
-			remoteContacts[i] = Contact{
-				Name:     remote.Contact.Name(),
-				IPs:      remote.Contact.IPs(),
-				Port:     remote.Contact.Port(),
-				IP:       remote.Contact.IP(),
-				Location: remote.Location,
-			}
-		}
-
-		writeJSON(w, http.StatusOK, struct {
-			LocalData      []byte    `json:"local_data"`
-			RemoteContacts []Contact `json:"remote_contacts"`
-		}{
-			LocalData:      response.LocalData,
-			RemoteContacts: remoteContacts,
-		})
-		return
-	}
-
-	// If we only have local data, return it directly as binary
 	w.Header().Set("Content-Type", "application/octet-stream")
-	if _, writeErr := w.Write(response.LocalData); writeErr != nil {
-		log.Println("Error writing response:", writeErr)
+	if _, err := w.Write(sets); err != nil {
+		slog.Warn("sets response truncated", "err", err)
 	}
 }
 
@@ -323,7 +298,7 @@ func (h *Handler) New(w http.ResponseWriter, r *http.Request) {
 
 	destination := r.Header.Get("Destination")
 
-	node, ok := network.nodes[destination]
+	node, ok := network.Get(destination)
 	if !ok {
 		w.WriteHeader(http.StatusNotFound)
 		return
@@ -333,12 +308,13 @@ func (h *Handler) New(w http.ResponseWriter, r *http.Request) {
 		Item    *domain.Item `json:"item"`
 		Root    string       `json:"root"`
 		Current string       `json:"current"`
+		Via     string       `json:"via"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
 		return
 	}
-	if err := node.New(body.Item, body.Root, body.Current); err != nil {
+	if err := node.New(body.Item, body.Root, domain.ParseVisited(body.Via)); err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
 	}
@@ -351,7 +327,7 @@ func (h *Handler) Acknowledged(w http.ResponseWriter, r *http.Request) {
 
 	destination := r.Header.Get("Destination")
 
-	node, ok := network.nodes[destination]
+	node, ok := network.Get(destination)
 	if !ok {
 		node, ok = network.unreachable[destination]
 		if !ok {
@@ -383,7 +359,7 @@ func (h *Handler) Registered(w http.ResponseWriter, r *http.Request) {
 
 	destination := r.Header.Get("Destination")
 
-	node, ok := network.nodes[destination]
+	node, ok := network.Get(destination)
 	if !ok {
 		node, ok = network.unreachable[destination]
 		if !ok {
@@ -415,7 +391,7 @@ func (h *Handler) Routing(w http.ResponseWriter, r *http.Request) {
 
 	destination := r.Header.Get("Destination")
 
-	node, ok := network.nodes[destination]
+	node, ok := network.Get(destination)
 	if !ok {
 		node, ok = network.unreachable[destination]
 		if !ok {
@@ -447,7 +423,7 @@ func (h *Handler) AllOwnership(w http.ResponseWriter, r *http.Request) {
 
 	body := map[string]any{}
 
-	for _, node := range network.nodes {
+	for _, node := range network.Nodes() {
 		arr, err := node.Ownership()
 		if err != nil || len(arr) == 0 {
 			continue
@@ -465,7 +441,7 @@ func (h *Handler) AllCount(w http.ResponseWriter, r *http.Request) {
 	body := map[string]any{}
 	total := 0
 
-	for _, node := range network.nodes {
+	for _, node := range network.Nodes() {
 		count, err := node.Count()
 		if err != nil {
 			continue
@@ -484,7 +460,7 @@ func (h *Handler) AllCheck(w http.ResponseWriter, r *http.Request) {
 
 	body := map[string]any{}
 
-	for _, node := range network.nodes {
+	for _, node := range network.Nodes() {
 		body[node.Name()] = node.Check()
 	}
 
@@ -497,14 +473,14 @@ func (h *Handler) AllQueue(w http.ResponseWriter, r *http.Request) {
 
 	body := map[string]any{}
 
-	for _, node := range network.nodes {
+	for _, node := range network.Nodes() {
 		body[node.Name()] = node.Queue()
 	}
 
 	writeJSON(w, http.StatusOK, body)
 }
 
-// FeedNetwork handles the /feed/network.nodes endpoint
+// FeedNetwork handles the /feed/network endpoint
 func (h *Handler) FeedNetwork(w http.ResponseWriter, r *http.Request) {
 	h.randomDelay() // Introduce latency
 
@@ -523,19 +499,22 @@ func (h *Handler) FeedNetwork(w http.ResponseWriter, r *http.Request) {
 			bootstraps = append(bootstraps, NewContact(random.Name(), random.IPs(), random.Port()))
 		}
 
-		name, err := domain.BASE64.RandomName()
+		name, err := encoding.BASE64.RandomName()
 		if err != nil {
-			log.Fatal(err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
 		}
 
-		settings, err := core.NewSettings(name, len(network.nodes), 1*time.Second, 5*time.Minute, domain.DelegationTreshold(), ".data")
+		settings, err := core.NewSettings(name, network.Length(), 1*time.Second, 5*time.Minute, domain.DelegationSize())
 		if err != nil {
-			log.Fatal(err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
 		}
 
-		node, err := core.NewNode(settings, NewContact, bootstraps)
+		node, err := core.NewNode(settings, NewContact, bootstraps, storage.NewMemory())
 		if err != nil {
-			log.Fatal(err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
 		}
 
 		workerInstance := worker.NewWorker(node)
@@ -554,7 +533,7 @@ func (h *Handler) FeedNetwork(w http.ResponseWriter, r *http.Request) {
 			network.Unreachable(node)
 		}
 
-		log.Printf("Node %s started", node.Name())
+		slog.Info("simulated node started", "name", node.Name())
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"message": "FeedNetwork completed"})
@@ -575,9 +554,10 @@ func (h *Handler) FeedCollection(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		for i := 0; i < c; i++ {
 
-			location, err := domain.BASE64.RandomName()
+			location, err := encoding.BASE64.RandomName()
 			if err != nil {
-				log.Fatal(err)
+				slog.Error("simulation feed stopped", "err", err)
+				return
 			}
 
 			item := &domain.Item{
@@ -587,9 +567,8 @@ func (h *Handler) FeedCollection(w http.ResponseWriter, r *http.Request) {
 				Metrics:    []float64{rand.Float64(), rand.Float64(), rand.Float64(), rand.Float64(), rand.Float64()},
 			}
 
-			err = network.Random().New(item, domain.BASE64.Root(), item.Location)
-			if err != nil {
-				log.Println(err)
+			if err := network.Random().New(item, encoding.BASE64.Root(), nil); err != nil {
+				slog.Debug("simulated insert rejected", "err", err)
 			}
 		}
 	}()

@@ -1,0 +1,56 @@
+#!/bin/bash
+set -euxo pipefail
+dnf install -y awscli jq
+
+install -d -m 0755 /opt/indexus /etc/indexus /var/lib/indexus
+
+for i in $(seq 1 60); do
+  if aws s3 ls "s3://${bucket}/bin/node" --region "${region}" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 5
+done
+
+aws s3 cp "s3://${bucket}/bin/node" /opt/indexus/node --region "${region}"
+chmod +x /opt/indexus/node
+
+TOKEN=$(curl -sf -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+PUBLIC_IP=$(curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4)
+if [[ -z "$PUBLIC_IP" ]]; then
+  PUBLIC_IP=$(curl -sf https://checkip.amazonaws.com || true)
+fi
+PUBLIC_IP=$(echo "$PUBLIC_IP" | tr -d '[:space:]')
+test -n "$PUBLIC_IP"
+
+# Wait for issuer
+for i in $(seq 1 60); do
+  if curl -sf "${issuer_url}/health" >/dev/null; then
+    break
+  fi
+  sleep 5
+done
+
+cat >/etc/systemd/system/indexus-node.service <<EOF
+[Unit]
+Description=Indexus Worker Node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Environment=HOME=/var/lib/indexus
+Environment=AWS_REGION=${region}
+Environment=SNAPSHOT_BUCKET=${bucket}
+Environment=INDEXUS_ZONE_SNAP_MIN=30s
+Environment=INDEXUS_STORAGE=/var/lib/indexus/backup
+Environment=INDEXUS_LEAVE_DIR=/var/lib/indexus/leave
+WorkingDirectory=/var/lib/indexus
+ExecStart=/opt/indexus/node -p2pPort 21000 -monitoringPort 19000 -advertise $${PUBLIC_IP} -bootstrap ${bootstrap_host}|21000 -issuer ${issuer_url} -network ${network_id} -requireAuth -delegation ${delegation} -storage /var/lib/indexus/backup -archive /var/lib/indexus/archive -nodeKey /etc/indexus/node.ed25519 -cert /etc/indexus/node.cert.json
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now indexus-node.service

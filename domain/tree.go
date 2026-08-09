@@ -30,18 +30,17 @@ func (t *tree[N]) Insert(idx int, id []byte, node N) {
 }
 
 func (t *tree[N]) Traverse(idx int, value []byte, process func(int, []byte, N)) {
-
+	// Mutate/restore the path buffer in place to avoid per-node allocations.
+	// Callers must not retain the value slice beyond the process callback.
 	if t.left != nil {
-		tmp := make([]byte, len(value))
-		copy(tmp, value)
-		t.left.Traverse(idx+1, tmp, process)
+		t.left.Traverse(idx+1, value, process)
 	}
 
 	if t.right != nil {
-		tmp := make([]byte, len(value))
-		copy(tmp, value)
-		tmp[idx/8] |= 1 << (7 - uint(idx%8))
-		t.right.Traverse(idx+1, tmp, process)
+		bit := byte(1 << (7 - uint(idx%8)))
+		value[idx/8] |= bit
+		t.right.Traverse(idx+1, value, process)
+		value[idx/8] &^= bit
 	}
 
 	if idx > 0 && t.left == nil && t.right == nil {
@@ -50,9 +49,6 @@ func (t *tree[N]) Traverse(idx int, value []byte, process func(int, []byte, N)) 
 }
 
 func (t *tree[N]) Range(idx int, owner, candidate, value []byte, process func(int, []byte, N)) {
-
-	tmp := make([]byte, len(value))
-	copy(tmp, value)
 
 	if idx/8 == len(owner) {
 		return
@@ -63,22 +59,24 @@ func (t *tree[N]) Range(idx int, owner, candidate, value []byte, process func(in
 
 	if oBit != cBit {
 		if !cBit && t.left != nil {
-			t.left.Traverse(idx+1, tmp, process)
+			t.left.Traverse(idx+1, value, process)
 		} else if cBit && t.right != nil {
-			tmp[idx/8] |= 1 << (7 - uint(idx%8))
-			t.right.Traverse(idx+1, tmp, process)
+			bit := byte(1 << (7 - uint(idx%8)))
+			value[idx/8] |= bit
+			t.right.Traverse(idx+1, value, process)
+			value[idx/8] &^= bit
 		}
 		return
 	}
 
 	if t.left != nil {
-		t.left.Range(idx+1, owner, candidate, tmp, process)
+		t.left.Range(idx+1, owner, candidate, value, process)
 	}
 	if t.right != nil {
-		tmpRight := make([]byte, len(tmp))
-		copy(tmpRight, tmp)
-		tmpRight[idx/8] |= 1 << (7 - uint(idx%8))
-		t.right.Range(idx+1, owner, candidate, tmpRight, process)
+		bit := byte(1 << (7 - uint(idx%8)))
+		value[idx/8] |= bit
+		t.right.Range(idx+1, owner, candidate, value, process)
+		value[idx/8] &^= bit
 	}
 }
 
@@ -183,6 +181,65 @@ func (t *tree[N]) Remove(idx int, value []byte) bool {
 	return false
 }
 
+// nearestK appends up to k members of this subtree, XOR-nearest to value
+// first. Descending the branch that matches the target bit before its sibling
+// visits leaves in exact distance order, so the first k reached are the k
+// nearest and no comparison is needed.
+func (t *tree[N]) nearestK(idx int, value []byte, k int, out *[]N) {
+	if len(*out) >= k {
+		return
+	}
+
+	if idx/8 == len(value) {
+		*out = append(*out, t.node)
+		return
+	}
+
+	first, second := t.left, t.right
+	if (value[idx/8] >> (7 - idx%8) & 1) == 1 {
+		first, second = t.right, t.left
+	}
+
+	if first != nil {
+		first.nearestK(idx+1, value, k, out)
+	}
+	if second != nil {
+		second.nearestK(idx+1, value, k, out)
+	}
+}
+
+// ExtractK is Extract widened: each bucket carries its k nearest members
+// instead of only its nearest. One per bucket is all a lookup needs, since a
+// single next hop closer to the key is enough to make progress. It is not
+// enough to *learn* the mesh — a bucket holding half the nodes names one of
+// them and drops the rest — so the answer a peer gossips is drawn with k > 1.
+func (t *tree[N]) ExtractK(idx int, value []byte, k int, routing *[160][]N) {
+
+	if idx/8 == len(value) {
+		return
+	}
+
+	bit := (value[idx/8] >> (7 - idx%8) & 1) == 1
+
+	if t.left != nil && !bit {
+		t.left.ExtractK(idx+1, value, k, routing)
+	} else if t.right != nil && bit {
+		t.right.ExtractK(idx+1, value, k, routing)
+	}
+
+	sibling := t.left
+	if !bit {
+		sibling = t.right
+	}
+	if sibling == nil {
+		return
+	}
+
+	out := make([]N, 0, k)
+	sibling.nearestK(idx+1, value, k, &out)
+	routing[idx] = out
+}
+
 func (t *tree[N]) Extract(idx int, value []byte, routing *[160]N) {
 
 	if idx/8 == len(value) {
@@ -205,13 +262,13 @@ func (t *tree[N]) Extract(idx int, value []byte, routing *[160]N) {
 }
 
 type BST[N any] struct {
-	mu   *sync.Mutex
+	mu   *sync.RWMutex
 	tree *tree[N]
 }
 
 func NewBST[N any]() *BST[N] {
 	return &BST[N]{
-		mu:   &sync.Mutex{},
+		mu:   &sync.RWMutex{},
 		tree: &tree[N]{},
 	}
 }
@@ -221,6 +278,13 @@ func (bst *BST[N]) Insert(idx int, id []byte, node N) {
 	defer bst.mu.Unlock()
 
 	bst.tree.Insert(idx, id, node)
+}
+
+func (bst *BST[N]) Reset() {
+	bst.mu.Lock()
+	defer bst.mu.Unlock()
+
+	bst.tree = &tree[N]{}
 }
 
 func (bst *BST[N]) Update(idx int, id []byte, process func(int, []byte, N)) {
@@ -243,17 +307,24 @@ func (bst *BST[N]) Upsert(idx int, id []byte, new N, process func(int, []byte, N
 }
 
 func (bst *BST[N]) Traverse(idx int, value []byte, process func(int, []byte, N)) {
-	bst.mu.Lock()
-	defer bst.mu.Unlock()
+	// Read-only walk (Observe / Count / listOwnedKeys). The tree walk mutates
+	// the path buffer in place, so copy under RLock — concurrent callers may
+	// share a buffer (tests) and must not race on those bits.
+	bst.mu.RLock()
+	defer bst.mu.RUnlock()
 
-	bst.tree.Traverse(idx, value, process)
+	path := make([]byte, len(value))
+	copy(path, value)
+	bst.tree.Traverse(idx, path, process)
 }
 
 func (bst *BST[N]) Range(idx int, owner, candidate, value []byte, process func(int, []byte, N)) {
-	bst.mu.Lock()
-	defer bst.mu.Unlock()
+	bst.mu.RLock()
+	defer bst.mu.RUnlock()
 
-	bst.tree.Range(idx, owner, candidate, value, process)
+	path := make([]byte, len(value))
+	copy(path, value)
+	bst.tree.Range(idx, owner, candidate, path, process)
 }
 
 func (bst *BST[N]) Truncate(idx int, owner, branch []byte) {
@@ -264,15 +335,26 @@ func (bst *BST[N]) Truncate(idx int, owner, branch []byte) {
 }
 
 func (bst *BST[N]) Get(idx int, value []byte) (N, bool) {
-	bst.mu.Lock()
-	defer bst.mu.Unlock()
+	bst.mu.RLock()
+	defer bst.mu.RUnlock()
 
 	return bst.tree.Get(idx, value)
 }
 
+// Read inspects the node for value under the read lock. When N is a reference
+// type the writers mutate it in place, so touching what Get returned races with
+// them; the callback is the only place it is safe to look.
+func (bst *BST[N]) Read(idx int, value []byte, process func(N, bool)) {
+	bst.mu.RLock()
+	defer bst.mu.RUnlock()
+
+	node, exist := bst.tree.Get(idx, value)
+	process(node, exist)
+}
+
 func (bst *BST[N]) Nearest(idx int, value []byte) N {
-	bst.mu.Lock()
-	defer bst.mu.Unlock()
+	bst.mu.RLock()
+	defer bst.mu.RUnlock()
 
 	return bst.tree.Nearest(idx, value)
 }
@@ -289,4 +371,11 @@ func (bst *BST[N]) Extract(idx int, value []byte, routing *[160]N) {
 	defer bst.mu.Unlock()
 
 	bst.tree.Extract(idx, value, routing)
+}
+
+func (bst *BST[N]) ExtractK(idx int, value []byte, k int, routing *[160][]N) {
+	bst.mu.Lock()
+	defer bst.mu.Unlock()
+
+	bst.tree.ExtractK(idx, value, k, routing)
 }
