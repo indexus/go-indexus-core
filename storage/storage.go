@@ -53,6 +53,10 @@ type Storage struct {
 	OnLogRotated func(archivedPath string)
 	// lastArchived is the path of the most recently rotated WAL (empty if none).
 	lastArchived string
+	// pendingSealed are WAL segments rotated without a matching Snapshot Save.
+	// Stream replays them before the live log so recovery remains complete
+	// across SealRotate under TransferBusy. Cleared on successful Save.
+	pendingSealed []string
 	// dirty is set on Append/SyncAppend (and when reopening a non-empty WAL)
 	// and cleared after a successful Save. Checkpoint skips Save when false.
 	dirty atomic.Bool
@@ -192,8 +196,45 @@ func (s *Storage) Save(commands []string) error {
 	} else if archived != "" && s.OnLogRotated != nil {
 		s.OnLogRotated(archived)
 	}
+	// Snapshot covers prior sealed segments; drop replay list (files remain for S3).
+	s.mu.Lock()
+	s.pendingSealed = nil
+	s.mu.Unlock()
 	s.dirty.Store(false)
 	return nil
+}
+
+// sealMinBytes is the live-WAL size that triggers SealRotate under TransferBusy.
+var sealMinBytes int64 = 1 << 20 // 1 MiB
+
+// SealRotate archives the live WAL without writing a snapshot. Used when
+// TransferBusy blocks Checkpoint so the active log cannot grow without bound.
+// Stream continues to replay sealed segments until the next Save.
+func (s *Storage) SealRotate() (archived string, err error) {
+	s.mu.Lock()
+	path := s.logPath()
+	var size int64
+	if st, statErr := os.Stat(path); statErr == nil {
+		size = st.Size()
+	}
+	s.mu.Unlock()
+	if size < sealMinBytes {
+		return "", nil
+	}
+
+	archived, err = s.rotateLog()
+	if err != nil || archived == "" {
+		return archived, err
+	}
+	s.mu.Lock()
+	s.pendingSealed = append(s.pendingSealed, archived)
+	s.mu.Unlock()
+	// Still dirty: snapshot does not cover the seal yet.
+	s.dirty.Store(true)
+	if s.OnLogRotated != nil {
+		s.OnLogRotated(archived)
+	}
+	return archived, nil
 }
 
 // rotateLog archives the current WAL and opens an empty one. Caller has just
@@ -365,29 +406,44 @@ func (s *Storage) Stream(start int) <-chan string {
 	go func() {
 		defer close(stream)
 
-		path := s.logPath()
-		file, err := os.Open(path)
-		if err != nil {
-			// No log yet is the normal state of a node that never wrote.
-			if !os.IsNotExist(err) {
-				slog.Error("cannot read write-ahead log", "path", path, "err", err)
+		s.mu.Lock()
+		sealed := append([]string(nil), s.pendingSealed...)
+		s.mu.Unlock()
+
+		current := 0
+		scanFile := func(path string) bool {
+			file, err := os.Open(path)
+			if err != nil {
+				if !os.IsNotExist(err) {
+					slog.Error("cannot read write-ahead log", "path", path, "err", err)
+				}
+				return true
 			}
-			return
+			defer file.Close()
+			scanner := bufio.NewScanner(file)
+			// Raise limit for long ingress lines.
+			scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
+			for scanner.Scan() {
+				if current < start {
+					current++
+					continue
+				}
+				stream <- scanner.Text()
+				current++
+			}
+			if err := scanner.Err(); err != nil {
+				slog.Error("write-ahead log truncated on read", "path", path, "err", err)
+				return false
+			}
+			return true
 		}
-		defer file.Close()
 
-		scanner := bufio.NewScanner(file)
-
-		for current := 0; current < start && scanner.Scan(); current++ {
+		for _, path := range sealed {
+			if !scanFile(path) {
+				return
+			}
 		}
-
-		for scanner.Scan() {
-			stream <- scanner.Text()
-		}
-
-		if err := scanner.Err(); err != nil {
-			slog.Error("write-ahead log truncated on read", "path", path, "err", err)
-		}
+		_ = scanFile(s.logPath())
 	}()
 	return stream
 }

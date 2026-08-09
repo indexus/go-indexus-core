@@ -18,8 +18,8 @@ while [[ -f "$SPAWNED_DIR/local-$SLOT.json" ]]; do
   SLOT=$((SLOT + 1))
 done
 ID="local-$SLOT"
-P2P=$((21010 + SLOT))
-MON=$((19010 + SLOT))
+P2P=$((BOOT_P2P + SPAWN_PORT_OFFSET + SLOT))
+MON=$((BOOT_MON + SPAWN_PORT_OFFSET + SLOT))
 DATA="$RUN_DIR/nodes/$ID"
 mkdir -p "$DATA"
 
@@ -35,18 +35,27 @@ rm -f "$KEYS_DIR/${ID}.ed25519" "$KEYS_DIR/${ID}.cert.json"
 
 LOG="$RUN_DIR/logs/$ID.log"
 
+STORAGE_ARGS=()
+if in_memory_on; then
+  STORAGE_ARGS=(-storage "" -archive "")
+  export INDEXUS_STORAGE=
+  export SNAPSHOT_DIR=
+  export INDEXUS_SNAPSHOT_DIR=
+else
+  STORAGE_ARGS=(-storage "$DATA/backup" -archive "$DATA/archive")
+  export INDEXUS_STORAGE="$DATA/backup"
+  export SNAPSHOT_DIR
+  export INDEXUS_SNAPSHOT_DIR="$SNAPSHOT_DIR"
+fi
+
 INDEXUS_INSTANCE_ID="$ID" \
 INDEXUS_ROLE=spawned \
 INDEXUS_LEAVE_DIR="$RUN_DIR/leave" \
-INDEXUS_STORAGE="$DATA/backup" \
 INDEXUS_PREFER_NEAR="${INDEXUS_PREFER_NEAR:-}" \
-SNAPSHOT_DIR="$SNAPSHOT_DIR" \
-INDEXUS_SNAPSHOT_DIR="$SNAPSHOT_DIR" \
-INDEXUS_DELEGATION_S3="${INDEXUS_DELEGATION_S3:-1}" \
 INDEXUS_DELEGATION="${INDEXUS_DELEGATION:-$DELEGATION}" \
-INDEXUS_DELEGATION_TIMEOUT="${INDEXUS_DELEGATION_TIMEOUT:-2m}" \
 INDEXUS_TRANSFER_TIMEOUT="${INDEXUS_TRANSFER_TIMEOUT:-5m}" \
-INDEXUS_TRANSFER_THRESHOLD="${INDEXUS_TRANSFER_THRESHOLD:-200}" \
+INDEXUS_ITEMS_LIMIT="${INDEXUS_ITEMS_LIMIT:-100000}" \
+INDEXUS_IN_MEMORY="${INDEXUS_IN_MEMORY:-0}" \
 HOME="$DATA" \
 nohup "$SCRIPT_DIR/detach.sh" -- "$BIN_DIR/node" \
   -p2pPort "$P2P" \
@@ -65,8 +74,7 @@ nohup "$SCRIPT_DIR/detach.sh" -- "$BIN_DIR/node" \
   -scaleDownThreshold "${SCALE_DOWN_THRESHOLD:-100}" \
   -scaleDownHold "${SCALE_DOWN_HOLD:-15m}" \
   -scaleCooldown "${SCALE_COOLDOWN:-15s}" \
-  -storage "$DATA/backup" \
-  -archive "$DATA/archive" \
+  "${STORAGE_ARGS[@]}" \
   -nodeKey "$KEYS_DIR/${ID}.ed25519" \
   -cert "$KEYS_DIR/${ID}.cert.json" \
   >"$LOG" 2>&1 &

@@ -181,6 +181,65 @@ func (t *tree[N]) Remove(idx int, value []byte) bool {
 	return false
 }
 
+// nearestK appends up to k members of this subtree, XOR-nearest to value
+// first. Descending the branch that matches the target bit before its sibling
+// visits leaves in exact distance order, so the first k reached are the k
+// nearest and no comparison is needed.
+func (t *tree[N]) nearestK(idx int, value []byte, k int, out *[]N) {
+	if len(*out) >= k {
+		return
+	}
+
+	if idx/8 == len(value) {
+		*out = append(*out, t.node)
+		return
+	}
+
+	first, second := t.left, t.right
+	if (value[idx/8] >> (7 - idx%8) & 1) == 1 {
+		first, second = t.right, t.left
+	}
+
+	if first != nil {
+		first.nearestK(idx+1, value, k, out)
+	}
+	if second != nil {
+		second.nearestK(idx+1, value, k, out)
+	}
+}
+
+// ExtractK is Extract widened: each bucket carries its k nearest members
+// instead of only its nearest. One per bucket is all a lookup needs, since a
+// single next hop closer to the key is enough to make progress. It is not
+// enough to *learn* the mesh — a bucket holding half the nodes names one of
+// them and drops the rest — so the answer a peer gossips is drawn with k > 1.
+func (t *tree[N]) ExtractK(idx int, value []byte, k int, routing *[160][]N) {
+
+	if idx/8 == len(value) {
+		return
+	}
+
+	bit := (value[idx/8] >> (7 - idx%8) & 1) == 1
+
+	if t.left != nil && !bit {
+		t.left.ExtractK(idx+1, value, k, routing)
+	} else if t.right != nil && bit {
+		t.right.ExtractK(idx+1, value, k, routing)
+	}
+
+	sibling := t.left
+	if !bit {
+		sibling = t.right
+	}
+	if sibling == nil {
+		return
+	}
+
+	out := make([]N, 0, k)
+	sibling.nearestK(idx+1, value, k, &out)
+	routing[idx] = out
+}
+
 func (t *tree[N]) Extract(idx int, value []byte, routing *[160]N) {
 
 	if idx/8 == len(value) {
@@ -282,6 +341,17 @@ func (bst *BST[N]) Get(idx int, value []byte) (N, bool) {
 	return bst.tree.Get(idx, value)
 }
 
+// Read inspects the node for value under the read lock. When N is a reference
+// type the writers mutate it in place, so touching what Get returned races with
+// them; the callback is the only place it is safe to look.
+func (bst *BST[N]) Read(idx int, value []byte, process func(N, bool)) {
+	bst.mu.RLock()
+	defer bst.mu.RUnlock()
+
+	node, exist := bst.tree.Get(idx, value)
+	process(node, exist)
+}
+
 func (bst *BST[N]) Nearest(idx int, value []byte) N {
 	bst.mu.RLock()
 	defer bst.mu.RUnlock()
@@ -301,4 +371,11 @@ func (bst *BST[N]) Extract(idx int, value []byte, routing *[160]N) {
 	defer bst.mu.Unlock()
 
 	bst.tree.Extract(idx, value, routing)
+}
+
+func (bst *BST[N]) ExtractK(idx int, value []byte, k int, routing *[160][]N) {
+	bst.mu.Lock()
+	defer bst.mu.Unlock()
+
+	bst.tree.ExtractK(idx, value, k, routing)
 }

@@ -20,9 +20,9 @@ type Service interface {
 	Registered() ([]domain.Contact, error)
 	Routing() ([]domain.Contact, error)
 	Ownership() (map[string]map[string]map[string]any, error)
+	OwnershipStats() (collections, zones int)
 	Queue() int
 	IngressStats() map[string]any
-	Count() (int, error)
 	Items() int
 	ItemsPreparing() int
 	Leaving() bool
@@ -108,21 +108,16 @@ func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 // work is pending and how much of the ring this node holds. It reports the item
 // total as last measured by the background pass rather than counting inline, so
 // a loaded node still answers; /count is there for an exact figure.
+//
+// Zone/collection counts come from OwnershipStats (XOR owned index), not
+// Ownership()/Browse, so /status never contends on Collection.mu with the
+// protocol path (Get, Transfer, Count, applyZone).
 func (h *Handler) Status(w http.ResponseWriter, r *http.Request) {
-	ownership, err := h.service.Ownership()
-	if err != nil {
-		writeError(w, err)
-		return
-	}
+	collections, zones := h.service.OwnershipStats()
 	peers, err := h.service.Registered()
 	if err != nil {
 		writeError(w, err)
 		return
-	}
-
-	zones := 0
-	for _, collection := range ownership {
-		zones += len(collection)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -131,7 +126,7 @@ func (h *Handler) Status(w http.ResponseWriter, r *http.Request) {
 		"uptime_s":     int64(time.Since(h.started).Seconds()),
 		"queue":        h.service.Queue(),
 		"peers":        len(peers),
-		"collections":  len(ownership),
+		"collections":  collections,
 		"zones":        zones,
 		"items":        h.service.Items(),
 		"items_prep":   h.service.ItemsPreparing(),
@@ -143,7 +138,8 @@ func (h *Handler) Status(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// Ownership lists the zones this node answers for.
+// Ownership lists the zones this node answers for (cached snapshot; never
+// waits on Collection.mu — may be briefly stale during exclusive writes).
 func (h *Handler) Ownership(w http.ResponseWriter, r *http.Request) {
 	body, err := h.service.Ownership()
 	if err != nil {
@@ -159,14 +155,13 @@ func (h *Handler) Queue(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, h.service.IngressStats())
 }
 
-// Count reports how many items this node holds locally.
+// Count reports the last background MeasureItems totals (same atomics as
+// /status). It does not walk the collection on the request path.
 func (h *Handler) Count(w http.ResponseWriter, r *http.Request) {
-	items, err := h.service.Count()
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]int{"count": items})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"count":      h.service.Items(),
+		"items_prep": h.service.ItemsPreparing(),
+	})
 }
 
 // Leave hands every owned zone over to peers, then snapshots. The autoscaler

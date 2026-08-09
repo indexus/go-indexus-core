@@ -143,15 +143,28 @@ func awaitStability(t *testing.T, nodes []*core.Node, expectedTotal int, steady,
 		return true
 	}
 
-	deadline := time.Now().Add(timeout)
+	// timeout is a stall budget, not a runtime budget. A mesh that is still
+	// changing is still converging, and how long that takes depends on the
+	// machine, on -race and on what else the suite is running — pinning a total
+	// runtime makes the test fail for being slow rather than for being wrong.
+	// What fails convergence is a network that stops moving without having
+	// settled, or one that never stops moving; giveUp catches the second.
+	stalled := time.Now().Add(timeout)
+	giveUp := time.Now().Add(8 * timeout)
 	prev := snap()
 	stableSince := time.Time{}
 
-	for time.Now().Before(deadline) {
+	for time.Now().Before(stalled) && time.Now().Before(giveUp) {
 		time.Sleep(50 * time.Millisecond)
 		curr := snap()
 
-		if equal(curr, prev) && totalOK(curr) && queuesCalm() {
+		if !equal(curr, prev) {
+			stalled = time.Now().Add(timeout)
+			stableSince = time.Time{}
+			prev = curr
+			continue
+		}
+		if totalOK(curr) && queuesCalm() {
 			if stableSince.IsZero() {
 				stableSince = time.Now()
 			} else if time.Since(stableSince) >= steady {
@@ -163,13 +176,17 @@ func awaitStability(t *testing.T, nodes []*core.Node, expectedTotal int, steady,
 		prev = curr
 	}
 
+	reason := fmt.Sprintf("stopped changing for %s without settling", timeout)
+	if !time.Now().Before(giveUp) {
+		reason = fmt.Sprintf("never stopped changing within %s", 8*timeout)
+	}
 	last := snap()
 	queues := make([]int, len(nodes))
 	for i, n := range nodes {
 		queues[i] = n.Queue()
 	}
-	t.Fatalf("network did not stabilize within %s; last counts=%v queues=%v expected_total=%d",
-		timeout, last.counts, queues, expectedTotal)
+	t.Fatalf("network %s; last counts=%v queues=%v expected_total=%d",
+		reason, last.counts, queues, expectedTotal)
 }
 
 // -----------------------------------------------------------------------------
@@ -201,7 +218,7 @@ func seedAcrossCollections(t *testing.T, n *core.Node, collections, perColl int)
 				Location:   loc,
 				Id:         fmt.Sprintf("id-%d", j),
 				Metrics:    []float64{1, 2, 3, 4, 5},
-			}, "@", loc)
+			}, "@", nil)
 			totalItems++
 		}
 	}

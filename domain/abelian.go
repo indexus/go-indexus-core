@@ -60,6 +60,17 @@ func (a *Abelian) Metrics() []float64 {
 	return a.metrics
 }
 
+// Metric reads one position, or 0 when the value does not carry it. Nothing
+// forces a collection to hold items of one metric width — Sum says so — and an
+// aggregate can reach a read with no metrics at all. Indexing Metrics() from a
+// request handler therefore panics on data the mesh considers valid.
+func (a *Abelian) Metric(idx int) float64 {
+	if a == nil || idx < 0 || idx >= len(a.metrics) {
+		return 0
+	}
+	return a.metrics[idx]
+}
+
 func (a *Abelian) Clone() *Abelian {
 	metrics := make([]float64, len(a.metrics))
 	copy(metrics, a.metrics)
@@ -89,31 +100,44 @@ func (a *Abelian) IsEqual(b *Abelian) bool {
 
 // Sum folds a delta in, position by position. Deltas come from items and from
 // peer aggregates, and nothing forces a collection to hold items of one metric
-// width, so a narrower delta only touches the positions it carries.
+// width: a narrower delta only touches the positions it carries, and a wider
+// one grows the total to fit.
+//
+// Growing matters because a counter raised by Set.incr starts with no metrics
+// at all. Only widening on nil left such a total pinned at length zero, so it
+// absorbed the count of every later item and none of their metrics — a cell
+// reporting real transactions with a price, a latitude and a longitude of 0.
 func (a *Abelian) Sum(delta *Abelian) {
 	if delta == nil {
 		return
 	}
 	a.count += delta.count
-	if a.metrics == nil {
-		a.metrics = make([]float64, len(delta.metrics))
-	}
-	for idx := range a.metrics {
-		if idx < len(delta.metrics) {
-			a.metrics[idx] += delta.metrics[idx]
-		}
+	a.widen(len(delta.metrics))
+	for idx := range delta.metrics {
+		a.metrics[idx] += delta.metrics[idx]
 	}
 }
 
-// Substract is Sum's inverse, with the same tolerance for a narrower delta.
+// Substract is Sum's inverse, and widens on the same terms: an inverse that
+// dropped the positions Sum keeps would not cancel it.
 func (a *Abelian) Substract(delta *Abelian) {
 	if delta == nil {
 		return
 	}
 	a.count -= delta.count
-	for idx := range a.metrics {
-		if idx < len(delta.metrics) {
-			a.metrics[idx] -= delta.metrics[idx]
-		}
+	a.widen(len(delta.metrics))
+	for idx := range delta.metrics {
+		a.metrics[idx] -= delta.metrics[idx]
 	}
+}
+
+// widen grows metrics to at least n positions, preserving what is already
+// there. Positions a value never carried read as 0, which is their identity.
+func (a *Abelian) widen(n int) {
+	if len(a.metrics) >= n {
+		return
+	}
+	grown := make([]float64, n)
+	copy(grown, a.metrics)
+	a.metrics = grown
 }

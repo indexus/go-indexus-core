@@ -119,9 +119,3 @@ variable "delegation" {
   default     = 5000
   description = "Items before Own split (-delegation). Owned zones target ~5k items."
 }
-
-variable "transfer_threshold" {
-  type        = number
-  default     = 200
-  description = "Item count at/above which SoftLeave uses snapshot delegation (INDEXUS_TRANSFER_THRESHOLD)."
-}

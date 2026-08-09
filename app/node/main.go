@@ -119,7 +119,7 @@ func parseFlags() (Config, error) {
 	flag.StringVar(&config.NodeKeyPath, "nodeKey", "", "Path to the node ed25519 private key")
 	flag.StringVar(&config.CertPath, "cert", "", "Path to the cached node certificate")
 	flag.BoolVar(&config.RequireAuth, "requireAuth", false, "Require node certificates and client tokens")
-	flag.IntVar(&config.Delegation, "delegation", domain.DelegationTreshold(), "Items a zone holds before it is owned")
+	flag.IntVar(&config.Delegation, "delegation", domain.DelegationSize(), "Items a zone holds before it is owned")
 
 	bootstrap := flag.String("bootstrap", "", "Bootstrap peers, as ip|port,ip|port")
 	advertise := flag.String("advertise", "", "Comma-separated IPs to advertise, defaults to 127.0.0.1")

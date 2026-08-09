@@ -19,10 +19,10 @@ func TestTransferDeliveredTwiceIsIdempotent(t *testing.T) {
 	}
 	key := domain.Key{Collection: "demo", Location: "a"}
 
-	if err := node.Transfer(nil, key, batch()); err != nil {
+	if _, err := node.Transfer(nil, key, batch()); err != nil {
 		t.Fatalf("first delivery: %v", err)
 	}
-	if err := node.Transfer(nil, key, batch()); err != nil {
+	if _, err := node.Transfer(nil, key, batch()); err != nil {
 		t.Fatalf("second delivery: %v", err)
 	}
 	drain(t, node)
@@ -44,7 +44,7 @@ func TestStaleSnapshotDuplicateOwnerHeals(t *testing.T) {
 	const items = 3
 	for i := 0; i < items; i++ {
 		it := &domain.Item{Collection: "demo", Location: "aa", Id: fmt.Sprintf("x%d", i), Metrics: []float64{1}}
-		if err := donor.New(it, root, "aa"); err != nil {
+		if err := donor.New(it, root, nil); err != nil {
 			t.Fatalf("New: %v", err)
 		}
 	}
@@ -86,11 +86,11 @@ func TestTransferredTombstoneThenLateAddResurrects(t *testing.T) {
 	root := encoding.BASE64.Root()
 
 	donor := newNodeOn(t, &memStorage{}, 64)
-	if err := donor.New(item("x"), root, "aa"); err != nil {
+	if err := donor.New(item("x"), root, nil); err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	drain(t, donor)
-	if err := donor.Delete(item("x"), root, "aa"); err != nil {
+	if err := donor.Delete(item("x"), root, nil); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 	drain(t, donor)
@@ -105,7 +105,7 @@ func TestTransferredTombstoneThenLateAddResurrects(t *testing.T) {
 
 	batch, _ := col.Delegate(root)
 	receiver := newNodeOn(t, &memStorage{}, 64)
-	if err := receiver.Transfer(donor, domain.Key{Collection: "demo", Location: root}, batch); err != nil {
+	if _, err := receiver.Transfer(donor, domain.Key{Collection: "demo", Location: root}, batch); err != nil {
 		t.Fatalf("Transfer: %v", err)
 	}
 
@@ -117,7 +117,7 @@ func TestTransferredTombstoneThenLateAddResurrects(t *testing.T) {
 		t.Fatal("tombstone did not survive the transfer")
 	}
 
-	if err := receiver.Handoff(item("x"), root, "aa"); err != nil {
+	if err := receiver.Handoff(item("x"), root, nil); err != nil {
 		t.Fatalf("Handoff: %v", err)
 	}
 	drain(t, receiver)
@@ -135,10 +135,10 @@ func TestRefusedWriteStillReplaysFromWAL(t *testing.T) {
 	node := newNodeOn(t, storage, 64)
 	node.settings.SetQueueMax(1)
 
-	if err := node.New(item("accepted"), "@", "aa"); err != nil {
+	if err := node.New(item("accepted"), "@", nil); err != nil {
 		t.Fatalf("first write: %v", err)
 	}
-	if err := node.New(item("refused"), "@", "aa"); err != ErrQueueFull {
+	if err := node.New(item("refused"), "@", nil); err != ErrQueueFull {
 		t.Fatalf("second write: err=%v want ErrQueueFull", err)
 	}
 

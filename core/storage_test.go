@@ -27,7 +27,7 @@ func TestRestoreReplaysDeleteAfterAdd(t *testing.T) {
 	node := newNodeOn(t, storage, 64)
 	item := &domain.Item{Collection: "demo", Location: "aa", Id: "x", Metrics: []float64{1}}
 
-	if err := node.New(item, root, "aa"); err != nil {
+	if err := node.New(item, root, nil); err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	drain(t, node)
@@ -36,7 +36,7 @@ func TestRestoreReplaysDeleteAfterAdd(t *testing.T) {
 		t.Fatalf("count after add: got %d (err=%v) want 1", count, err)
 	}
 
-	if err := node.Delete(item, root, "aa"); err != nil {
+	if err := node.Delete(item, root, nil); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 	drain(t, node)
@@ -79,15 +79,15 @@ func TestRestoreReplaysReaddAfterDelete(t *testing.T) {
 	node := newNodeOn(t, storage, 64)
 	item := &domain.Item{Collection: "demo", Location: "aa", Id: "x", Metrics: []float64{1}}
 
-	if err := node.New(item, root, "aa"); err != nil {
+	if err := node.New(item, root, nil); err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	drain(t, node)
-	if err := node.Delete(item, root, "aa"); err != nil {
+	if err := node.Delete(item, root, nil); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 	drain(t, node)
-	if err := node.New(item, root, "aa"); err != nil {
+	if err := node.New(item, root, nil); err != nil {
 		t.Fatalf("re-New: %v", err)
 	}
 	drain(t, node)
@@ -126,7 +126,7 @@ func TestCheckpointRestoresItemsWithoutTheLog(t *testing.T) {
 	node := newNodeOn(t, store, 64)
 
 	item := &domain.Item{Collection: "demo", Location: "aa", Id: "x", Metrics: []float64{1, 2, 3}}
-	if err := node.New(item, encoding.BASE64.Root(), "aa"); err != nil {
+	if err := node.New(item, encoding.BASE64.Root(), nil); err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	drain(t, node)
@@ -193,7 +193,7 @@ func TestRestoreReplaysLogWithoutSnapshot(t *testing.T) {
 	node := newNodeOn(t, store, 64)
 
 	item := &domain.Item{Collection: "demo", Location: "aa", Id: "y", Metrics: []float64{9}}
-	if err := node.New(item, encoding.BASE64.Root(), "aa"); err != nil {
+	if err := node.New(item, encoding.BASE64.Root(), nil); err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	drain(t, node)
@@ -222,7 +222,7 @@ func TestCheckpointKeepsPendingIngress(t *testing.T) {
 	node := newNodeOn(t, storage, 64)
 
 	item := &domain.Item{Collection: "demo", Location: "aa", Id: "pending", Metrics: []float64{1}}
-	if err := node.New(item, encoding.BASE64.Root(), "aa"); err != nil {
+	if err := node.New(item, encoding.BASE64.Root(), nil); err != nil {
 		t.Fatalf("New: %v", err)
 	}
 
@@ -245,6 +245,66 @@ func TestCheckpointKeepsPendingIngress(t *testing.T) {
 	count, err := restored.Count()
 	if err != nil || count != 1 {
 		t.Fatalf("Count: got %d err=%v want 1", count, err)
+	}
+}
+
+func TestCheckpointKeepsParkedIngressOutsideHotQueue(t *testing.T) {
+	store := &memStorage{}
+	node := newNodeOn(t, store, 64)
+	root := encoding.BASE64.Root()
+
+	node.create("demo", root)
+	collection, ok := node.collections.Get("demo")
+	if !ok {
+		t.Fatal("missing collection")
+	}
+	collection.Own("a", domain.Delegation{})
+	collection.MarkDelegatedTo("a", "aa", "missing-peer")
+
+	item := &domain.Item{
+		Collection: "demo",
+		Location:   "aaa",
+		Id:         "parked",
+		Metrics:    []float64{1},
+	}
+	if err := node.New(item, root, nil); err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	element, ok := node.queue.TryConsume()
+	if !ok {
+		t.Fatal("accepted write missing from queue")
+	}
+	if node.feedOnce(element) {
+		t.Fatal("write under a named mark unexpectedly landed")
+	}
+	if got := node.parkedCount(); got != 1 {
+		t.Fatalf("parked before checkpoint: got %d want 1", got)
+	}
+	if got := node.queue.Length(); got != 0 {
+		t.Fatalf("hot queue before checkpoint: got %d want 0", got)
+	}
+
+	if err := node.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	if got := countLines(store.snapshot, "parked-ingress|"); got != 1 {
+		t.Fatalf("parked-ingress lines: got %d want 1 (%v)", got, store.snapshot)
+	}
+
+	restored := newNodeOn(t, store, 64)
+	if got := restored.parkedCount(); got != 1 {
+		t.Fatalf("parked after restore: got %d want 1", got)
+	}
+	if got := restored.queue.Length(); got != 0 {
+		t.Fatalf("hot queue after restore: got %d want 0", got)
+	}
+	stats := restored.IngressStats()
+	byCollection, ok := stats["parked_by_collection"].(map[string]int)
+	if !ok {
+		t.Fatalf("parked_by_collection type=%T", stats["parked_by_collection"])
+	}
+	if got := byCollection["demo"]; got != 1 {
+		t.Fatalf("parked_by_collection[demo]=%d want 1", got)
 	}
 }
 

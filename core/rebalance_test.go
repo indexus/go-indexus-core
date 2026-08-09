@@ -24,7 +24,7 @@ func TestControlCollectThenDelegate(t *testing.T) {
 			Id:         string(rune('a' + i)),
 			Metrics:    []float64{1},
 		}
-		if err := node.New(it, root, "aa"); err != nil {
+		if err := node.New(it, root, nil); err != nil {
 			t.Fatalf("New: %v", err)
 		}
 	}
@@ -49,7 +49,7 @@ func TestControlCollectThenDelegate(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 20; i++ {
-			_, _, _ = node.Get(col, root, false, 0)
+			_, _, _ = node.Get(col, root, false, nil, false)
 		}
 	}()
 
@@ -101,7 +101,7 @@ func TestRefreshTransfersInParallel(t *testing.T) {
 			Id:         string(rune('0' + i)),
 			Metrics:    []float64{1},
 		}
-		if err := n.New(it, root, "zz"); err != nil {
+		if err := n.New(it, root, nil); err != nil {
 			t.Fatalf("New: %v", err)
 		}
 	}
@@ -172,12 +172,12 @@ type barrierSink struct {
 	barrier *transferBarrier
 }
 
-func (s *barrierSink) Transfer(origin domain.Peer, key domain.Key, items []*domain.Item) error {
+func (s *barrierSink) Transfer(origin domain.Peer, key domain.Key, items []*domain.Item) (string, error) {
 	s.barrier.enter()
 	select {
 	case <-s.barrier.gate:
 	case <-time.After(2 * time.Second):
-		return fmt.Errorf("barrier timeout: Refresh appears serial")
+		return "", fmt.Errorf("barrier timeout: Refresh appears serial")
 	}
 	return s.transferSink.Transfer(origin, key, items)
 }
@@ -190,14 +190,14 @@ type handoffPeer struct {
 	created atomic.Int64
 }
 
-func (p *handoffPeer) Transfer(_ domain.Peer, _ domain.Key, items []*domain.Item) error {
+func (p *handoffPeer) Transfer(_ domain.Peer, _ domain.Key, items []*domain.Item) (string, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.batches = append(p.batches, append([]*domain.Item(nil), items...))
-	return nil
+	return p.Name(), nil
 }
 
-func (p *handoffPeer) New(item *domain.Item, _, _ string) error {
+func (p *handoffPeer) New(item *domain.Item, _ string, _ domain.Visited) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.news = append(p.news, item)
@@ -254,7 +254,7 @@ func TestHandoffThenResidualWriteForwardsToNewOwner(t *testing.T) {
 	donor, owner := donorAndNewOwner(t)
 
 	for _, id := range []string{"x1", "x2", "x3"} {
-		if err := donor.New(item(id), "@", "aa"); err != nil {
+		if err := donor.New(item(id), "@", nil); err != nil {
 			t.Fatalf("seed %s: %v", id, err)
 		}
 	}
@@ -289,7 +289,7 @@ func TestHandoffThenResidualWriteForwardsToNewOwner(t *testing.T) {
 		t.Fatal("purge overreached: cache of an unrelated collection dropped")
 	}
 
-	if err := donor.New(item("x4"), "@", "aa"); err != nil {
+	if err := donor.New(item("x4"), "@", nil); err != nil {
 		t.Fatalf("residual New: %v", err)
 	}
 	drain(t, donor)

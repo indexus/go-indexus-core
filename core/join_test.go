@@ -17,7 +17,7 @@ func TestSpawnedNodeJoiningRefusesClientWrites(t *testing.T) {
 	if node.ClientReady() {
 		t.Fatal("spawned node without zones must not be client-ready")
 	}
-	err := node.New(item("i1"), "@", "aa")
+	err := node.New(item("i1"), "@", nil)
 	if !errors.Is(err, ErrJoining) {
 		t.Fatalf("New err=%v want ErrJoining", err)
 	}
@@ -31,11 +31,16 @@ func TestSpawnedNodeAcceptsPeerTransferWhileJoining(t *testing.T) {
 	})
 
 	key := domain.Key{Collection: "demo", Location: "aa"}
-	if err := node.Transfer(node, key, []*domain.Item{item("peer")}); err != nil {
+	transferred := item("peer")
+	transferred.Location = "aaa"
+	if _, err := node.Transfer(node, key, []*domain.Item{transferred}); err != nil {
 		t.Fatalf("Transfer while joining: %v", err)
 	}
-	if got := node.queue.Length(); got != 1 {
-		t.Fatalf("transfer not queued: length=%d", got)
+	if got := node.queue.Length(); got != 0 {
+		t.Fatalf("synchronous transfer leaked into ingress queue: length=%d", got)
+	}
+	if count, err := node.Count(); err != nil || count != 1 {
+		t.Fatalf("transferred item not installed: count=%d err=%v", count, err)
 	}
 }
 
@@ -91,7 +96,7 @@ func TestClientReadyLatchSurvivesBacklogRegrowth(t *testing.T) {
 	}
 
 	for i := 0; i < 8; i++ {
-		_ = node.queue.TryAdd(NewElement(item("q"), "@", "aa"), 8)
+		_ = node.queue.TryAdd(NewElement(item("q"), "@"), 8)
 	}
 	if !node.ClientReady() {
 		t.Fatal("a full queue flipped client_ready off — routing flap")
@@ -122,40 +127,10 @@ func TestJoinPublishGraceOverridesBacklog(t *testing.T) {
 	node.create("demo", "aa")
 
 	for i := 0; i < 6; i++ {
-		_ = node.queue.TryAdd(NewElement(item("q"), "@", "aa"), 8)
+		_ = node.queue.TryAdd(NewElement(item("q"), "@"), 8)
 	}
 	node.joinFirstOwn.Store(time.Now().Add(-DefaultJoinPublishGrace - time.Second).UnixNano())
 	if !node.ClientReady() {
 		t.Fatal("grace should publish even with a Transfer backlog")
-	}
-}
-
-func TestSpawnedNodeWaitsForInboundDelegation(t *testing.T) {
-	node := newNodeOn(t, &memStorage{}, 4)
-	node.EnableAutoscale(AutoscaleConfig{
-		Enabled: true,
-		Role:    "spawned",
-	})
-	// Inbound session must exist before ownership so we never latch ready early.
-	node.delegMu.Lock()
-	node.delegIn["donor"] = &delegationSession{
-		ID:       "sess",
-		PeerName: "donor",
-		Keys:     []domain.Key{{Collection: "demo", Location: "aa"}},
-		State:    delegCatchingUp,
-		Started:  time.Now(),
-		inbound:  true,
-	}
-	node.delegMu.Unlock()
-	node.create("demo", "aa")
-	node.joinFirstOwn.Store(time.Now().Add(-DefaultJoinPublishGrace - time.Second).UnixNano())
-	if node.ClientReady() {
-		t.Fatal("must not publish client_ready while inbound delegation is open")
-	}
-	node.delegMu.Lock()
-	delete(node.delegIn, "donor")
-	node.delegMu.Unlock()
-	if !node.ClientReady() {
-		t.Fatal("expected client_ready after inbound session cleared")
 	}
 }

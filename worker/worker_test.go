@@ -144,9 +144,10 @@ func (s *slowService) Update() error {
 	defer s.mu.Unlock()
 
 	s.update++
+	// The counter only hits 3 once, so the close cannot repeat. Clearing the
+	// field to guard it would write what the test reads.
 	if s.update == 3 && s.updated != nil {
 		close(s.updated)
-		s.updated = nil
 	}
 	return nil
 }

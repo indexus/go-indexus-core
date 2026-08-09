@@ -230,7 +230,6 @@ resource "aws_launch_template" "spawned" {
     region               = var.aws_region
     project              = var.project
     delegation           = var.delegation
-    transfer_threshold   = var.transfer_threshold
     queue_pressure       = var.queue_pressure
     pressure_hold        = var.pressure_hold
     scale_window         = var.scale_window
@@ -266,7 +265,6 @@ resource "aws_instance" "bootstrap" {
     region               = var.aws_region
     project              = var.project
     delegation           = var.delegation
-    transfer_threshold   = var.transfer_threshold
     launch_template_id   = aws_launch_template.spawned.id
     spawn_max            = var.spawn_max
     queue_pressure       = var.queue_pressure
@@ -308,7 +306,6 @@ resource "aws_instance" "worker" {
     bootstrap_host     = aws_instance.bootstrap.public_ip
     issuer_url         = "http://${aws_instance.bootstrap.public_ip}:22000"
     delegation         = var.delegation
-    transfer_threshold = var.transfer_threshold
   })
 
   depends_on = [aws_instance.bootstrap]

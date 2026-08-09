@@ -15,6 +15,14 @@ func (n *Node) Checkpoint() error {
 	n.checkpointMu.Lock()
 	defer n.checkpointMu.Unlock()
 
+	// Snapshot walks every owned leaf under Collection.RLock — defer while a
+	// synchronous handoff holds writers so monitoring/ops cannot freeze it.
+	// Still seal an oversized live WAL while checkpointing is deferred.
+	if n.TransferBusy() {
+		n.sealWAL()
+		return fmt.Errorf("checkpoint deferred: transfer busy")
+	}
+
 	if n.storage.Dirty() {
 		if err := n.storage.Save(n.Snapshot()); err != nil {
 			return err
@@ -25,6 +33,24 @@ func (n *Node) Checkpoint() error {
 		slog.Warn("zone checkpoint failed", "err", err)
 	}
 	return nil
+}
+
+func (n *Node) sealWAL() {
+	type sealer interface {
+		SealRotate() (string, error)
+	}
+	s, ok := n.storage.(sealer)
+	if !ok {
+		return
+	}
+	archived, err := s.SealRotate()
+	if err != nil {
+		slog.Warn("wal seal under transfer busy failed", "err", err)
+		return
+	}
+	if archived != "" {
+		slog.Info("wal sealed under transfer busy", "path", archived)
+	}
 }
 
 func (n *Node) uploadLatestSnapshot() {

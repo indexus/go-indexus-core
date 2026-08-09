@@ -31,7 +31,7 @@ func TestDeleteReachesOwnerFromAnyEdge(t *testing.T) {
 		Metrics:    []float64{1, 2, 3, 4, 5},
 	}
 
-	if err := n1.New(item, encoding.BASE64.Root(), "aa"); err != nil {
+	if err := n1.New(item, encoding.BASE64.Root(), nil); err != nil {
 		t.Fatal(err)
 	}
 	drainQueues(t, nodes, 3, 5*time.Second)
@@ -42,7 +42,7 @@ func TestDeleteReachesOwnerFromAnyEdge(t *testing.T) {
 	}
 
 	// Enter on n2 regardless of ownership: deleteOp forwards XOR-wise if needed.
-	if err := n2.Delete(item, encoding.BASE64.Root(), "aa"); err != nil {
+	if err := n2.Delete(item, encoding.BASE64.Root(), nil); err != nil {
 		t.Fatal(err)
 	}
 	drainQueues(t, nodes, 3, 5*time.Second)
@@ -72,7 +72,7 @@ func TestDeleteUnknownIdIsNoOp(t *testing.T) {
 		Id:         "keep",
 		Metrics:    []float64{1},
 	}
-	if err := n1.New(kept, encoding.BASE64.Root(), "aa"); err != nil {
+	if err := n1.New(kept, encoding.BASE64.Root(), nil); err != nil {
 		t.Fatal(err)
 	}
 	drainQueues(t, nodes, 3, 5*time.Second)
@@ -82,7 +82,7 @@ func TestDeleteUnknownIdIsNoOp(t *testing.T) {
 	}
 
 	ghost := &domain.Item{Collection: collection, Location: "aa", Id: "never-added"}
-	if err := n1.Delete(ghost, encoding.BASE64.Root(), "aa"); err != nil {
+	if err := n1.Delete(ghost, encoding.BASE64.Root(), nil); err != nil {
 		t.Fatal(err)
 	}
 	drainQueues(t, nodes, 3, 5*time.Second)

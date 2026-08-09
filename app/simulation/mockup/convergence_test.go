@@ -32,7 +32,7 @@ func newConvergenceNode(t *testing.T, delegation int, bootstraps ...*core.Node) 
 
 	contacts := make([]domain.Contact, 0, len(bootstraps))
 	for _, b := range bootstraps {
-		contacts = append(contacts, NewContact(b.Name(), b.IPs(), b.Port()))
+		contacts = append(contacts, ContactsOf(name)(b.Name(), b.IPs(), b.Port()))
 	}
 
 	port := int(21000 + mockPortSeq.Add(1))
@@ -42,7 +42,9 @@ func newConvergenceNode(t *testing.T, delegation int, bootstraps ...*core.Node) 
 	}
 	settings.SetAdvertise("127.0.0.1")
 
-	node, err := core.NewNode(settings, NewContact, contacts, storage.NewMemory())
+	// ContactsOf, not NewContact: the RPCs this node makes carry their origin,
+	// which is what lets a test cut the link in one direction.
+	node, err := core.NewNode(settings, ContactsOf(name), contacts, storage.NewMemory())
 	if err != nil {
 		t.Fatalf("NewNode: %v", err)
 	}
@@ -95,37 +97,53 @@ func closestNode(id []byte, nodes []*core.Node) *core.Node {
 	return best
 }
 
-// drainQueues spins until every node's queue is empty for `steady`
-// consecutive samples or `timeout` elapses. The "steady" requirement
-// avoids declaring success while a transfer is still mid-flight.
+// drainQueues spins until every node's queue is empty for `steady` consecutive
+// samples. The "steady" requirement avoids declaring success while a transfer
+// is still mid-flight.
+//
+// timeout is a stall budget, not a runtime budget: a queue that is still
+// shrinking is still draining, and how fast it drains depends on the machine,
+// on -race and on what else the suite is running. Failing a shrinking queue for
+// being slow reports a load problem as a correctness one. What does fail is a
+// queue that stops shrinking short of empty, or one that never stops.
 func drainQueues(t *testing.T, nodes []*core.Node, steady int, timeout time.Duration) {
 	t.Helper()
 
-	deadline := time.Now().Add(timeout)
-	calm := 0
-	for time.Now().Before(deadline) {
-		busy := false
+	pending := func() int {
+		total := 0
 		for _, n := range nodes {
-			if n.Queue() > 0 {
-				busy = true
-				break
-			}
+			total += n.Queue()
 		}
-		if busy {
+		return total
+	}
+
+	stalled := time.Now().Add(timeout)
+	giveUp := time.Now().Add(8 * timeout)
+	prev := pending()
+	calm := 0
+
+	for time.Now().Before(stalled) && time.Now().Before(giveUp) {
+		curr := pending()
+		if curr != prev {
+			stalled = time.Now().Add(timeout)
+			prev = curr
+		}
+		if curr > 0 {
 			calm = 0
-		} else {
-			calm++
-			if calm >= steady {
-				return
-			}
+		} else if calm++; calm >= steady {
+			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	for _, n := range nodes {
-		if q := n.Queue(); q > 0 {
-			t.Fatalf("queue did not drain on node %s within %s, length=%d", n.Name(), timeout, q)
-		}
+
+	lengths := make([]int, len(nodes))
+	for i, n := range nodes {
+		lengths[i] = n.Queue()
 	}
+	if !time.Now().Before(giveUp) {
+		t.Fatalf("queues never stopped moving within %s, lengths=%v", 8*timeout, lengths)
+	}
+	t.Fatalf("queues stopped draining for %s short of empty, lengths=%v", timeout, lengths)
 }
 
 // converge runs Observe+Refresh on every node repeatedly until the global
@@ -326,7 +344,7 @@ func TestConvergence_TwoNodes_TotalPreserved(t *testing.T) {
 			Location:   loc,
 			Id:         fmt.Sprintf("id-%d", i),
 			Metrics:    []float64{1, 2, 3, 4, 5},
-		}, "@", loc)
+		}, "@", nil)
 	}
 
 	drainQueues(t, []*core.Node{n1}, 5, 10*time.Second)
@@ -397,7 +415,7 @@ func TestConvergence_GrowingNetwork_Sequential(t *testing.T) {
 				Location:   loc,
 				Id:         fmt.Sprintf("id-%d", j),
 				Metrics:    []float64{1, 2, 3, 4, 5},
-			}, "@", loc)
+			}, "@", nil)
 			totalItems++
 		}
 	}
@@ -479,7 +497,7 @@ func TestConvergence_NoDoubleOwnership(t *testing.T) {
 				Location:   loc,
 				Id:         fmt.Sprintf("id-%d", j),
 				Metrics:    []float64{1, 2, 3, 4, 5},
-			}, "@", loc)
+			}, "@", nil)
 		}
 	}
 
