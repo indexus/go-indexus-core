@@ -1,0 +1,107 @@
+#!/bin/bash
+# Fast spawn boot for a pre-baked Indexus AMI.
+# No dnf, no S3 binary pull — only IMDS + bootstrap discovery + env file + start.
+set -euxo pipefail
+
+TOKEN=$(curl -sf -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+PUBLIC_IP=$(curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4 | tr -d '[:space:]')
+INSTANCE_ID=$(curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id | tr -d '[:space:]')
+REGION="${region}"
+
+PREFER_NEAR=$(curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/tags/instance/PreferNear 2>/dev/null || true)
+PREFER_NEAR=$(echo "$${PREFER_NEAR:-}" | tr -d '[:space:]')
+if [[ -z "$PREFER_NEAR" || "$PREFER_NEAR" == "None" ]]; then
+  PREFER_NEAR=$(aws ec2 describe-tags --region "$REGION" \
+    --filters "Name=resource-id,Values=$INSTANCE_ID" "Name=key,Values=PreferNear" \
+    --query 'Tags[0].Value' --output text 2>/dev/null || true)
+  PREFER_NEAR=$(echo "$${PREFER_NEAR:-}" | tr -d '[:space:]')
+  if [[ "$PREFER_NEAR" == "None" ]]; then PREFER_NEAR=""; fi
+fi
+
+# Bootstrap should already be up when we scale; keep a short poll only.
+BOOTSTRAP_HOST=""
+for i in $(seq 1 15); do
+  BOOTSTRAP_HOST=$(aws ec2 describe-instances --region "$REGION" \
+    --filters "Name=tag:Role,Values=bootstrap-issuer" "Name=instance-state-name,Values=running" \
+    --query 'Reservations[0].Instances[0].PublicIpAddress' --output text 2>/dev/null || true)
+  if [[ -n "$BOOTSTRAP_HOST" && "$BOOTSTRAP_HOST" != "None" ]]; then
+    break
+  fi
+  sleep 1
+done
+test -n "$BOOTSTRAP_HOST"
+ISSUER_URL="http://$${BOOTSTRAP_HOST}:22000"
+
+# Issuer health — short window (baked image should be ready in tens of seconds).
+for i in $(seq 1 20); do
+  if curl -sf --max-time 1 "$${ISSUER_URL}/health" >/dev/null; then break; fi
+  sleep 1
+done
+
+install -d -m 0755 /etc/indexus /var/lib/indexus /var/lib/indexus/leave /var/lib/indexus/backup /var/lib/indexus/archive
+
+# Fallback if someone launched with a stock AMI by mistake.
+if [[ ! -x /opt/indexus/node ]]; then
+  dnf install -y aws-cli jq || dnf install -y awscli jq || true
+  aws s3 cp "s3://${bucket}/bin/node" /opt/indexus/node --region "$REGION"
+  chmod +x /opt/indexus/node
+fi
+
+cat >/etc/indexus/node.env <<EOF
+PUBLIC_IP=$${PUBLIC_IP}
+BOOTSTRAP_HOST=$${BOOTSTRAP_HOST}
+ISSUER_URL=$${ISSUER_URL}
+NETWORK_ID=${network_id}
+DELEGATION=${delegation}
+AUTOSCALE_ROLE=spawned
+QUEUE_PRESSURE=${queue_pressure}
+PRESSURE_HOLD=${pressure_hold}
+SCALE_WINDOW=${scale_window}
+SCALE_DOWN_THRESHOLD=${scale_down_threshold}
+SCALE_DOWN_HOLD=${scale_down_hold}
+SCALE_COOLDOWN=${scale_cooldown}
+HOME=/var/lib/indexus
+AWS_REGION=$${REGION}
+SNAPSHOT_BUCKET=${bucket}
+INDEXUS_ZONE_SNAP_MIN=30s
+INDEXUS_STORAGE=/var/lib/indexus/backup
+INDEXUS_LEAVE_DIR=/var/lib/indexus/leave
+INDEXUS_LEAVE_TIMEOUT=90s
+INDEXUS_LEAVE_MAX=15m
+INDEXUS_SPAWN_GRACE=30s
+INDEXUS_ROLE=spawned
+INDEXUS_QUEUE_ABS=${queue_pressure}
+INDEXUS_FEED_WORKERS=32
+INDEXUS_QUEUE_MAX=50000
+INDEXUS_MEM_LIMIT_PCT=40
+INDEXUS_MEM_FLOOR_PCT=25
+INDEXUS_CPU_LIMIT_PCT=70
+INDEXUS_CPU_FLOOR_PCT=25
+INDEXUS_MEM_RISE=2.0
+INDEXUS_RISE_HOLD=12s
+INDEXUS_MEM_REFUSE_PCT=60
+INDEXUS_PREFER_NEAR=$${PREFER_NEAR}
+EOF
+
+# Ensure unit exists (baked AMI ships it; recreate if missing).
+if [[ ! -f /etc/systemd/system/indexus-node.service ]]; then
+  cat >/etc/systemd/system/indexus-node.service <<'UNIT'
+[Unit]
+Description=Indexus Node
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=simple
+EnvironmentFile=-/etc/indexus/node.env
+WorkingDirectory=/var/lib/indexus
+ExecStart=/opt/indexus/node -p2pPort 21000 -monitoringPort 19000 -advertise $${PUBLIC_IP} -bootstrap $${BOOTSTRAP_HOST}|21000 -issuer $${ISSUER_URL} -network $${NETWORK_ID} -requireAuth -delegation $${DELEGATION} -autoscale -autoscaleRole $${AUTOSCALE_ROLE} -queuePressure $${QUEUE_PRESSURE} -pressureHold $${PRESSURE_HOLD} -scaleWindow $${SCALE_WINDOW} -scaleDownThreshold $${SCALE_DOWN_THRESHOLD} -scaleDownHold $${SCALE_DOWN_HOLD} -scaleCooldown $${SCALE_COOLDOWN} -storage /var/lib/indexus/backup -archive /var/lib/indexus/archive -nodeKey /etc/indexus/node.ed25519 -cert /etc/indexus/node.cert.json
+Restart=always
+RestartSec=2
+[Install]
+WantedBy=multi-user.target
+UNIT
+fi
+
+systemctl daemon-reload
+systemctl enable --now indexus-node.service

@@ -2,83 +2,244 @@ package core
 
 import (
 	"fmt"
-	"log"
-	"os"
+	"log/slog"
+	"strconv"
 	"strings"
 
 	"github.com/indexus/go-indexus-core/domain"
+	"github.com/indexus/go-indexus-core/encoding"
 )
 
-func (n *Node) SaveCollections() error {
-	collectionsDir := n.settings.dataDir + "/collections"
+func (n *Node) Snapshot() []string {
+	snapshot := make([]string, 0)
 
-	// Create collections directory if it doesn't exist
-	if err := os.MkdirAll(collectionsDir, 0755); err != nil {
-		return fmt.Errorf("failed to create collections directory: %w", err)
+	n.routing.Traverse(0, encoding.BASE64.NewID(), func(i int, b []byte, p domain.Peer) {
+		c, exist := n.registered.Get(0, p.ID())
+		if exist {
+			arr := make([]string, 0)
+			for ip := range c.IPs() {
+				arr = append(arr, ip)
+			}
+			snapshot = append(snapshot, fmt.Sprintf("contact|%s|%s|%d", c.Name(), strings.Join(arr, ","), c.Port()))
+		}
+	})
+
+	for _, collection := range n.collections.List() {
+		snapshot = append(snapshot, fmt.Sprintf("collection|%s", collection.Name()))
+
+		collection.Browse(
+			func(ownership string) {
+				snapshot = append(snapshot, fmt.Sprintf("ownership|%s", ownership))
+			},
+			func(ownership, delegation string, handoff domain.Handoff) {
+				snapshot = append(snapshot, fmt.Sprintf("delegation|%s|%s|%d", delegation, handoff.Peer, handoff.At))
+			},
+		)
 	}
 
-	// Save each collection to a binary file
-	for _, collection := range n.collections.List() {
-		filename := fmt.Sprintf("%s/%s.bin", collectionsDir, collection.Name())
-		if err := collection.SaveToBinary(filename); err != nil {
-			log.Printf("Error saving collection %s: %v", collection.Name(), err)
+	n.owned.Traverse(0, encoding.BASE64.NewID(), func(i int, b []byte, keys map[domain.Key]any) {
+		for key := range keys {
+			collection, exist := n.collections.Get(key.Collection)
+			if !exist {
+				continue
+			}
+			collection.Traverse(
+				key.Location,
+				func(string, *domain.Abelian) {},
+				func(_ string, location, id string, abelian *domain.Abelian) {
+					item := &domain.Item{
+						Collection: key.Collection,
+						Location:   location,
+						Id:         id,
+						Metrics:    abelian.Metrics(),
+					}
+					snapshot = append(snapshot, "item|"+item.Content())
+				},
+			)
+			for _, tomb := range collection.TombstonesUnder(key.Location) {
+				snapshot = append(snapshot, tomb.Content())
+			}
+		}
+	})
+
+	for _, el := range n.queue.Snapshot() {
+		if el == nil || el.item == nil {
 			continue
 		}
+		via := el.via.String()
+		if via == "" {
+			via = el.item.Location
+		}
+		switch el.op {
+		case OpDelete:
+			snapshot = append(snapshot, fmt.Sprintf("pending-delete|%s|%s|%s", el.root, via, el.item.Content()))
+		default:
+			snapshot = append(snapshot, fmt.Sprintf("pending-ingress|%s|%s|%s", el.root, via, el.item.Content()))
+		}
 	}
+	snapshot = append(snapshot, n.snapshotParked()...)
 
-	return nil
+	return snapshot
 }
 
-func (n *Node) LoadCollections() error {
-	collectionsDir := n.settings.dataDir + "/collections"
-
-	// Check if collections directory exists
-	if _, err := os.Stat(collectionsDir); os.IsNotExist(err) {
-		log.Println("No collections directory found, starting with empty collections")
+func (n *Node) Restore() error {
+	if !n.storage.Exist() {
 		return nil
 	}
 
-	// Read directory entries
-	entries, err := os.ReadDir(collectionsDir)
+	commands, err := n.storage.Load()
 	if err != nil {
-		return fmt.Errorf("failed to read collections directory: %w", err)
+
+		slog.Error("snapshot unreadable, replaying the write-ahead log alone", "err", err)
+		commands = nil
 	}
 
-	// Load each collection file
-	for _, entry := range entries {
-		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".bin") {
-			filename := fmt.Sprintf("%s/%s", collectionsDir, entry.Name())
+	var collection string
 
-			// Try to load the collection
-			collection, err := domain.LoadFromBinary(filename)
-			if err != nil {
-				return fmt.Errorf("error loading collection from %s: %w", filename, err)
+	for _, command := range commands {
+		arr := strings.Split(command, "|")
+		if len(arr) < 2 {
+			slog.Warn("skipping corrupted snapshot line", "line", command)
+			continue
+		}
+
+		switch arr[0] {
+		case "contact":
+			if len(arr) != 4 {
+				continue
 			}
-			n.collections.Set(collection)
-
-			n.own(collection, collection.Ownership())
+			name := arr[1]
+			ips := strings.Split(arr[2], ",")
+			mIps := make(map[string]any)
+			for _, ip := range ips {
+				mIps[ip] = nil
+			}
+			port, err := strconv.Atoi(arr[3])
+			if err != nil {
+				continue
+			}
+			id, err := encoding.BASE64.Decode(name)
+			if err != nil {
+				continue
+			}
+			n.acknowledged.Insert(0, id, n.newContact(name, mIps, port))
+		case "collection":
+			collection = arr[1]
+		case "ownership":
+			n.create(collection, arr[1])
+		case "delegation":
+			current, ok := n.collections.Get(collection)
+			if !ok {
+				continue
+			}
+			child := arr[1]
+			if _, exist := current.Get(child); !exist {
+				continue
+			}
+			peer := ""
+			var at int64
+			if len(arr) >= 4 {
+				peer = arr[2]
+				at, _ = strconv.ParseInt(arr[3], 10, 64)
+			}
+			current.Delegate(child)
+			// Legacy "delegation|child" lines restore an unresolved Handoff{}:
+			// they are topology hints until Claim supplies a named holder.
+			current.NoteDelegatedHandoff(child, domain.Handoff{Peer: peer, At: at})
+		case "item":
+			item, ok := domain.ParseContent(command)
+			if !ok || item.Tombstone {
+				continue
+			}
+			if _, exist := n.collections.Get(item.Collection); !exist {
+				continue
+			}
+			n.add(item, false)
+		case "tombstone":
+			item, ok := domain.ParseContent(command)
+			if !ok || !item.Tombstone {
+				continue
+			}
+			if c, ok := n.collections.Get(item.Collection); ok {
+				c.ApplyTombstone(item.Location, item.Id, item.Gen)
+			}
+		case "pending-ingress":
+			n.restorePending(command, false)
+		case "pending-delete":
+			n.restorePending(command, true)
+		case "parked-ingress":
+			n.restoreParked(command, false)
+		case "parked-delete":
+			n.restoreParked(command, true)
+		default:
+			slog.Warn("unknown snapshot command, skipping", "line", command)
 		}
 	}
 
-	return nil
-}
-
-func (n *Node) ClearOperationsLog() error {
-	return n.collections.ClearOperationsLog()
-}
-
-func (n *Node) ReplayOperations() error {
-	return n.collections.ReplayOperations()
-}
-
-func (n *Node) CompleteOwnership() error {
-	// Iterate through all collections
-	for _, collection := range n.collections.List() {
-		// Get all areas that need to be owned
-		areas := collection.Complete(collection.Base().Root())
-
-		// Update the node's owned BST
-		n.own(collection, areas)
+	stream := n.storage.Stream(0)
+	for log := range stream {
+		n.replayLogLine(log)
 	}
+
 	return nil
+}
+
+func (n *Node) restorePending(command string, del bool) {
+	arr := strings.SplitN(command, "|", 4)
+	if len(arr) < 4 {
+		return
+	}
+	item, ok := domain.ParseContent(arr[3])
+	if !ok {
+		return
+	}
+	if del {
+		n.queue.Add(NewDeleteElement(item, arr[1]))
+		return
+	}
+	n.queue.Add(NewElement(item, arr[1]))
+}
+
+func (n *Node) replayLogLine(log string) {
+	if strings.HasPrefix(log, "ingress|") {
+		arr := strings.SplitN(log, "|", 4)
+		if len(arr) < 4 {
+			return
+		}
+		item, ok := domain.ParseContent(arr[3])
+		if !ok {
+			return
+		}
+		n.queue.Add(NewElement(item, arr[1]))
+		return
+	}
+	if strings.HasPrefix(log, "delete|") {
+		arr := strings.SplitN(log, "|", 4)
+		if len(arr) < 4 {
+			return
+		}
+		item, ok := domain.ParseContent(arr[3])
+		if !ok {
+			return
+		}
+		n.queue.Add(NewDeleteElement(item, arr[1]))
+		return
+	}
+	if strings.HasPrefix(log, "tombstone|") {
+		item, ok := domain.ParseContent(log)
+		if !ok {
+			return
+		}
+		if c, ok := n.collections.Get(item.Collection); ok {
+			c.ApplyTombstone(item.Location, item.Id, item.Gen)
+		}
+		return
+	}
+	item, ok := domain.ParseContent(log)
+	if !ok || item.Tombstone {
+		return
+	}
+	if _, exist := n.collections.Get(item.Collection); exist {
+		n.add(item, false)
+	}
 }

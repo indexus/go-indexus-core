@@ -2,7 +2,7 @@ package worker
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"time"
 )
 
@@ -12,9 +12,11 @@ type Service interface {
 	Refresh() error
 	Update() error
 	Feed() error
-	SaveCollections() error
-	ReplayOperations() error
-	ClearOperationsLog() error
+}
+
+// OptionalAutoscale is implemented by nodes that decide on scaling themselves.
+type OptionalAutoscale interface {
+	AutoscaleTick()
 }
 
 type Worker struct {
@@ -31,51 +33,55 @@ func NewWorker(service Service) *Worker {
 		cancel:  cancel,
 	}
 }
-
 func (w *Worker) Feed() error {
-	log.Println("Queuing system started")
+	slog.Info("ingress worker started")
 	return w.Service.Feed()
 }
 
 func (w *Worker) Start() error {
-	log.Println("Recurring jobs started")
+	slog.Info("background jobs started", "interval", w.Service.Delay())
 
-	// First, replay any operations from the write-ahead log
-	if err := w.Service.ReplayOperations(); err != nil {
-		log.Printf("Error replaying operations: %v", err)
+	// Refresh hands zones to peers over the network and can spend minutes on
+	// ones that stopped answering. Anything sharing its tick stops for as long
+	// as it runs: liveness would go on routing writes to peers it should have
+	// dropped, the soft-cache would freeze mid-rebalance, and the node would
+	// hold a pressure reading from before the handover while memory keeps
+	// climbing — blind exactly when it has to decide whether to ask for help.
+	go w.every("observe", w.Service.Observe)
+	go w.every("update", w.Service.Update)
+	if autoscale, ok := w.Service.(OptionalAutoscale); ok {
+		go w.every("autoscale", func() error {
+			autoscale.AutoscaleTick()
+			return nil
+		})
 	}
 
-	saveInterval := 30 * time.Second // Save collections every 5 minutes
-	saveTicker := time.NewTicker(saveInterval)
-	defer saveTicker.Stop()
+	// A job failure is almost always transient — an unreachable peer, a full
+	// queue. Returning here would stop rebalancing for good while the node
+	// keeps answering requests.
+	w.every("rebalance", w.Service.Refresh)
+	return nil
+}
 
+// every runs job on the service cadence until the worker is closed, logging
+// failures instead of giving up on the loop.
+//
+// The first pass runs immediately: joiners must Ping their bootstrap without
+// waiting a full jobInterval, or the bootstrap stays at peers=1 until the
+// first Observe tick (and /routing stays empty until clean()).
+func (w *Worker) every(name string, job func() error) {
+	run := func() {
+		if err := job(); err != nil {
+			slog.Warn(name+" failed", "err", err)
+		}
+	}
+	run()
 	for {
 		select {
 		case <-w.ctx.Done():
-			// Save collections one last time before shutting down
-			if err := w.Service.SaveCollections(); err != nil {
-				log.Printf("Error saving collections during shutdown: %v", err)
-			}
-			return nil
-		case <-saveTicker.C:
-			// Save collections and clear the operations log if successful
-			if err := w.Service.SaveCollections(); err != nil {
-				log.Printf("Error saving collections: %v", err)
-			} else {
-				if err := w.Service.ClearOperationsLog(); err != nil {
-					log.Printf("Error clearing operations log: %v", err)
-				}
-			}
+			return
 		case <-time.After(w.Service.Delay()):
-			if err := w.Service.Observe(); err != nil {
-				return err
-			}
-			if err := w.Service.Refresh(); err != nil {
-				return err
-			}
-			// if err := w.Service.Update(); err != nil {
-			// 	return err
-			// }
+			run()
 		}
 	}
 }
