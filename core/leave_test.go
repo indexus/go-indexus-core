@@ -16,8 +16,8 @@ type refusingSink struct {
 	*dialPeer
 }
 
-func (s *refusingSink) Transfer(domain.Peer, domain.Key, []*domain.Item) error {
-	return fmt.Errorf("simulated transfer failure")
+func (s *refusingSink) Transfer(domain.Peer, domain.Key, []*domain.Item) (string, error) {
+	return "", fmt.Errorf("simulated transfer failure")
 }
 
 type overlapSink struct {
@@ -31,7 +31,7 @@ func newOverlapSink(name, ip string, port int) *overlapSink {
 	return &overlapSink{transferSink: newTransferSink(name, ip, port)}
 }
 
-func (s *overlapSink) Transfer(origin domain.Peer, key domain.Key, items []*domain.Item) error {
+func (s *overlapSink) Transfer(origin domain.Peer, key domain.Key, items []*domain.Item) (string, error) {
 	s.mu.Lock()
 	s.active++
 	if s.active > s.peak {
@@ -57,7 +57,7 @@ func (s *overlapSink) peakConcurrency() int {
 func queueWrite(n *Node, id string) {
 	root := encoding.BASE64.Root()
 	item := &domain.Item{Collection: "demo", Location: "aa", Id: id, Metrics: []float64{1}}
-	n.queue.Add(NewElement(item, root, root))
+	n.queue.Add(NewElement(item, root))
 }
 
 func TestSoftLeaveHandsOffQueuedWrites(t *testing.T) {
@@ -138,16 +138,17 @@ type bouncingSink struct {
 	bounced atomic.Int64
 }
 
-func (s *bouncingSink) Transfer(origin domain.Peer, key domain.Key, items []*domain.Item) error {
-	if err := s.transferSink.Transfer(origin, key, items); err != nil {
-		return err
+func (s *bouncingSink) Transfer(origin domain.Peer, key domain.Key, items []*domain.Item) (string, error) {
+	ackedPeer, err := s.transferSink.Transfer(origin, key, items)
+	if err != nil {
+		return "", err
 	}
 	for _, item := range items {
-		if s.target.New(item, key.Location, key.Location) == nil {
+		if s.target.New(item, key.Location, nil) == nil {
 			s.bounced.Add(1)
 		}
 	}
-	return nil
+	return ackedPeer, nil
 }
 
 func TestSoftLeaveConvergesWhenPeerPushesItemsBack(t *testing.T) {
@@ -187,7 +188,7 @@ func TestLeavingNodeDropsOutOfTheRing(t *testing.T) {
 
 	root := encoding.BASE64.Root()
 	item := &domain.Item{Collection: "demo", Location: "aa", Id: "late", Metrics: []float64{1}}
-	if err := node.New(item, root, root); err == nil {
+	if err := node.New(item, root, nil); err == nil {
 		t.Fatal("a draining node accepted a write and re-owned the zone")
 	}
 	if got := ownedCount(t, node); got != 0 {
@@ -389,9 +390,9 @@ type leavingSink struct {
 	calls atomic.Int64
 }
 
-func (s *leavingSink) Transfer(domain.Peer, domain.Key, []*domain.Item) error {
+func (s *leavingSink) Transfer(domain.Peer, domain.Key, []*domain.Item) (string, error) {
 	s.calls.Add(1)
-	return domain.ErrLeaving
+	return "", domain.ErrLeaving
 }
 
 func TestSoftLeaveRetriesTransientFailure(t *testing.T) {
@@ -423,7 +424,7 @@ func TestTransferRefusedWhileLeaving(t *testing.T) {
 		t.Fatalf("SoftLeave: %+v", res)
 	}
 
-	err := node.Transfer(nil, domain.Key{Collection: "demo", Location: "a"}, []*domain.Item{
+	_, err := node.Transfer(nil, domain.Key{Collection: "demo", Location: "a"}, []*domain.Item{
 		{Collection: "demo", Location: "aa", Id: "z", Metrics: []float64{1}},
 	})
 	if err == nil {
@@ -495,7 +496,7 @@ type gatedSink struct {
 	entries atomic.Int64
 }
 
-func (s *gatedSink) Transfer(origin domain.Peer, key domain.Key, items []*domain.Item) error {
+func (s *gatedSink) Transfer(origin domain.Peer, key domain.Key, items []*domain.Item) (string, error) {
 	s.entries.Add(1)
 	s.once.Do(func() { close(s.entered) })
 	<-s.gate

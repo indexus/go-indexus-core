@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -59,15 +60,20 @@ func (n *Node) markOwnedDirtyForItem(collection, location string) {
 		return
 	}
 	for loc := location; loc != ""; loc = col.Base().Parent(loc) {
-		id, err := encoding.MergeEncodings(encoding.BASE64, encoding.BASE64, loc, collection)
+		id, err := zoneKeyID(collection, loc)
 		if err != nil {
 			continue
 		}
-		if sets, exist := n.owned.Get(0, id); exist {
-			if _, has := sets[domain.Key{Collection: collection, Location: loc}]; has {
-				n.markZoneDirty(collection, loc)
+		owns := false
+		n.owned.Read(0, id, func(sets map[domain.Key]any, exist bool) {
+			if !exist {
 				return
 			}
+			_, owns = sets[domain.Key{Collection: collection, Location: loc}]
+		})
+		if owns {
+			n.markZoneDirty(collection, loc)
+			return
 		}
 		if loc == col.Base().Root() {
 			break
@@ -107,12 +113,52 @@ func (n *Node) zoneLines(key domain.Key) ([]string, int, error) {
 }
 
 func zoneObjectKey(collection, location string, seq int64) string {
-	id, err := encoding.MergeEncodings(encoding.BASE64, encoding.BASE64, location, collection)
+	return zoneObjectPrefix(collection, location) + fmt.Sprintf("%d.snap", seq)
+}
+
+// zoneObjectPrefix is the store listing prefix for every snapshot of one zone.
+// The encoding matches zoneObjectKey so a reclaim can find the durable copy
+// left by a receiver that never came back.
+func zoneObjectPrefix(collection, location string) string {
+	id, err := zoneKeyID(collection, location)
 	enc := location
 	if err == nil {
 		enc = encoding.BASE64.Encode(id)
 	}
-	return fmt.Sprintf("zones/%s/%s/%d.snap", collection, enc, seq)
+	return fmt.Sprintf("zones/%s/%s/", collection, enc)
+}
+
+// latestZoneSnapshot returns the highest-seq snapshot of a zone in the object
+// store, or false when none was ever checkpointed. The loss window on reclaim
+// is then the WAL written since that seq.
+func latestZoneSnapshot(ctx context.Context, store Store, key domain.Key) (domain.ZoneSnapshotRef, bool) {
+	if store == nil {
+		return domain.ZoneSnapshotRef{}, false
+	}
+	objs, err := store.List(ctx, zoneObjectPrefix(key.Collection, key.Location))
+	if err != nil || len(objs) == 0 {
+		return domain.ZoneSnapshotRef{}, false
+	}
+	var best domain.ZoneSnapshotRef
+	var bestSeq int64
+	for _, obj := range objs {
+		base := filepath.Base(obj.Key)
+		if !strings.HasSuffix(base, ".snap") {
+			continue
+		}
+		seq, err := strconv.ParseInt(strings.TrimSuffix(base, ".snap"), 10, 64)
+		if err != nil || seq <= bestSeq {
+			continue
+		}
+		bestSeq = seq
+		best = domain.ZoneSnapshotRef{
+			Collection: key.Collection,
+			Location:   key.Location,
+			Seq:        seq,
+			Key:        obj.Key,
+		}
+	}
+	return best, bestSeq > 0
 }
 
 func nodeManifestKey(nodeName string) string {
@@ -290,35 +336,13 @@ func pullManifest(ctx context.Context, store Store, nodeName string) (*Manifest,
 }
 
 func (n *Node) applyZoneLines(lines []string) error {
-	var collection string
+	zones := &zoneReader{node: n}
 	for _, command := range lines {
 		arr := strings.Split(command, "|")
 		if len(arr) < 2 {
 			continue
 		}
-		switch arr[0] {
-		case "collection":
-			collection = arr[1]
-		case "ownership":
-			n.create(collection, arr[1])
-		case "item":
-			item, ok := domain.ParseContent(command)
-			if !ok || item.Tombstone {
-				continue
-			}
-			if _, exist := n.collections.Get(item.Collection); !exist {
-				continue
-			}
-			n.add(item, false)
-		case "tombstone":
-			item, ok := domain.ParseContent(command)
-			if !ok || !item.Tombstone {
-				continue
-			}
-			if c, ok := n.collections.Get(item.Collection); ok {
-				c.ApplyTombstone(item.Location, item.Id, item.Gen)
-			}
-		}
+		zones.line(command, arr)
 	}
 	return nil
 }
@@ -367,4 +391,37 @@ func (n *Node) zoneRef(key domain.Key) (domain.ZoneSnapshotRef, bool) {
 		Seq:        seq,
 		Key:        zoneObjectKey(key.Collection, key.Location, seq),
 	}, true
+}
+
+type zoneReader struct {
+	node       *Node
+	collection string
+}
+
+func (z *zoneReader) line(command string, arr []string) {
+	switch arr[0] {
+	case "collection":
+		z.collection = arr[1]
+	case "ownership":
+		if z.collection != "" {
+			z.node.create(z.collection, arr[1])
+		}
+	case "item":
+		item, ok := domain.ParseContent(command)
+		if !ok || item.Tombstone {
+			return
+		}
+		if _, exist := z.node.collections.Get(item.Collection); !exist {
+			return
+		}
+		z.node.add(item, false)
+	case "tombstone":
+		item, ok := domain.ParseContent(command)
+		if !ok || !item.Tombstone {
+			return
+		}
+		if c, ok := z.node.collections.Get(item.Collection); ok {
+			c.ApplyTombstone(item.Location, item.Id, item.Gen)
+		}
+	}
 }

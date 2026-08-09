@@ -31,8 +31,8 @@ func (n *Node) Snapshot() []string {
 			func(ownership string) {
 				snapshot = append(snapshot, fmt.Sprintf("ownership|%s", ownership))
 			},
-			func(ownership, delegation string) {
-				snapshot = append(snapshot, fmt.Sprintf("delegation|%s", delegation))
+			func(ownership, delegation string, handoff domain.Handoff) {
+				snapshot = append(snapshot, fmt.Sprintf("delegation|%s|%s|%d", delegation, handoff.Peer, handoff.At))
 			},
 		)
 	}
@@ -66,13 +66,18 @@ func (n *Node) Snapshot() []string {
 		if el == nil || el.item == nil {
 			continue
 		}
+		via := el.via.String()
+		if via == "" {
+			via = el.item.Location
+		}
 		switch el.op {
 		case OpDelete:
-			snapshot = append(snapshot, fmt.Sprintf("pending-delete|%s|%s|%s", el.root, el.current, el.item.Content()))
+			snapshot = append(snapshot, fmt.Sprintf("pending-delete|%s|%s|%s", el.root, via, el.item.Content()))
 		default:
-			snapshot = append(snapshot, fmt.Sprintf("pending-ingress|%s|%s|%s", el.root, el.current, el.item.Content()))
+			snapshot = append(snapshot, fmt.Sprintf("pending-ingress|%s|%s|%s", el.root, via, el.item.Content()))
 		}
 	}
+	snapshot = append(snapshot, n.snapshotParked()...)
 
 	return snapshot
 }
@@ -127,10 +132,20 @@ func (n *Node) Restore() error {
 			if !ok {
 				continue
 			}
-			if _, exist := current.Get(arr[1]); !exist {
+			child := arr[1]
+			if _, exist := current.Get(child); !exist {
 				continue
 			}
-			current.Delegate(arr[1])
+			peer := ""
+			var at int64
+			if len(arr) >= 4 {
+				peer = arr[2]
+				at, _ = strconv.ParseInt(arr[3], 10, 64)
+			}
+			current.Delegate(child)
+			// Legacy "delegation|child" lines restore an unresolved Handoff{}:
+			// they are topology hints until Claim supplies a named holder.
+			current.NoteDelegatedHandoff(child, domain.Handoff{Peer: peer, At: at})
 		case "item":
 			item, ok := domain.ParseContent(command)
 			if !ok || item.Tombstone {
@@ -152,6 +167,10 @@ func (n *Node) Restore() error {
 			n.restorePending(command, false)
 		case "pending-delete":
 			n.restorePending(command, true)
+		case "parked-ingress":
+			n.restoreParked(command, false)
+		case "parked-delete":
+			n.restoreParked(command, true)
 		default:
 			slog.Warn("unknown snapshot command, skipping", "line", command)
 		}
@@ -175,10 +194,10 @@ func (n *Node) restorePending(command string, del bool) {
 		return
 	}
 	if del {
-		n.queue.Add(NewDeleteElement(item, arr[1], arr[2]))
+		n.queue.Add(NewDeleteElement(item, arr[1]))
 		return
 	}
-	n.queue.Add(NewElement(item, arr[1], arr[2]))
+	n.queue.Add(NewElement(item, arr[1]))
 }
 
 func (n *Node) replayLogLine(log string) {
@@ -191,7 +210,7 @@ func (n *Node) replayLogLine(log string) {
 		if !ok {
 			return
 		}
-		n.queue.Add(NewElement(item, arr[1], arr[2]))
+		n.queue.Add(NewElement(item, arr[1]))
 		return
 	}
 	if strings.HasPrefix(log, "delete|") {
@@ -203,7 +222,7 @@ func (n *Node) replayLogLine(log string) {
 		if !ok {
 			return
 		}
-		n.queue.Add(NewDeleteElement(item, arr[1], arr[2]))
+		n.queue.Add(NewDeleteElement(item, arr[1]))
 		return
 	}
 	if strings.HasPrefix(log, "tombstone|") {

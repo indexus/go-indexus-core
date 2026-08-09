@@ -3,7 +3,6 @@ package core
 import (
 	"fmt"
 	"log/slog"
-	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -38,15 +37,21 @@ type Node struct {
 	fwdLast      time.Time
 
 	peerBusyMu sync.Mutex
-	peerBusy   map[string]time.Time
+	peerBusy   map[string]peerBackoff
 
 	suspectMu sync.Mutex
 	suspect   map[string]time.Time
+	// ghosted names peers that entered quarantine. Absence from membership
+	// tables after ghosting is a verdict for reclaim; cleared only by resume.
+	ghosted map[string]struct{}
 
 	stallMu       sync.Mutex
 	stalls        map[string]int64
 	requeues      int64
 	stallLoggedAt time.Time
+
+	parkMu sync.Mutex
+	parked map[parkedKey][]*Element
 
 	full atomic.Bool
 
@@ -57,17 +62,18 @@ type Node struct {
 	joinFirstOwn atomic.Int64
 
 	items       atomic.Int64
-	itemsPrep   atomic.Int64
 	lastCountAt atomic.Int64
+	// ownershipSnap is the last successful TryRLock browse of Collection.owned.
+	// /ownership serves this so monitoring never waits on Collection.mu.
+	ownershipSnap atomic.Value // map[string]map[string]map[string]any
 
 	storeMu     sync.Mutex
 	objectStore Store
 	zoneSnap    *zoneSnapState
 
-	delegMu      sync.Mutex
-	delegOut     map[string]*delegationSession
-	delegIn      map[string]*delegationSession
-	delegEnabled bool
+	// parentSyncAt debounces parent-stub pulls and Claim pushes per key.
+	parentSyncMu sync.Mutex
+	parentSyncAt map[domain.Key]time.Time
 }
 
 func NewNode(settings *Settings, newContact func(string, map[string]any, int) domain.Contact, bootstraps []domain.Contact, storage domain.Storage) (*Node, error) {
@@ -85,13 +91,13 @@ func NewNode(settings *Settings, newContact func(string, map[string]any, int) do
 		storage:      storage,
 		fwdLast:      time.Now(),
 		fwdTokens:    float64(settings.forwardRate),
-		peerBusy:     make(map[string]time.Time),
+		peerBusy:     make(map[string]peerBackoff),
 		suspect:      make(map[string]time.Time),
+		ghosted:      make(map[string]struct{}),
 		stalls:       make(map[string]int64),
+		parked:       make(map[parkedKey][]*Element),
 		zoneSnap:     newZoneSnapState(),
-		delegOut:     make(map[string]*delegationSession),
-		delegIn:      make(map[string]*delegationSession),
-		delegEnabled: os.Getenv("INDEXUS_DELEGATION_S3") == "1" || os.Getenv("INDEXUS_DELEGATION_S3") == "true",
+		parentSyncAt: make(map[domain.Key]time.Time),
 	}
 
 	node.register([]domain.Contact{node})

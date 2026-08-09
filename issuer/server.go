@@ -42,7 +42,7 @@ type Server struct {
 	lastScale     time.Time
 	lastDownscale time.Time
 	scaleCount    int
-	scaleReserved int // in-flight launches not yet reflected in inventory
+	scaleReserved int                  // in-flight launches not yet reflected in inventory
 	lastScaleBy   map[string]time.Time // per requester_id cooldown
 	drainingID    string               // instance currently holding SoftLeave drain lock
 	drainingSince time.Time

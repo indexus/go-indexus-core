@@ -23,3 +23,5 @@ scripts/bench/node_modules/
 */__debug*
 z_draft/*
 .DS_Store
+__pycache__/
+*.pyc

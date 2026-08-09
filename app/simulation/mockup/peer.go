@@ -24,6 +24,7 @@ type Network struct {
 	mu          sync.RWMutex
 	nodes       map[string]*core.Node
 	unreachable map[string]*core.Node
+	blocked     map[string]map[string]bool
 
 	// transferDropPct is a 0..100 percentage. When non-zero, every
 	// Transfer call has that probability of returning a synthetic
@@ -60,6 +61,7 @@ func NewNetwork() *Network {
 	return &Network{
 		nodes:       map[string]*core.Node{},
 		unreachable: map[string]*core.Node{},
+		blocked:     map[string]map[string]bool{},
 	}
 }
 
@@ -86,6 +88,39 @@ func (n *Network) Get(name string) (*core.Node, bool) {
 	defer n.mu.RUnlock()
 	node, ok := n.nodes[name]
 	return node, ok
+}
+
+func (n *Network) GetFrom(origin, name string) (*core.Node, bool) {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	if origin != "" && n.blocked[origin][name] {
+		return nil, false
+	}
+	node, ok := n.nodes[name]
+	return node, ok
+}
+
+func (n *Network) Partition(left, right []*core.Node) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for _, a := range left {
+		if n.blocked[a.Name()] == nil {
+			n.blocked[a.Name()] = map[string]bool{}
+		}
+		for _, b := range right {
+			n.blocked[a.Name()][b.Name()] = true
+			if n.blocked[b.Name()] == nil {
+				n.blocked[b.Name()] = map[string]bool{}
+			}
+			n.blocked[b.Name()][a.Name()] = true
+		}
+	}
+}
+
+func (n *Network) Heal() {
+	n.mu.Lock()
+	n.blocked = map[string]map[string]bool{}
+	n.mu.Unlock()
 }
 
 func (n *Network) Nodes() []*core.Node {
@@ -118,13 +153,28 @@ type Peer struct {
 	ips  map[string]any
 	port int
 	ip   string
+	from string
+	mesh *Network
 }
 
 func NewContact(name string, ips map[string]any, port int) domain.Contact {
+	return newPeerContact(network, "", name, ips, port)
+}
+
+func newPeerContact(mesh *Network, from, name string, ips map[string]any, port int) *Peer {
 	return &Peer{
 		name: name,
 		ips:  ips,
 		port: port,
+		from: from,
+		mesh: mesh,
+	}
+}
+
+func ContactsOf(origin string) func(string, map[string]any, int) domain.Contact {
+	mesh := network
+	return func(name string, ips map[string]any, port int) domain.Contact {
+		return newPeerContact(mesh, origin, name, ips, port)
 	}
 }
 
@@ -158,34 +208,34 @@ func (p *Peer) Host() string {
 
 func (p *Peer) Ping(origin domain.Contact) (domain.Contact, error) {
 
-	distant, ok := network.Get(p.Name())
+	distant, ok := p.mesh.GetFrom(origin.Name(), p.Name())
 	if !ok {
 		return nil, fmt.Errorf("error code: 404")
 	}
 
 	node, err := distant.Ping(NewContact(origin.Name(), origin.IPs(), origin.Port()))
 	if err != nil {
-		return nil, fmt.Errorf("error making request: %s", err.Error())
+		return nil, fmt.Errorf("error making request: %w", err)
 	}
 
-	return NewContact(node.Name(), node.IPs(), node.Port()), nil
+	return newPeerContact(p.mesh, origin.Name(), node.Name(), node.IPs(), node.Port()), nil
 }
 
 func (p *Peer) Neighbors(origin domain.Peer) ([]domain.Contact, error) {
 
-	distant, ok := network.Get(p.Name())
+	distant, ok := p.mesh.GetFrom(origin.Name(), p.Name())
 	if !ok {
 		return nil, fmt.Errorf("error code: 404")
 	}
 
 	neighbors, err := distant.Neighbors(origin)
 	if err != nil {
-		return nil, fmt.Errorf("error making request: %s", err.Error())
+		return nil, fmt.Errorf("error making request: %w", err)
 	}
 
 	contacts := make([]domain.Contact, 0)
 	for _, neighbor := range neighbors {
-		contacts = append(contacts, NewContact(neighbor.Name(), neighbor.IPs(), neighbor.Port()))
+		contacts = append(contacts, newPeerContact(p.mesh, origin.Name(), neighbor.Name(), neighbor.IPs(), neighbor.Port()))
 	}
 
 	return contacts, nil
@@ -193,86 +243,114 @@ func (p *Peer) Neighbors(origin domain.Peer) ([]domain.Contact, error) {
 
 func (p *Peer) Random(origin domain.Peer) (domain.Contact, error) {
 
-	distant, ok := network.Get(p.Name())
+	distant, ok := p.mesh.GetFrom(origin.Name(), p.Name())
 	if !ok {
 		return nil, fmt.Errorf("error code: 404")
 	}
 
 	random, err := distant.Random(origin)
 	if err != nil {
-		return nil, fmt.Errorf("error making request: %s", err.Error())
+		return nil, fmt.Errorf("error making request: %w", err)
 	}
 
 	if random == nil {
 		return nil, fmt.Errorf("error no contact to propose")
 	}
 
-	return NewContact(random.Name(), random.IPs(), random.Port()), nil
+	return newPeerContact(p.mesh, origin.Name(), random.Name(), random.IPs(), random.Port()), nil
 }
 
-func (p *Peer) Transfer(origin domain.Peer, key domain.Key, items []*domain.Item) error {
+func (p *Peer) Transfer(origin domain.Peer, key domain.Key, items []*domain.Item) (string, error) {
 
-	if pct := network.transferDropPct.Load(); pct > 0 {
+	if pct := p.mesh.transferDropPct.Load(); pct > 0 {
 		if rand.Intn(100) < int(pct) {
-			network.transferDropped.Add(1)
-			return fmt.Errorf("simulated transfer drop")
+			p.mesh.transferDropped.Add(1)
+			return "", fmt.Errorf("simulated transfer drop")
 		}
 	}
 
-	distant, ok := network.Get(p.Name())
+	distant, ok := p.mesh.GetFrom(origin.Name(), p.Name())
+	if !ok {
+		return "", fmt.Errorf("error code: 404")
+	}
+	p.mesh.transferOK.Add(1)
+
+	ackedPeer, err := distant.Transfer(origin, key, items)
+	if err != nil {
+		return "", fmt.Errorf("error making request: %w", err)
+	}
+
+	return ackedPeer, nil
+}
+
+func (p *Peer) Claim(payload domain.ClaimPayload) error {
+	distant, ok := p.mesh.GetFrom(payload.Peer, p.Name())
 	if !ok {
 		return fmt.Errorf("error code: 404")
 	}
-	network.transferOK.Add(1)
-
-	err := distant.Transfer(origin, key, items)
-	if err != nil {
-		return fmt.Errorf("error making request: %s", err.Error())
-	}
-
-	return nil
+	origin := NewContact(payload.Peer, nil, 0)
+	return distant.Claim(origin, payload)
 }
 
-func (p *Peer) Get(collection string, location string, deep bool, hop int) (domain.Contact, *domain.Set, error) {
+func (p *Peer) Get(collection string, location string, deep bool, via domain.Visited, refresh bool) (domain.Contact, *domain.Set, error) {
 
-	distant, ok := network.Get(p.Name())
+	distant, ok := p.mesh.GetFrom(p.from, p.Name())
 	if !ok {
 		return nil, nil, fmt.Errorf("error code: 404")
 	}
 
-	contact, set, err := distant.Get(collection, location, deep, hop)
+	contact, set, err := distant.Get(collection, location, deep, via, refresh)
 	if err != nil {
-		return nil, nil, fmt.Errorf("error making request: %s", err.Error())
+		return nil, nil, fmt.Errorf("error making request: %w", err)
 	}
 
+	if contact != nil {
+		contact = newPeerContact(p.mesh, p.from, contact.Name(), contact.IPs(), contact.Port())
+	}
 	return contact, set, nil
 }
 
-func (p *Peer) New(item *domain.Item, root string, current string) error {
+func (p *Peer) Children(collection, parent string) (map[string]*domain.ChildEntry, error) {
+	distant, ok := p.mesh.GetFrom(p.from, p.Name())
+	if !ok {
+		return nil, fmt.Errorf("error code: 404")
+	}
+	return distant.Children(collection, parent)
+}
 
-	distant, ok := network.Get(p.Name())
+func (p *Peer) GetAggregates(collection string, locations []string) (map[string]*domain.Abelian, error) {
+	distant, ok := p.mesh.GetFrom(p.from, p.Name())
+	if !ok {
+		return nil, fmt.Errorf("error code: 404")
+	}
+	return distant.GetAggregates(collection, locations)
+}
+
+func (p *Peer) New(item *domain.Item, root string, via domain.Visited) error {
+
+	distant, ok := p.mesh.GetFrom(p.from, p.Name())
 	if !ok {
 		return fmt.Errorf("error code: 404")
 	}
 
-	err := distant.New(item, root, current)
+	err := distant.Handoff(item, root, via)
 	if err != nil {
-		return fmt.Errorf("error making request: %s", err.Error())
+		return fmt.Errorf("error making request: %w", err)
 	}
 
 	return err
 }
 
-func (p *Peer) Delete(item *domain.Item, root string, current string) error {
+func (p *Peer) Delete(item *domain.Item, root string, via domain.Visited) error {
 
-	distant, ok := network.Get(p.Name())
+	distant, ok := p.mesh.GetFrom(p.from, p.Name())
 	if !ok {
 		return fmt.Errorf("error code: 404")
 	}
 
-	err := distant.Delete(item, root, current)
+	err := distant.Delete(item, root, via)
 	if err != nil {
-		return fmt.Errorf("error making request: %s", err.Error())
+		return fmt.Errorf("error making request: %w", err)
 	}
 
 	return err

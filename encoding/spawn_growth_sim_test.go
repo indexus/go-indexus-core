@@ -32,27 +32,27 @@ type growNode struct {
 }
 
 type growSnap struct {
-	Step       int              `json:"step"`
-	Kind       string           `json:"kind"` // inject | split
-	TotalItems int              `json:"total_items"`
-	Nodes      int              `json:"nodes"`
-	PerNode    map[string]int   `json:"per_node"`
-	Moved      map[string]int   `json:"moved,omitempty"` // to → items received this split
-	Spawned    string           `json:"spawned,omitempty"`
-	Requester  string           `json:"requester,omitempty"`
-	PreferNear string           `json:"prefer_near,omitempty"`
-	MaxNode    string           `json:"max_node"`
-	MaxItems   int              `json:"max_items"`
-	Imbalance  float64          `json:"imbalance"` // max/mean
+	Step       int            `json:"step"`
+	Kind       string         `json:"kind"` // inject | split
+	TotalItems int            `json:"total_items"`
+	Nodes      int            `json:"nodes"`
+	PerNode    map[string]int `json:"per_node"`
+	Moved      map[string]int `json:"moved,omitempty"` // to → items received this split
+	Spawned    string         `json:"spawned,omitempty"`
+	Requester  string         `json:"requester,omitempty"`
+	PreferNear string         `json:"prefer_near,omitempty"`
+	MaxNode    string         `json:"max_node"`
+	MaxItems   int            `json:"max_items"`
+	Imbalance  float64        `json:"imbalance"` // max/mean
 }
 
 type growReport struct {
-	Strategy   string     `json:"strategy"`
-	FinalNodes []string   `json:"final_nodes"`
+	Strategy   string         `json:"strategy"`
+	FinalNodes []string       `json:"final_nodes"`
 	FinalLoad  map[string]int `json:"final_load"`
-	Snaps      []growSnap `json:"snaps"`
-	Splits     []growSnap `json:"splits"`
-	Summary    string     `json:"summary"`
+	Snaps      []growSnap     `json:"snaps"`
+	Splits     []growSnap     `json:"splits"`
+	Summary    string         `json:"summary"`
 }
 
 func TestSuccessiveSplitGrowth(t *testing.T) {
@@ -355,12 +355,12 @@ func TestSuccessiveSplitGrowthCompare(t *testing.T) {
 	hot := runGrowthSim(t, "hot_prefer_near")
 
 	type cmpRow struct {
-		Strategy string `json:"strategy"`
-		Nodes    int    `json:"nodes"`
-		Splits   int    `json:"splits"`
-		MaxPct   float64 `json:"max_pct"`
-		Imbalance float64 `json:"imbalance"`
-		EmptySpawns int `json:"empty_spawns"` // splits where spawned got <5% of moved total
+		Strategy    string  `json:"strategy"`
+		Nodes       int     `json:"nodes"`
+		Splits      int     `json:"splits"`
+		MaxPct      float64 `json:"max_pct"`
+		Imbalance   float64 `json:"imbalance"`
+		EmptySpawns int     `json:"empty_spawns"` // splits where spawned got <5% of moved total
 	}
 	summarize := func(r growReport) cmpRow {
 		total := 0
@@ -401,10 +401,10 @@ func TestSuccessiveSplitGrowthCompare(t *testing.T) {
 
 	// Emit compact trajectory for exclusive_gap (canvas feed).
 	type traj struct {
-		Step int            `json:"step"`
-		Kind string         `json:"kind"`
-		Loads map[string]int `json:"loads"`
-		Labels []string     `json:"labels"`
+		Step   int            `json:"step"`
+		Kind   string         `json:"kind"`
+		Loads  map[string]int `json:"loads"`
+		Labels []string       `json:"labels"`
 	}
 	// Stable short labels n0, n1, …
 	labelOf := map[string]string{}
@@ -448,15 +448,15 @@ func TestSuccessiveSplitGrowthCompare(t *testing.T) {
 				}
 				return m
 			}(),
-			"total": s.TotalItems,
+			"total":     s.TotalItems,
 			"imbalance": s.Imbalance,
 		})
 	}
 	payload := map[string]any{
-		"compare": out,
-		"summary": ex.Summary,
+		"compare":    out,
+		"summary":    ex.Summary,
 		"trajectory": trajs,
-		"splits": splitDetail,
+		"splits":     splitDetail,
 		"final": func() map[string]int {
 			m := map[string]int{}
 			for name, v := range ex.FinalLoad {

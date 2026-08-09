@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -54,19 +55,18 @@ func (p *Peer) Name() string {
 }
 
 type Service interface {
+	Name() string
 	Ping(domain.Contact) (domain.Contact, error)
 	Neighbors(domain.Peer) ([]domain.Contact, error)
 	Random(domain.Peer) (domain.Contact, error)
-	Transfer(domain.Peer, domain.Key, []*domain.Item) error
-	Get(string, string, bool, int) (domain.Contact, *domain.Set, error)
-	GetMultiple(string, []string, int, []func(*domain.Abelian) int, bool, int) ([]byte, error)
-	New(*domain.Item, string, string) error
-	Handoff(*domain.Item, string, string) error
-	Delete(*domain.Item, string, string) error
-	DelegationOffer(domain.Peer, domain.DelegationOfferPayload) error
-	WALDelta(domain.Peer, domain.WALDeltaPayload) error
-	CaughtUp(domain.Peer, domain.CaughtUpPayload) error
-	SwitchAck(domain.Peer, domain.SwitchAckPayload) error
+	Transfer(domain.Peer, domain.Key, []*domain.Item) (string, error)
+	Get(string, string, bool, domain.Visited, bool) (domain.Contact, *domain.Set, error)
+	GetMultiple(string, []string, int, []func(*domain.Abelian) int, bool, domain.Visited, bool, bool) ([]byte, error)
+	Children(string, string) (map[string]*domain.ChildEntry, error)
+	New(*domain.Item, string, domain.Visited) error
+	Handoff(*domain.Item, string, domain.Visited) error
+	Delete(*domain.Item, string, domain.Visited) error
+	Claim(domain.Peer, domain.ClaimPayload) error
 }
 
 type Handler struct {
@@ -95,21 +95,26 @@ func NewHttpHandler(tlsDir string, service Service, newContact func(string, map[
 	mux.HandleFunc("/neighbors", handler.Neighbors)
 	mux.HandleFunc("/random", handler.Random)
 	mux.HandleFunc("/transfer", handler.Transfer)
-	mux.HandleFunc("/delegation/offer", handler.DelegationOffer)
-	mux.HandleFunc("/delegation/wal-delta", handler.WALDelta)
-	mux.HandleFunc("/delegation/caught-up", handler.CaughtUp)
-	mux.HandleFunc("/delegation/switch-ack", handler.SwitchAck)
+	mux.HandleFunc("/claim", handler.Claim)
 
 	mux.HandleFunc("/set", handler.Get)
 	mux.HandleFunc("/sets", handler.GetMultiple)
+	mux.HandleFunc("/children", handler.Children)
+	mux.HandleFunc("/aggregates", handler.GetAggregates)
 	mux.HandleFunc("/item", handler.New)
 	mux.HandleFunc("/item/delete", handler.Delete)
 
+	// Browser SDKs (axios arraybuffer /sets) preflight with Accept besides
+	// Authorization. A narrow AllowedHeaders list makes rs/cors omit ACAO on
+	// OPTIONS, which Chrome reports as "blocked by CORS". Credentials cannot
+	// be true with AllowedOrigins "*" — Bearer auth does not need cookies.
+	// Ingress hint response headers must be exposed or axios cannot read them.
 	cors := cors.New(cors.Options{
 		AllowedOrigins:   []string{"*"},
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowedHeaders:   []string{"Content-Type", "Authorization"},
-		AllowCredentials: true,
+		AllowedHeaders:   []string{"*"},
+		ExposedHeaders:   []string{"X-Indexus-Ingress-Name", "X-Indexus-Ingress-IP", "X-Indexus-Ingress-Port"},
+		AllowCredentials: false,
 	})
 
 	handler.server = &http.Server{
@@ -338,7 +343,8 @@ func (h *Handler) Transfer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.Service.Transfer(origin, body.Key, body.Items); err != nil {
+	ackedPeer, err := h.Service.Transfer(origin, body.Key, body.Items)
+	if err != nil {
 		if errors.Is(err, domain.ErrLeaving) {
 
 			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
@@ -347,16 +353,16 @@ func (h *Handler) Transfer(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
 	}
-	w.WriteHeader(http.StatusCreated)
+	writeJSON(w, http.StatusCreated, map[string]string{"peer": ackedPeer})
 }
 
-func (h *Handler) DelegationOffer(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) Claim(w http.ResponseWriter, r *http.Request) {
 	if !h.requireClientScope(w, r, "write") {
 		return
 	}
 	var body struct {
-		Origin string                        `json:"origin"`
-		Offer  domain.DelegationOfferPayload `json:"offer"`
+		Origin  string              `json:"origin"`
+		Payload domain.ClaimPayload `json:"payload"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
@@ -367,83 +373,7 @@ func (h *Handler) DelegationOffer(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
 	}
-	if err := h.Service.DelegationOffer(origin, body.Offer); err != nil {
-		if errors.Is(err, domain.ErrLeaving) {
-			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
-			return
-		}
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
-		return
-	}
-	w.WriteHeader(http.StatusOK)
-}
-
-func (h *Handler) WALDelta(w http.ResponseWriter, r *http.Request) {
-	if !h.requireClientScope(w, r, "write") {
-		return
-	}
-	var body struct {
-		Origin string                 `json:"origin"`
-		Delta  domain.WALDeltaPayload `json:"delta"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
-		return
-	}
-	origin, err := NewPeer(body.Origin)
-	if err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
-		return
-	}
-	if err := h.Service.WALDelta(origin, body.Delta); err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
-		return
-	}
-	w.WriteHeader(http.StatusOK)
-}
-
-func (h *Handler) CaughtUp(w http.ResponseWriter, r *http.Request) {
-	if !h.requireClientScope(w, r, "write") {
-		return
-	}
-	var body struct {
-		Origin  string                 `json:"origin"`
-		Payload domain.CaughtUpPayload `json:"payload"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
-		return
-	}
-	origin, err := NewPeer(body.Origin)
-	if err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
-		return
-	}
-	if err := h.Service.CaughtUp(origin, body.Payload); err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
-		return
-	}
-	w.WriteHeader(http.StatusOK)
-}
-
-func (h *Handler) SwitchAck(w http.ResponseWriter, r *http.Request) {
-	if !h.requireClientScope(w, r, "write") {
-		return
-	}
-	var body struct {
-		Origin  string                  `json:"origin"`
-		Payload domain.SwitchAckPayload `json:"payload"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
-		return
-	}
-	origin, err := NewPeer(body.Origin)
-	if err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
-		return
-	}
-	if err := h.Service.SwitchAck(origin, body.Payload); err != nil {
+	if err := h.Service.Claim(origin, body.Payload); err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
 	}
@@ -456,9 +386,9 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	}
 	collection := r.URL.Query().Get("collection")
 	location := r.URL.Query().Get("location")
-	deep, hop := parseDeepHop(r)
+	deep, via, refresh := parseGetFlags(r)
 
-	contact, set, err := h.Service.Get(collection, location, deep, hop)
+	contact, set, err := h.Service.Get(collection, location, deep, via, refresh)
 	if err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
@@ -500,7 +430,8 @@ func (h *Handler) GetMultiple(w http.ResponseWriter, r *http.Request) {
 	}
 
 	locations := strings.Split(locationsParam, ",")
-	deep, hop := parseDeepHop(r)
+	deep, via, refresh := parseGetFlags(r)
+	envelope := parseEnvelopeFlag(r)
 
 	precision := 6
 
@@ -509,21 +440,23 @@ func (h *Handler) GetMultiple(w http.ResponseWriter, r *http.Request) {
 			return a.Count()
 		},
 		func(a *domain.Abelian) int {
-			return int(a.Metrics()[2])
+			return int(a.Metric(2))
 		},
 		func(a *domain.Abelian) int {
-			return int(1_000_000 * a.Metrics()[3])
+			return int(1_000_000 * a.Metric(3))
 		},
 		func(a *domain.Abelian) int {
-			return int(1_000_000 * a.Metrics()[4])
+			return int(1_000_000 * a.Metric(4))
 		},
 	}
 
-	sets, err := h.Service.GetMultiple(collection, locations, precision, properties, deep, hop)
+	sets, err := h.Service.GetMultiple(collection, locations, precision, properties, deep, via, refresh, envelope)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
 		return
 	}
+
+	h.writeIngressHint(w, r)
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	if _, err := w.Write(sets); err != nil {
@@ -531,9 +464,67 @@ func (h *Handler) GetMultiple(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// parseDeepHop: deep defaults true. hop defaults 8 when deep. Legacy depth:
-// depth=0 → deep=false; depth>0 → deep=true (hop still default unless set).
-func parseDeepHop(r *http.Request) (deep bool, hop int) {
+// writeIngressHint decodes the client session key and, when a closer peer
+// exists, advertises it so sticky browsers can migrate without rediscovery.
+func (h *Handler) writeIngressHint(w http.ResponseWriter, r *http.Request) {
+	keyRaw := r.Header.Get("X-Indexus-Routing-Key")
+	if keyRaw == "" {
+		return
+	}
+	key, ok := decodeRoutingKey(keyRaw)
+	if !ok {
+		return
+	}
+	hintSvc, ok := h.Service.(interface {
+		RoutingHint([]byte) domain.Contact
+	})
+	if !ok {
+		return
+	}
+	hint := hintSvc.RoutingHint(key)
+	if hint == nil {
+		return
+	}
+	w.Header().Set("X-Indexus-Ingress-Name", hint.Name())
+	w.Header().Set("X-Indexus-Ingress-IP", hint.IP())
+	w.Header().Set("X-Indexus-Ingress-Port", strconv.Itoa(hint.Port()))
+}
+
+// decodeRoutingKey accepts the SDK's base64url(session bytes). Falls back to
+// raw bytes only when the value is not valid base64url, so older probes that
+// sent opaque strings keep a defined (if imperfect) behaviour.
+func decodeRoutingKey(raw string) ([]byte, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, false
+	}
+	if key, err := base64.RawURLEncoding.DecodeString(raw); err == nil && len(key) > 0 {
+		return key, true
+	}
+	padded := raw
+	if m := len(raw) % 4; m != 0 {
+		padded += strings.Repeat("=", 4-m)
+	}
+	if key, err := base64.URLEncoding.DecodeString(padded); err == nil && len(key) > 0 {
+		return key, true
+	}
+	return []byte(raw), true
+}
+
+func parseEnvelopeFlag(r *http.Request) bool {
+	raw := r.URL.Query().Get("envelope")
+	if raw == "" {
+		return false
+	}
+	switch strings.ToLower(raw) {
+	case "1", "true", "yes":
+		return true
+	default:
+		return false
+	}
+}
+
+func parseGetFlags(r *http.Request) (deep bool, via domain.Visited, refresh bool) {
 	deep = true
 	if raw := r.URL.Query().Get("deep"); raw != "" {
 		switch strings.ToLower(raw) {
@@ -547,16 +538,84 @@ func parseDeepHop(r *http.Request) (deep bool, hop int) {
 			deep = false
 		}
 	}
-	hop = 0
-	if deep {
-		hop = 8
-		if h := r.URL.Query().Get("hop"); h != "" {
-			if v, err := strconv.Atoi(h); err == nil {
-				hop = v
-			}
+	via = domain.ParseVisited(r.URL.Query().Get("via"))
+	if raw := r.URL.Query().Get("refresh"); raw != "" {
+		switch strings.ToLower(raw) {
+		case "1", "true", "yes":
+			refresh = true
 		}
 	}
-	return deep, hop
+	return deep, via, refresh
+}
+
+func childWire(entry *domain.ChildEntry) map[string]any {
+	if entry == nil {
+		return map[string]any{}
+	}
+	out := map[string]any{}
+	if entry.Abelian != nil {
+		out["count"] = entry.Abelian.Count()
+	}
+	if entry.RedirectName != "" {
+		out["redirect_name"] = entry.RedirectName
+	}
+	if entry.RedirectIP != "" {
+		out["redirect_ip"] = entry.RedirectIP
+	}
+	if entry.RedirectPort > 0 {
+		out["redirect_port"] = entry.RedirectPort
+	}
+	if len(entry.RedirectIPs) > 0 {
+		out["redirect_ips"] = entry.RedirectIPs
+	}
+	return out
+}
+
+func (h *Handler) Children(w http.ResponseWriter, r *http.Request) {
+	if !h.requireClientScope(w, r, "read") {
+		return
+	}
+	collection := r.URL.Query().Get("collection")
+	parent := r.URL.Query().Get("location")
+	entries, err := h.Service.Children(collection, parent)
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		return
+	}
+	if entries == nil {
+		entries = map[string]*domain.ChildEntry{}
+	}
+	wire := make(map[string]any, len(entries))
+	for loc, entry := range entries {
+		wire[loc] = childWire(entry)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"parent": parent, "children": wire})
+}
+
+func (h *Handler) GetAggregates(w http.ResponseWriter, r *http.Request) {
+	if !h.requireClientScope(w, r, "read") {
+		return
+	}
+	collection := r.URL.Query().Get("collection")
+	locParam := r.URL.Query().Get("location")
+	if collection == "" || locParam == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "collection and location are required"})
+		return
+	}
+	aggSvc, ok := h.Service.(interface {
+		GetAggregates(string, []string) (map[string]*domain.Abelian, error)
+	})
+	if !ok {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "aggregates not supported"})
+		return
+	}
+	locations := strings.Split(locParam, ",")
+	aggs, err := aggSvc.GetAggregates(collection, locations)
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"aggregates": aggs})
 }
 
 func (h *Handler) New(w http.ResponseWriter, r *http.Request) {
@@ -566,17 +625,19 @@ func (h *Handler) New(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Item    *domain.Item `json:"item"`
 		Root    string       `json:"root"`
-		Current string       `json:"current"`
+		Current string       `json:"current"` // legacy SDK field; ignored
+		Via     string       `json:"via"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
 		return
 	}
+	via := domain.ParseVisited(body.Via)
 	accept := h.Service.New
 	if r.Header.Get(domain.HandoffHeader) != "" {
 		accept = h.Service.Handoff
 	}
-	if err := accept(body.Item, body.Root, body.Current); err != nil {
+	if err := accept(body.Item, body.Root, via); err != nil {
 
 		w.Header().Set("Retry-After", "1")
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
@@ -593,13 +654,14 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Item    *domain.Item `json:"item"`
 		Root    string       `json:"root"`
-		Current string       `json:"current"`
+		Current string       `json:"current"` // legacy SDK field; ignored
+		Via     string       `json:"via"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
 		return
 	}
-	if err := h.Service.Delete(body.Item, body.Root, body.Current); err != nil {
+	if err := h.Service.Delete(body.Item, body.Root, domain.ParseVisited(body.Via)); err != nil {
 		w.Header().Set("Retry-After", "1")
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return

@@ -18,6 +18,37 @@ func TestInsertWindowSum(t *testing.T) {
 	}
 }
 
+// INDEXUS_DISK_MIN_FREE_PCT=0 must disable the disk signal, not fall back to 35.
+func TestDiskMinFreeZeroFromEnvDisablesSignal(t *testing.T) {
+	t.Setenv("INDEXUS_DISK_MIN_FREE_PCT", "0")
+	var ups atomic.Int64
+	a := core.NewAutoscaleController(core.AutoscaleConfig{
+		Enabled:      true,
+		Role:         "bootstrap",
+		Window:       time.Minute,
+		Cooldown:     time.Hour,
+		PressureHold: time.Millisecond,
+		MemLimitPct:  99,
+		CPULimitPct:  99,
+		MemRisePct:   1000,
+		RiseHold:     time.Hour,
+	})
+	if got := a.Snapshot()["disk_min_free"]; got != float64(0) {
+		t.Fatalf("disk_min_free=%v want 0", got)
+	}
+	hotDisk := core.PressureInput{
+		SelfName:  "self",
+		Resources: core.ResourceSample{DiskFreePct: 1, DiskOK: true, MemPct: 1},
+	}
+	for i := 0; i < 5; i++ {
+		a.Tick(hotDisk, func(core.ScaleUpRequest) error { ups.Add(1); return nil }, nil)
+		time.Sleep(5 * time.Millisecond)
+	}
+	if ups.Load() != 0 {
+		t.Fatalf("disk=0 still triggered scale-up: ups=%d reason=%v", ups.Load(), a.Snapshot()["last_reason"])
+	}
+}
+
 func TestInsertWindowShortExpires(t *testing.T) {
 	w := core.NewInsertWindow(2 * time.Second)
 	w.Record(7)
@@ -183,12 +214,13 @@ func TestAutoscalePreferNearUsesLoadSplitNotHeat(t *testing.T) {
 	a.SetNearBuilder(func(spawnN int, fallback string) []string {
 		return []string{"dichotomyKey000000"}
 	})
-	var got core.ScaleUpRequest
+	var request atomic.Value
 	a.Tick(memHot(80), func(req core.ScaleUpRequest) error {
-		got = req
+		request.Store(req)
 		return nil
 	}, nil)
 	time.Sleep(30 * time.Millisecond)
+	got, _ := request.Load().(core.ScaleUpRequest)
 	if got.PreferNear != "dichotomyKey000000" {
 		t.Fatalf("prefer_near=%q want dichotomy split, not hot prefix", got.PreferNear)
 	}
@@ -387,15 +419,15 @@ func TestAutoscaleHardMemTriggers(t *testing.T) {
 func TestAutoscaleDownNeedsHold(t *testing.T) {
 	var downs atomic.Int64
 	a := core.NewAutoscaleController(core.AutoscaleConfig{
-		Enabled:            true,
-		Role:               "spawned",
-		DownThreshold:      5,
-		DownHold:           80 * time.Millisecond,
-		Window:             time.Minute,
-		Cooldown:           0,
-		QueueAbsThreshold:  10000,
-		MemLimitPct:        99,
-		DiskMinFreePct:     1,
+		Enabled:           true,
+		Role:              "spawned",
+		DownThreshold:     5,
+		DownHold:          80 * time.Millisecond,
+		Window:            time.Minute,
+		Cooldown:          0,
+		QueueAbsThreshold: 10000,
+		MemLimitPct:       99,
+		DiskMinFreePct:    1,
 	})
 	for i := 0; i < 6; i++ {
 		a.RecordInsert()
@@ -405,15 +437,15 @@ func TestAutoscaleDownNeedsHold(t *testing.T) {
 		t.Fatal("should not downscale while still hot")
 	}
 	a = core.NewAutoscaleController(core.AutoscaleConfig{
-		Enabled:            true,
-		Role:               "spawned",
-		DownThreshold:      5,
-		DownHold:           80 * time.Millisecond,
-		Window:             2 * time.Second,
-		Cooldown:           0,
-		QueueAbsThreshold:  10000,
-		MemLimitPct:        99,
-		DiskMinFreePct:     1,
+		Enabled:           true,
+		Role:              "spawned",
+		DownThreshold:     5,
+		DownHold:          80 * time.Millisecond,
+		Window:            2 * time.Second,
+		Cooldown:          0,
+		QueueAbsThreshold: 10000,
+		MemLimitPct:       99,
+		DiskMinFreePct:    1,
 	})
 	for i := 0; i < 6; i++ {
 		a.RecordInsert()
@@ -441,15 +473,15 @@ func TestAutoscaleDownNeedsHold(t *testing.T) {
 func TestAutoscaleDownSkipsVirgin(t *testing.T) {
 	var downs atomic.Int64
 	a := core.NewAutoscaleController(core.AutoscaleConfig{
-		Enabled:            true,
-		Role:               "spawned",
-		DownThreshold:      5,
-		DownHold:           time.Millisecond,
-		Window:             time.Minute,
-		Cooldown:           0,
-		QueueAbsThreshold:  10000,
-		MemLimitPct:        99,
-		DiskMinFreePct:     1,
+		Enabled:           true,
+		Role:              "spawned",
+		DownThreshold:     5,
+		DownHold:          time.Millisecond,
+		Window:            time.Minute,
+		Cooldown:          0,
+		QueueAbsThreshold: 10000,
+		MemLimitPct:       99,
+		DiskMinFreePct:    1,
 	})
 	for i := 0; i < 20; i++ {
 		a.Tick(pressure(0), nil, func() error { downs.Add(1); return nil })
@@ -463,15 +495,15 @@ func TestAutoscaleDownSkipsVirgin(t *testing.T) {
 func TestAutoscaleDownWithPendingQueue(t *testing.T) {
 	var downs atomic.Int64
 	a := core.NewAutoscaleController(core.AutoscaleConfig{
-		Enabled:            true,
-		Role:               "spawned",
-		DownThreshold:      5,
-		DownHold:           50 * time.Millisecond,
-		Window:             2 * time.Second,
-		Cooldown:           0,
-		QueueAbsThreshold:  100000,
-		MemLimitPct:        99,
-		DiskMinFreePct:     1,
+		Enabled:           true,
+		Role:              "spawned",
+		DownThreshold:     5,
+		DownHold:          50 * time.Millisecond,
+		Window:            2 * time.Second,
+		Cooldown:          0,
+		QueueAbsThreshold: 100000,
+		MemLimitPct:       99,
+		DiskMinFreePct:    1,
 	})
 	for i := 0; i < 6; i++ {
 		a.RecordInsert()

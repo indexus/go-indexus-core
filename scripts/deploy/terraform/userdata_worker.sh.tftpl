@@ -40,8 +40,6 @@ Wants=network-online.target
 Environment=HOME=/var/lib/indexus
 Environment=AWS_REGION=${region}
 Environment=SNAPSHOT_BUCKET=${bucket}
-Environment=INDEXUS_DELEGATION_S3=1
-Environment=INDEXUS_TRANSFER_THRESHOLD=${transfer_threshold}
 Environment=INDEXUS_ZONE_SNAP_MIN=30s
 Environment=INDEXUS_STORAGE=/var/lib/indexus/backup
 Environment=INDEXUS_LEAVE_DIR=/var/lib/indexus/leave

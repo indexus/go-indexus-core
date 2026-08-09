@@ -25,28 +25,51 @@ func (n *Node) Registered() ([]domain.Contact, error) {
 	return n.traverseRegistered(true), nil
 }
 
+// Ownership returns the last cached ownership map. It never blocks on
+// Collection.mu: a TryRLock refresh is attempted, and on contention the
+// previous snapshot is served (empty if none yet).
 func (n *Node) Ownership() (map[string]map[string]map[string]any, error) {
-	collections := make(map[string]map[string]map[string]any)
-
-	for _, collection := range n.collections.List() {
-		collections[collection.Name()] = make(map[string]map[string]any)
-
-		collection.Browse(
-			func(ownership string) {
-				collections[collection.Name()][ownership] = make(map[string]any)
-			},
-			func(ownership, delegation string) {
-				collections[collection.Name()][ownership][delegation] = nil
-			},
-		)
+	n.tryRefreshOwnershipSnap()
+	if v := n.ownershipSnap.Load(); v != nil {
+		return v.(map[string]map[string]map[string]any), nil
 	}
-	return collections, nil
+	return map[string]map[string]map[string]any{}, nil
 }
 
+// tryRefreshOwnershipSnap copies Collection.owned under TryRLock per collection.
+// Returns false if any collection was write-locked (keeps the previous snap).
+func (n *Node) tryRefreshOwnershipSnap() bool {
+	out := make(map[string]map[string]map[string]any)
+	for _, collection := range n.collections.List() {
+		snap, ok := collection.TryOwnershipBrowse()
+		if !ok {
+			return false
+		}
+		out[collection.Name()] = snap
+	}
+	n.ownershipSnap.Store(out)
+	return true
+}
+
+// OwnershipStats returns collection/zone counts from the XOR owned index.
+// Used by /status so monitoring never takes Collection.mu (Browse/Traverse)
+// and cannot stall the data-plane protocol under load.
+func (n *Node) OwnershipStats() (collections, zones int) {
+	seen := make(map[string]struct{})
+	n.owned.Traverse(0, encoding.BASE64.NewID(), func(_ int, _ []byte, keys map[domain.Key]any) {
+		for key := range keys {
+			zones++
+			seen[key.Collection] = struct{}{}
+		}
+	})
+	return len(seen), zones
+}
+
+// Count walks owned zones under Collection RLock and updates the Items atomics
+// plus the ownership snapshot. Prefer Items()/Ownership() on request paths —
+// this is for MeasureItems / explicit exact recount only.
 func (n *Node) Count() (int, error) {
-	pending := n.pendingInboundKeySet()
 	total := 0
-	prep := 0
 
 	n.owned.Traverse(0, encoding.BASE64.NewID(), func(i int, b []byte, keys map[domain.Key]any) {
 		for key := range keys {
@@ -54,42 +77,26 @@ func (n *Node) Count() (int, error) {
 			if !exist {
 				continue
 			}
-			count := 0
-			collection.Traverse(
-				key.Location,
-				func(s string, a *domain.Abelian) {},
-				func(s1, s2, s3 string, a *domain.Abelian) { count++ },
-			)
-			if keyInPendingInbound(pending, key) {
-				prep += count
-				continue
-			}
+			count := collection.ItemCount(key.Location)
 			total += count
 		}
 	})
 	n.items.Store(int64(total))
-	n.itemsPrep.Store(int64(prep))
+	_ = n.tryRefreshOwnershipSnap()
 	return total, nil
 }
 
+// Items returns the last background MeasureItems/Count total. Never walks the
+// collection (that is /count or MeasureItems) so monitoring cannot take
+// Collection.mu on the request path.
 func (n *Node) Items() int {
-	if n.items.Load() == 0 && n.itemsPrep.Load() == 0 && n.lastCountAt.Load() == 0 {
-		total, _ := n.Count()
-		n.lastCountAt.Store(time.Now().UnixNano())
-		return total
-	}
 	return int(n.items.Load())
 }
 
-// ItemsPreparing is the item count under inbound snapshot-delegation sessions
-// (loaded, not yet SwitchAck'd). Official Items() excludes these so the donor
-// remains the serving count until the receiver is ready.
+// ItemsPreparing is retained for monitoring compatibility. Repeatable
+// handoffs have no mounted pre-ownership session, so it is always zero.
 func (n *Node) ItemsPreparing() int {
-	if n.items.Load() == 0 && n.itemsPrep.Load() == 0 && n.lastCountAt.Load() == 0 {
-		_, _ = n.Count()
-		n.lastCountAt.Store(time.Now().UnixNano())
-	}
-	return int(n.itemsPrep.Load())
+	return 0
 }
 
 func (n *Node) MeasureItems() {
@@ -108,16 +115,11 @@ func (n *Node) Check() []string {
 			func(ownership string) {
 				ownerships = append(ownerships, ownership)
 			},
-			func(ownership, delegation string) {},
+			func(_, _ string, _ domain.Handoff) {},
 		)
 
 		for _, ownership := range ownerships {
-			id, err := encoding.MergeEncodings(
-				encoding.BASE64,
-				encoding.BASE64,
-				ownership,
-				collection.Name(),
-			)
+			id, err := zoneKeyID(collection.Name(), ownership)
 			if err != nil {
 				continue
 			}
@@ -157,17 +159,14 @@ func (n *Node) Queue() int {
 
 func (n *Node) SnapshotInfo() map[string]any {
 	info := map[string]any{
-		"store":              n.Store() != nil,
-		"delegation":         n.Delegation(), // S3 / DirStore snapshot path enabled
-		"delegation_size":    0,               // -delegation / INDEXUS_DELEGATION
-		"transfer_threshold": TransferThreshold(),
-		"delegation_timeout": DelegationTimeout().String(),
-		"transfer_timeout":   ClassicTransferTimeout().String(),
-		"deleg_in":           n.pendingInbound(),
-		"deleg_out":          0,
-		"dirty":              0,
-		"snapped":            0,
-		"wal_segments":       0,
+		"store":           n.Store() != nil,
+		"delegation":      false, // legacy status key; five-state S3 path removed
+		"delegation_size": 0,     // -delegation / INDEXUS_DELEGATION
+		"deleg_in":        0,
+		"deleg_out":       0,
+		"dirty":           0,
+		"snapped":         0,
+		"wal_segments":    0,
 	}
 	if n == nil {
 		return info
@@ -175,15 +174,6 @@ func (n *Node) SnapshotInfo() map[string]any {
 	if n.settings != nil {
 		info["delegation_size"] = n.settings.DelegationSize()
 	}
-	n.delegMu.Lock()
-	out := 0
-	for _, s := range n.delegOut {
-		if s.State != delegSwitched && s.State != delegCancelled {
-			out++
-		}
-	}
-	n.delegMu.Unlock()
-	info["deleg_out"] = out
 	if n.zoneSnap != nil {
 		n.zoneSnap.mu.Lock()
 		info["dirty"] = len(n.zoneSnap.dirty)

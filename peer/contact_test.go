@@ -16,21 +16,26 @@ type fakeOrigin struct {
 	port int
 }
 
-func (f *fakeOrigin) ID() []byte                                             { return nil }
-func (f *fakeOrigin) Name() string                                           { return f.name }
-func (f *fakeOrigin) IPs() map[string]any                                    { return f.ips }
-func (f *fakeOrigin) Port() int                                              { return f.port }
-func (f *fakeOrigin) IP() string                                             { return "" }
-func (f *fakeOrigin) Host() string                                           { return "" }
-func (f *fakeOrigin) Ping(domain.Contact) (domain.Contact, error)            { return nil, nil }
-func (f *fakeOrigin) Neighbors(domain.Peer) ([]domain.Contact, error)        { return nil, nil }
-func (f *fakeOrigin) Random(domain.Peer) (domain.Contact, error)             { return nil, nil }
-func (f *fakeOrigin) Transfer(domain.Peer, domain.Key, []*domain.Item) error { return nil }
-func (f *fakeOrigin) Get(string, string, bool, int) (domain.Contact, *domain.Set, error) {
+func (f *fakeOrigin) ID() []byte                                      { return nil }
+func (f *fakeOrigin) Name() string                                    { return f.name }
+func (f *fakeOrigin) IPs() map[string]any                             { return f.ips }
+func (f *fakeOrigin) Port() int                                       { return f.port }
+func (f *fakeOrigin) IP() string                                      { return "" }
+func (f *fakeOrigin) Host() string                                    { return "" }
+func (f *fakeOrigin) Ping(domain.Contact) (domain.Contact, error)     { return nil, nil }
+func (f *fakeOrigin) Neighbors(domain.Peer) ([]domain.Contact, error) { return nil, nil }
+func (f *fakeOrigin) Random(domain.Peer) (domain.Contact, error)      { return nil, nil }
+func (f *fakeOrigin) Transfer(domain.Peer, domain.Key, []*domain.Item) (string, error) {
+	return f.name, nil
+}
+func (f *fakeOrigin) Get(string, string, bool, domain.Visited, bool) (domain.Contact, *domain.Set, error) {
 	return nil, nil, nil
 }
-func (f *fakeOrigin) New(*domain.Item, string, string) error    { return nil }
-func (f *fakeOrigin) Delete(*domain.Item, string, string) error { return nil }
+func (f *fakeOrigin) Children(string, string) (map[string]*domain.ChildEntry, error) {
+	return nil, nil
+}
+func (f *fakeOrigin) New(*domain.Item, string, domain.Visited) error    { return nil }
+func (f *fakeOrigin) Delete(*domain.Item, string, domain.Visited) error { return nil }
 
 func TestNewContactSetsPrimaryIP(t *testing.T) {
 	c := NewContact("PeerAAAAAAAAAAAA", map[string]any{"127.0.0.1": nil}, 21010).(*Contact)
@@ -127,11 +132,108 @@ func TestNewMaps503ToErrPeerBusy(t *testing.T) {
 	})
 
 	item := &domain.Item{Collection: "c", Location: "a", Id: "x", Metrics: []float64{1}}
-	err := c.New(item, "@", "a")
+	err := c.New(item, "@", nil)
 	if err == nil {
 		t.Fatal("New must surface 503 as an error")
 	}
 	if !errors.Is(err, domain.ErrPeerBusy) {
 		t.Fatalf("New: %v, want ErrPeerBusy", err)
+	}
+}
+
+func TestRandomDecodesHandlerPayload(t *testing.T) {
+	_, c := newServerContact(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/random" {
+			t.Fatalf("path=%s want /random", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"random": map[string]any{
+				"name": "PeerBBBBBBBBBBBB",
+				"ips":  map[string]any{"10.0.0.2": nil},
+				"ip":   "10.0.0.2",
+				"port": 21001,
+			},
+		})
+	})
+
+	got, err := c.Random(&fakeOrigin{name: "self", ips: map[string]any{"127.0.0.1": nil}, port: 1})
+	if err != nil {
+		t.Fatalf("Random: %v", err)
+	}
+	if got == nil || got.Name() != "PeerBBBBBBBBBBBB" {
+		t.Fatalf("Random=%v want PeerBBBBBBBBBBBB", got)
+	}
+}
+
+func TestRandomNullBodyIsNilInterface(t *testing.T) {
+	_, c := newServerContact(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"random":null}`))
+	})
+	got, err := c.Random(&fakeOrigin{name: "self", ips: map[string]any{"127.0.0.1": nil}, port: 1})
+	if err != nil {
+		t.Fatalf("Random: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("typed-nil Contact leaked as non-nil interface: %#v", got)
+	}
+}
+
+func TestGetAggregatesRoundTrip(t *testing.T) {
+	want := domain.NewAbelian(5, []float64{5})
+	_, c := newServerContact(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/aggregates" {
+			t.Fatalf("path=%s want /aggregates", r.URL.Path)
+		}
+		if got := r.URL.Query().Get("collection"); got != "demo" {
+			t.Fatalf("collection=%q", got)
+		}
+		if got := r.URL.Query().Get("location"); got != "a,b" {
+			t.Fatalf("location=%q want a,b", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"aggregates": map[string]*domain.Abelian{"a": want},
+		})
+	})
+
+	aggs, err := c.GetAggregates("demo", []string{"a", "b"})
+	if err != nil {
+		t.Fatalf("GetAggregates: %v", err)
+	}
+	if aggs["a"] == nil || aggs["a"].Count() != 5 {
+		t.Fatalf("aggregates=%v want a=5", aggs)
+	}
+	if _, ok := aggs["b"]; ok {
+		t.Fatal("unowned location must be omitted")
+	}
+}
+
+func TestTransferRequiresNominativeAck(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		ackPeer string
+		wantErr bool
+	}{
+		{name: "matching receiver", ackPeer: "peer"},
+		{name: "relayed receiver", ackPeer: "other"},
+		{name: "empty receiver", ackPeer: "", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, c := newServerContact(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusCreated)
+				_ = json.NewEncoder(w).Encode(map[string]string{"peer": tc.ackPeer})
+			})
+			origin := &fakeOrigin{name: "self", ips: map[string]any{"127.0.0.1": nil}, port: 1}
+			_, err := c.Transfer(origin, domain.Key{Collection: "c", Location: "a"}, nil)
+			if tc.wantErr && err == nil {
+				t.Fatal("Transfer accepted an empty nominative ACK")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("Transfer: %v", err)
+			}
+		})
 	}
 }

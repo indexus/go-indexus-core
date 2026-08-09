@@ -23,30 +23,52 @@ func NewSet() *Set {
 	}
 }
 
+// NewSetFromAbelian builds the summary-only Set that mesh aggregate pulls use
+// when no child list ships with the response. The aggregate goes straight to
+// agg: every character of the alphabet is a legal location, so no reserved key
+// can stand for "the total" without shadowing a real zone.
+func NewSetFromAbelian(a *Abelian) *Set {
+	s := NewSet()
+	if a != nil {
+		s.agg = a.Clone()
+	}
+	return s
+}
+
 func (s *Set) List() map[string]*Abelian {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	result := make(map[string]*Abelian)
-	for key, value := range s.list {
-		result[key] = value
-	}
-	return result
+	return s.snapshot()
 }
 
-// MarshalJSON takes a shallow snapshot under the lock then encodes unlocked
-// so /set responses do not hold Set.mu across json.Marshal.
+// MarshalJSON snapshots under the lock then encodes unlocked, so /set responses
+// do not hold Set.mu across json.Marshal.
 func (s *Set) MarshalJSON() ([]byte, error) {
 	if s == nil {
 		return []byte("null"), nil
 	}
 	s.mu.Lock()
-	snap := make(map[string]*Abelian, len(s.list))
-	for k, v := range s.list {
-		snap[k] = v
-	}
+	snap := s.snapshot()
 	s.mu.Unlock()
 	return json.Marshal(snap)
+}
+
+// snapshot copies the values, not just the map. Incr sums into the Abelian in
+// place, so handing the stored pointers out and reading them after the lock is
+// released lets a caller see a count from before an increment beside metrics
+// from after it — a torn aggregate, on the path that answers reads.
+// Callers hold s.mu.
+func (s *Set) snapshot() map[string]*Abelian {
+	out := make(map[string]*Abelian, len(s.list))
+	for key, value := range s.list {
+		if value == nil {
+			out[key] = nil
+			continue
+		}
+		out[key] = value.Clone()
+	}
+	return out
 }
 
 func (s *Set) Traverse(process func(string, *Abelian)) {
@@ -75,6 +97,14 @@ func (s *Set) Put(value string, abelian *Abelian) {
 	defer s.mu.Unlock()
 
 	s.put(value, abelian)
+}
+
+// IsSummaryPlaceholder reports a set carrying a total but no children — an
+// /aggregates answer, which is a count, not a child list to serve.
+func (s *Set) IsSummaryPlaceholder() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.list) == 0 && s.agg != nil
 }
 
 func (s *Set) Count() int {
@@ -269,6 +299,10 @@ func (s *Set) shrink(base Encoder, sets map[string]*Set, key string, max int, le
 	}
 
 	for current, abelian := range s.list {
+		// Drop corrupt self-aggregates (set location used as a child key).
+		if current == key {
+			continue
+		}
 
 		if abelian.Count() > 1 {
 			list[current] = abelian
@@ -281,14 +315,21 @@ func (s *Set) shrink(base Encoder, sets map[string]*Set, key string, max int, le
 			location = current[:idx]
 		}
 
-		if len(location) <= precision {
+		// A leaf already at this set's own location cannot split further. Root
+		// shrinks with precision=0, so without this the child of "@" is "@"
+		// itself: endless recursion plus a self-key aggregate that later
+		// crashes Collection.traverse / Snapshot.
+		child := ""
+		if location != key && len(location) > precision {
+			child = location[:precision+1]
+		}
+		if child == "" || child == key {
 			list[current] = abelian
 			if leaves != nil {
 				leaves[current] = key
 			}
 			continue
 		}
-		child := location[:precision+1]
 
 		if set, ok := sets[child]; ok {
 			if set.add(current, abelian, max) {

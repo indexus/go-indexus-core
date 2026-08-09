@@ -11,47 +11,35 @@ import (
 
 	"errors"
 	"fmt"
-	"github.com/indexus/go-indexus-core/domain"
-	"github.com/indexus/go-indexus-core/encoding"
 	"testing"
 	"time"
+
+	"github.com/indexus/go-indexus-core/domain"
+	"github.com/indexus/go-indexus-core/encoding"
 )
 
 func TestWriteRejectsUnwalkableKey(t *testing.T) {
 	node := newNodeOn(t, &memStorage{}, 64)
 	item := &domain.Item{Collection: "demo", Location: "aa", Id: "x", Metrics: []float64{1}}
-
-	for name, key := range map[string]struct{ root, current string }{
-		"empty root and current": {"", ""},
-		"empty root":             {"", "aa"},
-		"empty current":          {encoding.BASE64.Root(), ""},
-		"root outside current":   {"zz", "aa"},
-	} {
+	for name, root := range map[string]string{"empty root": "", "root outside location": "zz"} {
 		t.Run(name, func(t *testing.T) {
-			if err := node.New(item, key.root, key.current); err == nil {
-				t.Fatal("New accepted a key it cannot walk")
-			}
-			if err := node.Delete(item, key.root, key.current); err == nil {
-				t.Fatal("Delete accepted a key it cannot walk")
+			if err := node.New(item, root, nil); err == nil {
+				t.Fatalf("New accepted %s", name)
 			}
 		})
 	}
-
-	if err := node.New(item, encoding.BASE64.Root(), "aa"); err != nil {
-		t.Fatalf("New on a walkable key: %v", err)
-	}
-	if err := node.New(item, "a", "aa"); err != nil {
-		t.Fatalf("New below an ancestor root: %v", err)
+	if err := node.New(item, encoding.BASE64.Root(), nil); err != nil {
+		t.Fatalf("New under root: %v", err)
 	}
 }
 
 func TestWriteRejectsItemWithoutLocation(t *testing.T) {
 	node := newNodeOn(t, &memStorage{}, 64)
 
-	if err := node.New(&domain.Item{Collection: "demo", Id: "x"}, encoding.BASE64.Root(), "aa"); err == nil {
+	if err := node.New(&domain.Item{Collection: "demo", Id: "x"}, encoding.BASE64.Root(), nil); err == nil {
 		t.Fatal("New accepted an item without location")
 	}
-	if err := node.New(nil, encoding.BASE64.Root(), "aa"); err == nil {
+	if err := node.New(nil, encoding.BASE64.Root(), nil); err == nil {
 		t.Fatal("New accepted a nil item")
 	}
 }
@@ -65,7 +53,7 @@ func TestWriteRejectsUnkeyableItem(t *testing.T) {
 	}
 
 	short := &domain.Item{Collection: "demo", Location: location, Id: "x", Metrics: []float64{1}}
-	if err := node.New(short, encoding.BASE64.Root(), location); err == nil {
+	if err := node.New(short, encoding.BASE64.Root(), nil); err == nil {
 		t.Fatal("New accepted a location its collection cannot key")
 	}
 
@@ -74,13 +62,13 @@ func TestWriteRejectsUnkeyableItem(t *testing.T) {
 		t.Fatal(err)
 	}
 	full := &domain.Item{Collection: collection, Location: location, Id: "x", Metrics: []float64{1}}
-	if err := node.New(full, encoding.BASE64.Root(), location); err != nil {
+	if err := node.New(full, encoding.BASE64.Root(), nil); err != nil {
 		t.Fatalf("New on a keyable item: %v", err)
 	}
 
 	wide := location + location
 	over := &domain.Item{Collection: wide, Location: wide, Id: "x", Metrics: []float64{1}}
-	if err := node.New(over, encoding.BASE64.Root(), wide); err == nil {
+	if err := node.New(over, encoding.BASE64.Root(), nil); err == nil {
 		t.Fatal("New accepted an identifier wider than the key space")
 	}
 }
@@ -94,18 +82,27 @@ func transferItems() []*domain.Item {
 
 var transferKey = domain.Key{Collection: "demo", Location: "a"}
 
-func TestTransferFailsWhenQueueIsFull(t *testing.T) {
+func TestTransferAppliesEvenWhenIngressQueueIsFull(t *testing.T) {
 	node := newNodeOn(t, &memStorage{}, 64)
 
 	node.settings.SetQueueMax(1)
 	for i := 0; i < node.settings.peerQueueMax; i++ {
-		if err := node.Handoff(item(fmt.Sprintf("filler-%d", i)), "@", "aa"); err != nil {
+		if err := node.Handoff(item(fmt.Sprintf("filler-%d", i)), "@", nil); err != nil {
 			t.Fatalf("filling the queue: %v", err)
 		}
 	}
 
-	if err := node.Transfer(nil, transferKey, transferItems()); err == nil {
-		t.Fatal("Transfer acknowledged items it could not enqueue")
+	// Classic zone Transfer must not compete with the ingress queue — otherwise
+	// PreferNear handoffs stall Items() and freeze client writes above queueMax.
+	if _, err := node.Transfer(nil, transferKey, transferItems()); err != nil {
+		t.Fatalf("Transfer refused while ingress queue full: %v", err)
+	}
+	count, err := node.Count()
+	if err != nil {
+		t.Fatalf("Count: %v", err)
+	}
+	if count < 2 {
+		t.Fatalf("transferred items missing from Count: got %d", count)
 	}
 }
 
@@ -113,13 +110,13 @@ func TestHandoffQueuesAboveTheClientCeiling(t *testing.T) {
 	node := newNodeOn(t, &memStorage{}, 64)
 	node.settings.SetQueueMax(1)
 
-	if err := node.New(item("client-1"), "@", "aa"); err != nil {
+	if err := node.New(item("client-1"), "@", nil); err != nil {
 		t.Fatalf("first client write: %v", err)
 	}
-	if err := node.New(item("client-2"), "@", "aa"); err == nil {
+	if err := node.New(item("client-2"), "@", nil); err == nil {
 		t.Fatal("client write accepted past the ingress ceiling")
 	}
-	if err := node.Handoff(item("peer-1"), "@", "aa"); err != nil {
+	if err := node.Handoff(item("peer-1"), "@", nil); err != nil {
 		t.Fatalf("handoff refused on a node full of client writes: %v", err)
 	}
 }
@@ -127,11 +124,10 @@ func TestHandoffQueuesAboveTheClientCeiling(t *testing.T) {
 func TestTransferAcceptsItemsWhenQueueHasRoom(t *testing.T) {
 	node := newNodeOn(t, &memStorage{}, 64)
 
-	if err := node.Transfer(nil, transferKey, transferItems()); err != nil {
+	if _, err := node.Transfer(nil, transferKey, transferItems()); err != nil {
 		t.Fatalf("Transfer: %v", err)
 	}
-	drain(t, node)
-
+	// Applied synchronously — no Feed drain required for Count.
 	count, err := node.Count()
 	if err != nil {
 		t.Fatalf("Count: %v", err)
@@ -150,7 +146,7 @@ func TestHandoffDoesNotMeterAutoscale(t *testing.T) {
 	})
 
 	root := encoding.BASE64.Root()
-	if err := node.Handoff(item("peer-meter"), root, "aa"); err != nil {
+	if err := node.Handoff(item("peer-meter"), root, nil); err != nil {
 		t.Fatalf("Handoff: %v", err)
 	}
 	drain(t, node)
@@ -159,7 +155,7 @@ func TestHandoffDoesNotMeterAutoscale(t *testing.T) {
 		t.Fatalf("Handoff metered inserts_window=%d want 0", got)
 	}
 
-	if err := node.New(item("client-meter"), root, "aa"); err != nil {
+	if err := node.New(item("client-meter"), root, nil); err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	drain(t, node)
@@ -173,7 +169,7 @@ func TestFullNodeRefusesClientWrites(t *testing.T) {
 	node := newNodeOn(t, &memStorage{}, 4)
 	node.full.Store(true)
 
-	err := node.New(item("i1"), "@", "aa")
+	err := node.New(item("i1"), "@", nil)
 	if !errors.Is(err, ErrNodeFull) {
 		t.Fatalf("New err=%v want ErrNodeFull", err)
 	}
@@ -186,12 +182,13 @@ func TestFullNodeStillAcceptsHandoffs(t *testing.T) {
 	node := newNodeOn(t, &memStorage{}, 4)
 	node.full.Store(true)
 
-	key := domain.Key{Collection: "demo", Location: "aa"}
-	if err := node.Transfer(node, key, []*domain.Item{item("i1")}); err != nil {
+	key := domain.Key{Collection: "demo", Location: "a"}
+	it := &domain.Item{Collection: "demo", Location: "aa", Id: "i1", Metrics: []float64{1}}
+	if _, err := node.Transfer(node, key, []*domain.Item{it}); err != nil {
 		t.Fatalf("Transfer: %v", err)
 	}
-	if got := node.queue.Length(); got != 1 {
-		t.Fatalf("handoff not queued: length=%d", got)
+	if got := node.Items(); got != 1 {
+		t.Fatalf("transfer not applied under mem-full: items=%d", got)
 	}
 }
 
@@ -200,7 +197,7 @@ func TestNodeAcceptsAgainWithHeadroom(t *testing.T) {
 	node.full.Store(true)
 	node.full.Store(false)
 
-	if err := node.New(item("i1"), "@", "aa"); err != nil {
+	if err := node.New(item("i1"), "@", nil); err != nil {
 		t.Fatalf("New: %v", err)
 	}
 }
@@ -239,15 +236,16 @@ func TestClientRefusedWhileScaleUpInFlight(t *testing.T) {
 		t.Fatal("scale-up never started")
 	}
 
-	if err := node.New(item("client"), "@", "aa"); !errors.Is(err, ErrNodeFull) {
+	if err := node.New(item("client"), "@", nil); !errors.Is(err, ErrNodeFull) {
 		t.Fatalf("New err=%v want ErrNodeFull while up_in_flight", err)
 	}
-	key := domain.Key{Collection: "demo", Location: "aa"}
-	if err := node.Transfer(node, key, []*domain.Item{item("peer")}); err != nil {
+	key := domain.Key{Collection: "demo", Location: "a"}
+	it := &domain.Item{Collection: "demo", Location: "aa", Id: "peer", Metrics: []float64{1}}
+	if _, err := node.Transfer(node, key, []*domain.Item{it}); err != nil {
 		t.Fatalf("Transfer during up_in_flight: %v", err)
 	}
-	if got := node.queue.Length(); got != 1 {
-		t.Fatalf("peer handoff not queued: length=%d", got)
+	if got := node.Items(); got != 1 {
+		t.Fatalf("peer transfer not applied: items=%d", got)
 	}
 	close(release)
 }
@@ -279,7 +277,7 @@ func TestIngressWALBeforeAck(t *testing.T) {
 	}
 
 	item := &domain.Item{Collection: "demo", Location: "aa", Id: "i1", Metrics: []float64{1}}
-	if err := n.New(item, "@", "aa"); err != nil {
+	if err := n.New(item, "@", nil); err != nil {
 		t.Fatal(err)
 	}
 

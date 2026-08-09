@@ -32,13 +32,12 @@ Ops console + dataset loaders: sibling repo [`dashboard/`](../../../dashboard/) 
 | Env | Default | Role |
 |-----|---------|------|
 | `DELEGATION` / `INDEXUS_DELEGATION` | `5000` | Soft item count before Own split (`-delegation`). Override via dashboard Config → Restart mesh (`.data-local/mesh-config.env`) |
-| `INDEXUS_TRANSFER_THRESHOLD` | `200` | Zones ≥ this count use snapshot delegation vs classic Transfer |
-| `INDEXUS_DELEGATION_TIMEOUT` | `2m` | Snapshot-delegation session timeout |
-| `INDEXUS_TRANSFER_TIMEOUT` | `5m` | Classic `/transfer` HTTP timeout |
-| `SPAWN_MAX` | `4` | Issuer spawn cap |
+| `INDEXUS_TRANSFER_TIMEOUT` | `5m` | Timeout for one repeatable `/transfer` round |
+| `SPAWN_MAX` | `15` | Issuer `-spawnMax` (spawned processes, bootstrap excluded) |
+| `INDEXUS_ITEMS_LIMIT` | `100000` | Owned items that force scale-up |
 | `QUEUE_PRESSURE` | `50000` | Scale-down backlog guard (not SoftLeave) |
 | `SNAPSHOT_DIR` | `.data-local/snapshots` | Shared DirStore (S3-equivalent) |
-| `INDEXUS_DELEGATION_S3` | `1` | Enable snapshot handoff protocol |
+| `INDEXUS_IN_MEMORY` | `0` | Lab: RAM-only (`-storage ""`), no DirStore |
 
 Data and logs live under `.data-local/` (gitignored).
 

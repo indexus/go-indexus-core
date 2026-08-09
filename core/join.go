@@ -22,8 +22,7 @@ func (n *Node) ClientReady() bool {
 
 // DefaultJoinPublishGrace is how long a spawned node may wait for the ingress
 // queue to settle after first ownership before publishing client routing.
-// Override with INDEXUS_JOIN_PUBLISH_GRACE (Go duration). Does not bypass an
-// incomplete inbound snapshot-delegation session.
+// Override with INDEXUS_JOIN_PUBLISH_GRACE (Go duration).
 const DefaultJoinPublishGrace = 5 * time.Second
 
 func joinPublishGrace() time.Duration {
@@ -41,12 +40,6 @@ func (n *Node) tryPublishClientReady() {
 	}
 	if n.autoscale == nil || n.autoscale.cfg.Role != "spawned" {
 		n.clientPublished.Store(true)
-		return
-	}
-	// Snapshot handoff still in flight: data may be loaded but ownership is
-	// not official yet. Never advertise client_ready until SwitchAck clears
-	// inbound sessions (donor still serves those zones).
-	if n.pendingInbound() > 0 {
 		return
 	}
 	zones := n.ownedZoneCount()

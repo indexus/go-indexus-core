@@ -49,46 +49,11 @@ func seedManyAcrossCollections(t *testing.T, n *core.Node, collections, perColl 
 				Location:   loc,
 				Id:         fmt.Sprintf("id-%d", idx),
 				Metrics:    []float64{1, 2, 3, 4, 5},
-			}, "@", loc)
+			}, "@", nil)
 			totalItems++
 		}
 	}
 	return totalItems, collNames
-}
-
-// awaitDrained blocks until every node's queue is 0 for `steady`
-// consecutive samples, or until `timeout` elapses (in which case it
-// fatals the test). This is a coarser tool than awaitStability — used
-// when we just want to be sure no Feed work is left, without checking
-// snapshot equality.
-func awaitDrained(t *testing.T, nodes []*core.Node, steady int, timeout time.Duration) {
-	t.Helper()
-
-	deadline := time.Now().Add(timeout)
-	calm := 0
-	for time.Now().Before(deadline) {
-		busy := false
-		for _, n := range nodes {
-			if n.Queue() > 0 {
-				busy = true
-				break
-			}
-		}
-		if busy {
-			calm = 0
-		} else {
-			calm++
-			if calm >= steady {
-				return
-			}
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	queues := make([]int, len(nodes))
-	for i, n := range nodes {
-		queues[i] = n.Queue()
-	}
-	t.Fatalf("queues did not drain within %s, lengths=%v", timeout, queues)
 }
 
 // -----------------------------------------------------------------------------
@@ -119,7 +84,7 @@ func TestConvergence_LargeScale_Burst(t *testing.T) {
 	t.Logf("seeding N1 with %d items across %d collections...", collections*perColl, collections)
 	start := time.Now()
 	expected, _ := seedManyAcrossCollections(t, n1, collections, perColl)
-	awaitDrained(t, []*core.Node{n1}, 5, 60*time.Second)
+	drainQueues(t, []*core.Node{n1}, 5, 60*time.Second)
 	t.Logf("seeded %d items in %s", expected, time.Since(start))
 
 	if got, _ := n1.Count(); got != expected {
@@ -206,7 +171,7 @@ func TestConvergence_MixedInsertsAndRebalance(t *testing.T) {
 
 	const (
 		seedCollections = 100
-		seedPerColl     = 10  // -> 1000 items pre-seed
+		seedPerColl     = 10 // -> 1000 items pre-seed
 		liveCollections = 50
 		liveItemsTotal  = 1500
 		burst           = 4
@@ -221,7 +186,7 @@ func TestConvergence_MixedInsertsAndRebalance(t *testing.T) {
 
 	t.Logf("pre-seeding N1 with %d items...", seedCollections*seedPerColl)
 	preSeeded, _ := seedManyAcrossCollections(t, n1, seedCollections, seedPerColl)
-	awaitDrained(t, []*core.Node{n1}, 5, 30*time.Second)
+	drainQueues(t, []*core.Node{n1}, 5, 30*time.Second)
 	if got, _ := n1.Count(); got != preSeeded {
 		t.Fatalf("pre-seed lost items: got %d want %d", got, preSeeded)
 	}
@@ -291,7 +256,7 @@ func TestConvergence_MixedInsertsAndRebalance(t *testing.T) {
 					Location:   loc,
 					Id:         fmt.Sprintf("live-%d", idx),
 					Metrics:    []float64{1, 2, 3, 4, 5},
-				}, "@", loc); err == nil {
+				}, "@", nil); err == nil {
 					inserted.Add(1)
 				}
 			}
@@ -389,7 +354,7 @@ func TestConvergence_LossyTransfer_RecoversWithoutLoss(t *testing.T) {
 
 			n1 := newConvergenceNode(t, delegation)
 			expected, _ := seedManyAcrossCollections(t, n1, collections, perColl)
-			awaitDrained(t, []*core.Node{n1}, 5, 30*time.Second)
+			drainQueues(t, []*core.Node{n1}, 5, 30*time.Second)
 			if got, _ := n1.Count(); got != expected {
 				t.Fatalf("solo seed lost items: got %d want %d", got, expected)
 			}

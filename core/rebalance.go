@@ -2,6 +2,7 @@ package core
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"runtime"
 	"runtime/debug"
@@ -17,17 +18,13 @@ func (n *Node) Rebalancing() bool {
 	return n != nil && n.rebalancing.Load()
 }
 
-// TransferBusy is true while ownership is moving (rebalance flag or open
-// inbound/outbound delegation sessions). Feed/ingress pause on this; autoscale
-// may still spawn but must exclude outbound zones from PreferNear / item load.
+// TransferBusy is true while the serialized repeatable handoff round is moving
+// ownership. There are no asynchronous delegation sessions.
 func (n *Node) TransferBusy() bool {
 	if n == nil {
 		return false
 	}
-	if n.rebalancing.Load() {
-		return true
-	}
-	return n.pendingOutbound() > 0 || n.pendingInbound() > 0
+	return n.rebalancing.Load()
 }
 
 func (n *Node) Refresh() error {
@@ -74,9 +71,6 @@ func (n *Node) Refresh() error {
 			}()
 		}
 		wg.Wait()
-		// S3 offers finish asynchronously (CaughtUp). Do NOT hold rebalancing for
-		// the whole mirror — that stalls Feed and balloons the ingress queue while
-		// CaughtUp is still in flight. Flip freezes Feed only inside CaughtUp.
 		n.rebalancing.Store(false)
 		n.transferMu.Unlock()
 		if total := int(transferred.Load()); total > 0 {
@@ -123,6 +117,14 @@ func (n *Node) control() map[domain.Contact][]domain.Key {
 	return plan
 }
 
+// offerZones is one repeatable handoff round. Each zone is copied in one
+// request, the HTTP response is the receiver's nominative ACK, and only that
+// ACKed zone is dropped. A refusal restores it locally; untouched keys remain
+// residue for the next Refresh tick.
+func (n *Node) offerZones(peer domain.Contact, keys []domain.Key) int {
+	return n.transferToPeer(peer, keys)
+}
+
 func (n *Node) transferToPeer(candidate domain.Contact, keys []domain.Key) int {
 	keySet := make(map[domain.Key]struct{}, len(keys))
 	for _, key := range keys {
@@ -162,7 +164,8 @@ func (n *Node) transferToPeer(candidate domain.Contact, keys []domain.Key) int {
 		}
 
 		items, empty := collection.Delegate(key.Location)
-		if err := candidate.Transfer(n, transferKey, items); err != nil {
+		ackedPeer, err := candidate.Transfer(n, transferKey, items)
+		if err != nil {
 			refused = true
 			slog.Warn("rebalance transfer failed, keeping items local",
 				"peer", candidate.Name(),
@@ -173,6 +176,13 @@ func (n *Node) transferToPeer(candidate domain.Contact, keys []domain.Key) int {
 			n.restoreDelegated(key, items)
 			continue
 		}
+
+		// Nominative mark: the ACK names the final receiver, so parked writes and
+		// repair know who holds the child. Anonymous marks never block progress.
+		if parent := collection.Base().Parent(key.Location); parent != "" {
+			collection.MarkDelegatedTo(parent, key.Location, ackedPeer)
+		}
+		n.wakeParked(key.Collection, key.Location)
 
 		n.removeOwnedKey(key)
 		if empty {
@@ -197,17 +207,34 @@ func (n *Node) transferToPeer(candidate domain.Contact, keys []domain.Key) int {
 	return handed
 }
 
-func (n *Node) Transfer(origin domain.Peer, key domain.Key, items []*domain.Item) error {
+func (n *Node) Transfer(origin domain.Peer, key domain.Key, items []*domain.Item) (string, error) {
 	if n.leaving.Load() {
-		return domain.ErrLeaving
+		return "", domain.ErrLeaving
 	}
 	for _, item := range items {
-
 		if item == nil {
-			return errors.New("transfer carries an empty item")
+			return "", errors.New("transfer carries an empty item")
 		}
+		if item.Collection != key.Collection {
+			return "", fmt.Errorf("transfer item collection %q does not match key %q", item.Collection, key.Collection)
+		}
+	}
+	holder, err := n.find(key.Collection, key.Location)
+	if err != nil {
+		return "", err
+	}
+	if holder.Name() != n.Name() {
+		if origin != nil && holder.Name() == origin.Name() {
+			return "", domain.ErrOwnerUnavailable
+		}
+		return holder.Transfer(n, key, items)
+	}
+
+	// The payload is now fully copied and validated. Install ownership only on
+	// this final step, immediately before applying the round's items.
+	n.create(key.Collection, key.Location)
+	for _, item := range items {
 		if item.Tombstone {
-			n.create(item.Collection, key.Location)
 			if c, ok := n.collections.Get(item.Collection); ok {
 				c.ApplyTombstone(item.Location, item.Id, item.Gen)
 				if n.ready {
@@ -216,13 +243,26 @@ func (n *Node) Transfer(origin domain.Peer, key domain.Key, items []*domain.Item
 			}
 			continue
 		}
-		if err := n.enqueue(item, key.Location, key.Location, fromPeer, false); err != nil {
-			return err
+		// The pre-flight above accepted this whole zone on this node. Applying
+		// its leaves through insert would restart routing at each leaf address;
+		// leaves can have a different XOR-nearest peer than the zone root and
+		// would recreate ownership on the donor while the handoff was in flight.
+		// Install directly into the accepted zone instead.
+		if n.add(item, false) {
+			continue
 		}
+		if child, handoff, ok := n.delegatedCover(item.Collection, item.Location); ok {
+			blocked := domain.ErrDelegatedTo{Child: child, Peer: handoff.Peer}
+			if n.park(NewElement(item, key.Location), blocked) {
+				continue
+			}
+		}
+		return "", fmt.Errorf("transfer item %s/%s is outside accepted zone %s", item.Collection, item.Location, key.Location)
 	}
 
+	n.MeasureItems()
 	n.tryPublishClientReady()
-	return nil
+	return n.Name(), nil
 }
 
 func (n *Node) restoreDelegated(key domain.Key, items []*domain.Item) {

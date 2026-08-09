@@ -209,7 +209,7 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	collection := r.URL.Query().Get("collection")
 	location := r.URL.Query().Get("location")
 
-	contact, set, err := node.Get(collection, location, true, 8)
+	contact, set, err := node.Get(collection, location, true, nil, false)
 	if err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
@@ -270,17 +270,17 @@ func (h *Handler) GetMultiple(w http.ResponseWriter, r *http.Request) {
 			return a.Count()
 		},
 		func(a *domain.Abelian) int {
-			return int(a.Metrics()[2])
+			return int(a.Metric(2))
 		},
 		func(a *domain.Abelian) int {
-			return int(1_000_000 * a.Metrics()[3])
+			return int(1_000_000 * a.Metric(3))
 		},
 		func(a *domain.Abelian) int {
-			return int(1_000_000 * a.Metrics()[4])
+			return int(1_000_000 * a.Metric(4))
 		},
 	}
 
-	sets, err := node.GetMultiple(collection, locations, precision, properties, true, 8)
+	sets, err := node.GetMultiple(collection, locations, precision, properties, true, nil, false, false)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
 		return
@@ -308,12 +308,13 @@ func (h *Handler) New(w http.ResponseWriter, r *http.Request) {
 		Item    *domain.Item `json:"item"`
 		Root    string       `json:"root"`
 		Current string       `json:"current"`
+		Via     string       `json:"via"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
 		return
 	}
-	if err := node.New(body.Item, body.Root, body.Current); err != nil {
+	if err := node.New(body.Item, body.Root, domain.ParseVisited(body.Via)); err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
 	}
@@ -504,7 +505,7 @@ func (h *Handler) FeedNetwork(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		settings, err := core.NewSettings(name, network.Length(), 1*time.Second, 5*time.Minute, domain.DelegationTreshold())
+		settings, err := core.NewSettings(name, network.Length(), 1*time.Second, 5*time.Minute, domain.DelegationSize())
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
@@ -566,7 +567,7 @@ func (h *Handler) FeedCollection(w http.ResponseWriter, r *http.Request) {
 				Metrics:    []float64{rand.Float64(), rand.Float64(), rand.Float64(), rand.Float64(), rand.Float64()},
 			}
 
-			if err := network.Random().New(item, encoding.BASE64.Root(), item.Location); err != nil {
+			if err := network.Random().New(item, encoding.BASE64.Root(), nil); err != nil {
 				slog.Debug("simulated insert rejected", "err", err)
 			}
 		}

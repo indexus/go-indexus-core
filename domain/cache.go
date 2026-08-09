@@ -112,6 +112,8 @@ func hopTTL(base time.Duration, beta float64, hops int) time.Duration {
 	return ttl
 }
 
+// Get returns a cached set and marks it as recently used (client traffic):
+// LRU MoveToFront + Set.Reset for hop TTL. Use Peek for non-client reads.
 func (c *Cache) Get(collection, location string) (*Set, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -132,6 +134,37 @@ func (c *Cache) Get(collection, location string) (*Set, bool) {
 		entry.set.Reset()
 	}
 	return entry.set, true
+}
+
+// Peek returns a cached set without touching the LRU or resetting TTL.
+func (c *Cache) Peek(collection, location string) (*Set, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	sets, exist := c.collections[collection]
+	if !exist {
+		return nil, false
+	}
+	entry, exist := sets[location]
+	if !exist {
+		return nil, false
+	}
+	return entry.set, true
+}
+
+// LastTouch returns when the entry was last client-touched (zero if missing).
+func (c *Cache) LastTouch(collection, location string) time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	sets, exist := c.collections[collection]
+	if !exist {
+		return time.Time{}
+	}
+	entry, exist := sets[location]
+	if !exist {
+		return time.Time{}
+	}
+	return entry.last
 }
 
 // Hops returns the stored hop distance for a cache entry (0 if missing).
@@ -161,11 +194,15 @@ func (c *Cache) SetHops(collection, location string, set *Set, hops int) {
 		c.collections[collection] = make(map[string]*cacheEntry)
 	}
 
-	// Keeping the existing entry is only right when it holds the same set the
-	// caller is offering; anything else, including a placeholder either way, is a
-	// new entry.
+	// Keeping the existing entry is only right when it holds the same kind of
+	// set the caller is offering. A summary placeholder and a child list can
+	// share a count after an /aggregates pull; treating them as equal would
+	// leave the placeholder in place and make the next shallow Get a miss.
 	current, exist := c.collections[collection][location]
-	if !exist || set == nil || current.set == nil || current.set.Count() != set.Count() {
+	same := exist && set != nil && current.set != nil &&
+		current.set.Count() == set.Count() &&
+		current.set.IsSummaryPlaceholder() == set.IsSummaryPlaceholder()
+	if !same {
 		if exist {
 			c.removeLocked(collection, location, current)
 		}
@@ -180,6 +217,7 @@ func (c *Cache) SetHops(collection, location string, set *Set, hops int) {
 		return
 	}
 
+	current.set = set
 	current.hops = hops
 	c.touchLocked(current)
 }

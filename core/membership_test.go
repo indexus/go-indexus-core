@@ -8,6 +8,47 @@ import (
 	"testing"
 )
 
+type recoveringPeer struct {
+	*dialPeer
+	online bool
+}
+
+func (p *recoveringPeer) Ping(domain.Contact) (domain.Contact, error) {
+	if !p.online {
+		return nil, errors.New("partitioned")
+	}
+	return p, nil
+}
+
+func TestObserveReprobesAndRestoresQuarantinedPeer(t *testing.T) {
+	n := newNodeOn(t, &memStorage{}, 64)
+	peer := &recoveringPeer{
+		dialPeer: newDialPeer("RecoveringPeerAAA", "10.0.0.2", 21002),
+	}
+	n.register([]domain.Contact{peer})
+
+	if err := n.Observe(); err != nil {
+		t.Fatalf("Observe partition: %v", err)
+	}
+	if !n.suspended(peer.Name()) {
+		t.Fatal("failed peer was not quarantined")
+	}
+	if _, ok := n.acknowledged.Get(0, peer.ID()); !ok {
+		t.Fatal("quarantined peer lost its probationary probe address")
+	}
+
+	peer.online = true
+	if err := n.Observe(); err != nil {
+		t.Fatalf("Observe heal: %v", err)
+	}
+	if n.suspended(peer.Name()) {
+		t.Fatal("successful direct ping did not clear quarantine")
+	}
+	if _, ok := n.registered.Get(0, peer.ID()); !ok {
+		t.Fatal("recovered peer was not registered again")
+	}
+}
+
 func TestContactDialable(t *testing.T) {
 	cases := []struct {
 		name string
@@ -106,7 +147,7 @@ func TestGetDoesNotRedirectToUndialable(t *testing.T) {
 
 	n.registered.Insert(0, dead.ID(), dead)
 
-	contact, set, err := n.Get("demo", root, true, DefaultDeepHops)
+	contact, set, err := n.Get("demo", root, true, nil, false)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
@@ -133,13 +174,13 @@ func TestIngressHoldsWhileNearestOwnerIsSuspended(t *testing.T) {
 	peer := nearestFailPeer(t, n, "demo", root)
 
 	item := &domain.Item{Collection: "demo", Location: "aa", Id: "x", Metrics: []float64{1}}
-	if err := n.process(NewElement(item, root, root)); err == nil {
+	if err := n.process(NewElement(item, root)); err == nil {
 		t.Fatal("precondition: the forward to the dead peer reported success")
 	}
 
 	n.suspend(peer.Name(), quarantineWindow)
 
-	err := n.process(NewElement(item, root, root))
+	err := n.process(NewElement(item, root))
 	if !errors.Is(err, domain.ErrOwnerUnavailable) {
 		t.Fatalf("write while owner suspended: %v want ErrOwnerUnavailable", err)
 	}
@@ -162,7 +203,7 @@ func TestIngressFallsBackAfterDeadPeerRejected(t *testing.T) {
 	n.reject([]domain.Contact{peer})
 
 	item := &domain.Item{Collection: "demo", Location: "aa", Id: "x", Metrics: []float64{1}}
-	if err := n.process(NewElement(item, root, root)); err != nil {
+	if err := n.process(NewElement(item, root)); err != nil {
 		t.Fatalf("write after reject: %v", err)
 	}
 
@@ -260,7 +301,7 @@ func filledNode(t *testing.T, locations []string, per int) *Node {
 				Id:         fmt.Sprintf("%s-%d", location, i),
 				Metrics:    []float64{1},
 			}
-			if err := node.New(item, encoding.BASE64.Root(), location); err != nil {
+			if err := node.New(item, encoding.BASE64.Root(), nil); err != nil {
 				t.Fatalf("New: %v", err)
 			}
 		}

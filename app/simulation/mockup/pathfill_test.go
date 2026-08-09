@@ -30,13 +30,13 @@ func TestQueueBackpressureOnNode(t *testing.T) {
 	mk := func(id string) *domain.Item {
 		return &domain.Item{Collection: "demo", Location: "aa", Id: id, Metrics: []float64{1}}
 	}
-	if err := n.New(mk("a"), "@", "aa"); err != nil {
+	if err := n.New(mk("a"), encoding.BASE64.Root(), nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := n.New(mk("b"), "@", "aa"); err != nil {
+	if err := n.New(mk("b"), encoding.BASE64.Root(), nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := n.New(mk("c"), "@", "aa"); err == nil {
+	if err := n.New(mk("c"), encoding.BASE64.Root(), nil); err == nil {
 		t.Fatal("expected queue full error")
 	}
 }
@@ -60,7 +60,7 @@ func TestPathFillFromOwnerNeighbor(t *testing.T) {
 		Id:         "x1",
 		Metrics:    []float64{1, 2, 3, 4, 5},
 	}
-	if err := n1.New(item, "@", loc); err != nil {
+	if err := n1.New(item, encoding.BASE64.Root(), nil); err != nil {
 		t.Fatal(err)
 	}
 	drainQueues(t, []*core.Node{n1, n2}, 3, 5*time.Second)
@@ -77,12 +77,12 @@ func TestPathFillFromOwnerNeighbor(t *testing.T) {
 		owner, other = n2, n1
 	}
 
-	_, ownedSet, err := owner.Get(collection, "@", false, 0)
+	_, ownedSet, err := owner.Get(collection, "@", false, nil, false)
 	if err != nil || ownedSet == nil {
 		t.Fatalf("owner must serve locally: err=%v set=%v", err, ownedSet != nil)
 	}
 
-	_, filled, err := other.Get(collection, "@", true, 8)
+	_, filled, err := other.Get(collection, "@", true, nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +90,7 @@ func TestPathFillFromOwnerNeighbor(t *testing.T) {
 		t.Fatal("non-owner should path-fill from owner neighbor")
 	}
 
-	_, cached, err := other.Get(collection, "@", false, 0)
+	_, cached, err := other.Get(collection, "@", false, nil, false)
 	if err != nil || cached == nil {
 		t.Fatalf("expected cache hit on edge after path-fill: err=%v set=%v", err, cached != nil)
 	}

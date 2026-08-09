@@ -1,6 +1,12 @@
 package domain
 
-import "testing"
+import (
+	"encoding/json"
+	"fmt"
+	"sync"
+	"testing"
+	"time"
+)
 
 func leaf() *Abelian {
 	return NewAbelian(1, []float64{1})
@@ -195,5 +201,118 @@ func TestSetIncrMissingKey(t *testing.T) {
 	}
 	if s.Count() != 1 {
 		t.Fatalf("set count: got %d, want 1", s.Count())
+	}
+}
+
+func TestSetMarshalJSONMatchesList(t *testing.T) {
+	s := NewSet()
+	s.Put("aa:x", NewAbelian(1, []float64{1, 2}))
+	s.Put("ab:y", NewAbelian(1, []float64{3}))
+
+	viaSet, err := json.Marshal(s)
+	if err != nil {
+		t.Fatalf("Marshal set: %v", err)
+	}
+	viaList, err := json.Marshal(s.List())
+	if err != nil {
+		t.Fatalf("Marshal list: %v", err)
+	}
+
+	var fromSet, fromList map[string]*Abelian
+	if err := json.Unmarshal(viaSet, &fromSet); err != nil {
+		t.Fatalf("Unmarshal set: %v", err)
+	}
+	if err := json.Unmarshal(viaList, &fromList); err != nil {
+		t.Fatalf("Unmarshal list: %v", err)
+	}
+	if len(fromSet) != len(fromList) {
+		t.Fatalf("len set=%d list=%d", len(fromSet), len(fromList))
+	}
+	for k, a := range fromList {
+		b, ok := fromSet[k]
+		if !ok || !a.IsEqual(b) {
+			t.Fatalf("key %s mismatch set=%v list=%v", k, b, a)
+		}
+	}
+}
+
+// MarshalJSON must release Set.mu before encoding so writers are not blocked
+// for the duration of json.Marshal.
+func TestSetMarshalJSONDoesNotHoldLockDuringEncode(t *testing.T) {
+	s := NewSet()
+	for i := 0; i < 200; i++ {
+		s.Put(string(rune('a'+i%26))+string(rune('0'+i%10)), NewAbelian(1, []float64{float64(i)}))
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = json.Marshal(s)
+	}()
+
+	// While marshal runs (or right after snapshot), Put must not deadlock.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		s.Put("zz:concurrent", NewAbelian(1, []float64{1}))
+		select {
+		case <-done:
+			return
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	t.Fatal("Put blocked while MarshalJSON held the lock")
+}
+
+// Not holding the lock during encode is only safe if the snapshot owns its
+// values. Put replaces the stored pointer, so it never caught this; Incr sums
+// into the Abelian in place, and a snapshot sharing that pointer lets a reader
+// catch a count and its metrics from either side of the same increment — on
+// the path that answers /set.
+func TestSnapshotSurvivesConcurrentIncrements(t *testing.T) {
+	s := NewSet()
+	keys := make([]string, 32)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("k%d", i)
+		s.Put(keys[i], NewAbelian(1, []float64{1}))
+	}
+
+	stop := make(chan struct{})
+	var writer sync.WaitGroup
+	writer.Add(1)
+	go func() {
+		defer writer.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			for _, key := range keys {
+				s.Incr(key, NewAbelian(1, []float64{1}))
+			}
+		}
+	}()
+
+	for round := 0; round < 200; round++ {
+		for _, abelian := range s.List() {
+			_, _ = abelian.Count(), abelian.Metrics()
+		}
+		if _, err := json.Marshal(s); err != nil {
+			t.Fatalf("Marshal: %v", err)
+		}
+	}
+	close(stop)
+	writer.Wait()
+}
+
+func TestSetMarshalJSONNil(t *testing.T) {
+	var s *Set
+	raw, err := json.Marshal(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != "null" {
+		t.Fatalf("got %s want null", raw)
 	}
 }

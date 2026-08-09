@@ -52,7 +52,7 @@ func TestEdgeAbsorbReadWriteDeleteEndToEnd(t *testing.T) {
 			Metrics:    []float64{1, 2, 3, 4, 5},
 		}
 		made = append(made, item)
-		if err := nodes[i%len(nodes)].New(item, root, item.Location); err != nil {
+		if err := nodes[i%len(nodes)].New(item, root, nil); err != nil {
 			t.Fatalf("New on edge %d: %v", i%len(nodes), err)
 		}
 	}
@@ -69,13 +69,13 @@ func TestEdgeAbsorbReadWriteDeleteEndToEnd(t *testing.T) {
 	// single path-fill has run, instead of hitting the owner again.
 	edges := 0
 	for _, n := range nodes {
-		if _, set, _ := n.Get(collection, root, false, 0); set != nil {
+		if _, set, _ := n.Get(collection, root, false, nil, false); set != nil {
 			continue // this node owns the root or already cached it
 		}
-		if _, set, err := n.Get(collection, root, true, 8); err != nil || set == nil {
+		if _, set, err := n.Get(collection, root, true, nil, false); err != nil || set == nil {
 			t.Fatalf("path-fill failed on %s: err=%v set=%v", n.Name(), err, set != nil)
 		}
-		if _, set, _ := n.Get(collection, root, false, 0); set == nil {
+		if _, set, _ := n.Get(collection, root, false, nil, false); set == nil {
 			t.Fatalf("edge %s did not cache the set after path-fill", n.Name())
 		}
 		edges++
@@ -87,7 +87,7 @@ func TestEdgeAbsorbReadWriteDeleteEndToEnd(t *testing.T) {
 	// Deletions take the same edges as the writes did.
 	for i := 0; i < deletions; i++ {
 		item := made[i]
-		if err := nodes[i%len(nodes)].Delete(item, root, item.Location); err != nil {
+		if err := nodes[i%len(nodes)].Delete(item, root, nil); err != nil {
 			t.Fatalf("Delete on edge %d: %v", i%len(nodes), err)
 		}
 	}
@@ -104,7 +104,7 @@ func TestEdgeAbsorbReadWriteDeleteEndToEnd(t *testing.T) {
 	// Replaying the same deletions must be a no-op, not a second subtraction.
 	for i := 0; i < deletions; i++ {
 		item := made[i]
-		if err := nodes[i%len(nodes)].Delete(item, root, item.Location); err != nil {
+		if err := nodes[i%len(nodes)].Delete(item, root, nil); err != nil {
 			t.Fatalf("repeated Delete on edge %d: %v", i%len(nodes), err)
 		}
 	}

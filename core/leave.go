@@ -203,7 +203,7 @@ func (d *drainTargets) transfer(origin domain.Peer, key domain.Key, items []*dom
 			continue
 		}
 		tried++
-		err := peer.Transfer(origin, key, items)
+		_, err := peer.Transfer(origin, key, items)
 		if err == nil {
 			d.fails[name] = 0
 			return nil
@@ -263,7 +263,7 @@ func (n *Node) handOffTargets(targets *drainTargets, key domain.Key, element *El
 			if targets.skip[peer.Name()] {
 				continue
 			}
-			if err := peer.Delete(element.item, element.root, element.current); err != nil {
+			if err := peer.Delete(element.item, element.root, nil); err != nil {
 				lastErr = err
 				if errors.Is(err, domain.ErrLeaving) {
 					targets.skip[peer.Name()] = true

@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/indexus/go-indexus-core/auth"
@@ -29,11 +31,10 @@ var HttpClient = &http.Client{
 	},
 }
 
-// TransferClient carries bulk ownership handoffs (classic /transfer). Large
-// zones (~100k items) routinely exceed 30s on a single POST, so the default
-// is DefaultTransferTimeout. Override with INDEXUS_TRANSFER_TIMEOUT (Go
-// duration, e.g. 10m). Prefer INDEXUS_DELEGATION_S3 + SNAPSHOT_DIR /
-// SNAPSHOT_BUCKET so large zones move via object-store snapshots instead.
+// TransferClient carries repeatable ownership handoff rounds. Large zones
+// (~100k items) routinely exceed 30s on a single POST, so the default is
+// DefaultTransferTimeout. Override with INDEXUS_TRANSFER_TIMEOUT (Go duration,
+// e.g. 10m).
 const DefaultTransferTimeout = 5 * time.Minute
 
 var TransferClient = &http.Client{
@@ -322,15 +323,19 @@ func (c *Contact) Random(origin domain.Peer) (domain.Contact, error) {
 		return nil, fmt.Errorf("error code: %d", resp.StatusCode)
 	}
 
+	// Handler writes {"random": {...}}; a missing/null body must be a true
+	// nil interface, not a typed (*Contact)(nil), or callers panic on .Name().
 	var body struct {
-		Contact *Contact `json:"contact"`
+		Random *Contact `json:"random"`
 	}
 	decoder := json.NewDecoder(resp.Body)
 	if err := decoder.Decode(&body); err != nil {
 		return nil, err
 	}
-
-	return body.Contact, nil
+	if body.Random == nil {
+		return nil, nil
+	}
+	return body.Random, nil
 }
 
 func (c *Contact) dialTargets() []string {
@@ -350,15 +355,16 @@ func (c *Contact) dialTargets() []string {
 	return out
 }
 
-func (c *Contact) Transfer(origin domain.Peer, key domain.Key, items []*domain.Item) error {
+func (c *Contact) Transfer(origin domain.Peer, key domain.Key, items []*domain.Item) (string, error) {
 	if c.port <= 0 {
-		return fmt.Errorf("transfer: invalid port on peer %s", c.name)
+		return "", fmt.Errorf("transfer: invalid port on peer %s", c.name)
 	}
 	targets := c.dialTargets()
 	if len(targets) == 0 {
-		return fmt.Errorf("transfer: no dialable IP on peer %s", c.name)
+		return "", fmt.Errorf("transfer: no dialable IP on peer %s", c.name)
 	}
 	var lastErr error
+	var ackedPeer string
 	for _, rawIP := range targets {
 		ip := rawIP
 		if parsed := net.ParseIP(rawIP); parsed != nil && parsed.To4() == nil {
@@ -376,7 +382,7 @@ func (c *Contact) Transfer(origin domain.Peer, key domain.Key, items []*domain.I
 		}
 		jsonData, err := json.Marshal(body)
 		if err != nil {
-			return err
+			return "", err
 		}
 		req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 		if err != nil {
@@ -401,34 +407,59 @@ func (c *Contact) Transfer(origin domain.Peer, key domain.Key, items []*domain.I
 				lastErr = fmt.Errorf("transfer %s: status %d", url, resp.StatusCode)
 				return
 			}
+			var ack struct {
+				Peer string `json:"peer"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&ack); err != nil {
+				lastErr = fmt.Errorf("transfer %s: invalid ACK: %w", url, err)
+				return
+			}
+			if ack.Peer != c.name {
+				// A repeatable handoff may be relayed to the holder selected
+				// by the receiver's newer membership view.
+				if ack.Peer == "" {
+					lastErr = fmt.Errorf("transfer %s: empty nominative ACK", url)
+					return
+				}
+			}
+			ackedPeer = ack.Peer
 			lastErr = nil
 		}()
 		if errors.Is(lastErr, domain.ErrLeaving) {
-			return lastErr
+			return "", lastErr
 		}
 		if lastErr == nil {
 			if c.ip == "" {
 				c.ip = rawIP
 			}
-			return nil
+			return ackedPeer, nil
 		}
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("transfer: all dial targets failed for %s", c.name)
 	}
-	return lastErr
+	return "", lastErr
 }
 
-func (c *Contact) Get(collection string, location string, deep bool, hop int) (domain.Contact, *domain.Set, error) {
+func (c *Contact) Get(collection string, location string, deep bool, via domain.Visited, refresh bool) (domain.Contact, *domain.Set, error) {
 	ip, parsedIP := c.ip, net.ParseIP(c.ip)
 
 	if parsedIP != nil && parsedIP.To4() == nil {
 		ip = fmt.Sprintf("[%s]", ip)
 	}
 
-	url := fmt.Sprintf("http://%s:%d/set?collection=%s&location=%s&deep=%t&hop=%d",
-		ip, c.port, collection, location, deep, hop)
-	req, err := http.NewRequest("GET", url, nil)
+	// Inter-node reads use the same /sets protocol as browser clients so the
+	// two paths cannot diverge. envelope=1 carries owner redirects for
+	// deep=false; /set remains a JSON adapter for older probes.
+	rawURL := fmt.Sprintf("http://%s:%d/sets?collection=%s&location=%s&deep=%t&envelope=1",
+		ip, c.port, url.QueryEscape(collection), url.QueryEscape(location), deep)
+	if s := via.String(); s != "" {
+		rawURL += "&via=" + url.QueryEscape(s)
+	}
+	if refresh {
+		rawURL += "&refresh=true"
+	}
+	req, err := http.NewRequest("GET", rawURL, nil)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -443,36 +474,133 @@ func (c *Contact) Get(collection string, location string, deep bool, hop int) (d
 		return nil, nil, fmt.Errorf("error code: %d", resp.StatusCode)
 	}
 
-	var body struct {
-		Contact *Contact                   `json:"contact"`
-		Set     map[string]*domain.Abelian `json:"set"`
-	}
-	decoder := json.NewDecoder(resp.Body)
-	if err := decoder.Decode(&body); err != nil {
+	buf := new(bytes.Buffer)
+	if _, err := buf.ReadFrom(resp.Body); err != nil {
 		return nil, nil, err
 	}
+	payload := buf.Bytes()
 
-	if body.Set == nil {
-		var contact domain.Contact
-		if body.Contact != nil {
-			contact = body.Contact
-		}
-		return contact, nil, nil
+	redirects, body, isEnv, err := domain.DecodeSetsEnvelope(payload)
+	if err != nil {
+		return nil, nil, err
 	}
-
-	set := domain.NewSet()
-	for key, value := range body.Set {
-		set.Put(key, value)
+	if !isEnv {
+		body = payload
 	}
 
 	var contact domain.Contact
-	if body.Contact != nil {
-		contact = body.Contact
+	for _, r := range redirects {
+		if r.Location != location || r.Name == "" || r.Port <= 0 {
+			continue
+		}
+		contact = NewContact(r.Name, map[string]any{r.IP: nil}, r.Port)
+		break
+	}
+
+	if len(body) == 0 {
+		return contact, nil, nil
+	}
+	entries, err := domain.DecodeSetsBinary(body, 4)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(entries) == 0 {
+		return contact, nil, nil
+	}
+	set := domain.NewSet()
+	for key, value := range entries {
+		set.Put(key, value)
 	}
 	return contact, set, nil
 }
 
-func (c *Contact) New(item *domain.Item, root string, current string) error {
+func (c *Contact) Children(collection, parent string) (map[string]*domain.ChildEntry, error) {
+	ip, parsedIP := c.ip, net.ParseIP(c.ip)
+	if parsedIP != nil && parsedIP.To4() == nil {
+		ip = fmt.Sprintf("[%s]", ip)
+	}
+	rawURL := fmt.Sprintf("http://%s:%d/children?collection=%s&location=%s",
+		ip, c.port, url.QueryEscape(collection), url.QueryEscape(parent))
+	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	withAuth(req)
+	resp, err := HttpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("error code: %d", resp.StatusCode)
+	}
+	var body struct {
+		Children map[string]json.RawMessage `json:"children"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, err
+	}
+	out := make(map[string]*domain.ChildEntry, len(body.Children))
+	for loc, raw := range body.Children {
+		entry := &domain.ChildEntry{}
+		var stub struct {
+			Count        int            `json:"count"`
+			RedirectName string         `json:"redirect_name"`
+			RedirectIP   string         `json:"redirect_ip"`
+			RedirectPort int            `json:"redirect_port"`
+			RedirectIPs  map[string]any `json:"redirect_ips"`
+		}
+		if err := json.Unmarshal(raw, &stub); err != nil {
+			return nil, err
+		}
+		entry.Abelian = domain.NewAbelian(stub.Count, nil)
+		entry.RedirectName = stub.RedirectName
+		entry.RedirectIP = stub.RedirectIP
+		entry.RedirectPort = stub.RedirectPort
+		entry.RedirectIPs = stub.RedirectIPs
+		out[loc] = entry
+	}
+	return out, nil
+}
+
+// GetAggregates asks a peer for SoT summaries of locations it owns. Answering
+// is a claim of ownership — the only source allowed to write a parent stub.
+func (c *Contact) GetAggregates(collection string, locations []string) (map[string]*domain.Abelian, error) {
+	if len(locations) == 0 {
+		return map[string]*domain.Abelian{}, nil
+	}
+	ip, parsedIP := c.ip, net.ParseIP(c.ip)
+	if parsedIP != nil && parsedIP.To4() == nil {
+		ip = fmt.Sprintf("[%s]", ip)
+	}
+	rawURL := fmt.Sprintf("http://%s:%d/aggregates?collection=%s&location=%s",
+		ip, c.port, url.QueryEscape(collection), url.QueryEscape(strings.Join(locations, ",")))
+	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	withAuth(req)
+	resp, err := HttpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("error code: %d", resp.StatusCode)
+	}
+	var body struct {
+		Aggregates map[string]*domain.Abelian `json:"aggregates"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, err
+	}
+	if body.Aggregates == nil {
+		return map[string]*domain.Abelian{}, nil
+	}
+	return body.Aggregates, nil
+}
+
+func (c *Contact) New(item *domain.Item, root string, via domain.Visited) error {
 	ip, parsedIP := c.ip, net.ParseIP(c.ip)
 
 	if parsedIP != nil && parsedIP.To4() == nil {
@@ -481,13 +609,13 @@ func (c *Contact) New(item *domain.Item, root string, current string) error {
 
 	url := fmt.Sprintf("http://%s:%d/item", ip, c.port)
 	body := struct {
-		Item    *domain.Item `json:"item"`
-		Root    string       `json:"root"`
-		Current string       `json:"current"`
+		Item *domain.Item `json:"item"`
+		Root string       `json:"root"`
+		Via  string       `json:"via,omitempty"`
 	}{
-		Item:    item,
-		Root:    root,
-		Current: current,
+		Item: item,
+		Root: root,
+		Via:  via.String(),
 	}
 
 	jsonData, err := json.Marshal(body)
@@ -520,7 +648,7 @@ func (c *Contact) New(item *domain.Item, root string, current string) error {
 	return nil
 }
 
-func (c *Contact) Delete(item *domain.Item, root string, current string) error {
+func (c *Contact) Delete(item *domain.Item, root string, via domain.Visited) error {
 	ip, parsedIP := c.ip, net.ParseIP(c.ip)
 
 	if parsedIP != nil && parsedIP.To4() == nil {
@@ -529,13 +657,13 @@ func (c *Contact) Delete(item *domain.Item, root string, current string) error {
 
 	url := fmt.Sprintf("http://%s:%d/item/delete", ip, c.port)
 	body := struct {
-		Item    *domain.Item `json:"item"`
-		Root    string       `json:"root"`
-		Current string       `json:"current"`
+		Item *domain.Item `json:"item"`
+		Root string       `json:"root"`
+		Via  string       `json:"via,omitempty"`
 	}{
-		Item:    item,
-		Root:    root,
-		Current: current,
+		Item: item,
+		Root: root,
+		Via:  via.String(),
 	}
 
 	jsonData, err := json.Marshal(body)
@@ -566,32 +694,18 @@ func (c *Contact) Delete(item *domain.Item, root string, current string) error {
 	return nil
 }
 
-func (c *Contact) DelegationOffer(origin domain.Peer, offer domain.DelegationOfferPayload) error {
-	return c.postJSON("/delegation/offer", struct {
-		Origin string                        `json:"origin"`
-		Offer  domain.DelegationOfferPayload `json:"offer"`
-	}{Origin: origin.Name(), Offer: offer})
-}
-
-func (c *Contact) WALDelta(origin domain.Peer, delta domain.WALDeltaPayload) error {
-	return c.postJSON("/delegation/wal-delta", struct {
-		Origin string                 `json:"origin"`
-		Delta  domain.WALDeltaPayload `json:"delta"`
-	}{Origin: origin.Name(), Delta: delta})
-}
-
-func (c *Contact) CaughtUp(origin domain.Peer, payload domain.CaughtUpPayload) error {
-	return c.postJSON("/delegation/caught-up", struct {
-		Origin  string                 `json:"origin"`
-		Payload domain.CaughtUpPayload `json:"payload"`
-	}{Origin: origin.Name(), Payload: payload})
-}
-
-func (c *Contact) SwitchAck(origin domain.Peer, payload domain.SwitchAckPayload) error {
-	return c.postJSON("/delegation/switch-ack", struct {
-		Origin  string                  `json:"origin"`
-		Payload domain.SwitchAckPayload `json:"payload"`
-	}{Origin: origin.Name(), Payload: payload})
+// Claim announces local ownership of a child zone to the holder of its parent.
+// The payload already carries the claimant peer name; origin on the wire is
+// the same identity so the receiver can authenticate the announcement.
+func (c *Contact) Claim(payload domain.ClaimPayload) error {
+	origin := payload.Peer
+	if origin == "" {
+		origin = c.name
+	}
+	return c.postJSON("/claim", struct {
+		Origin  string              `json:"origin"`
+		Payload domain.ClaimPayload `json:"payload"`
+	}{Origin: origin, Payload: payload})
 }
 
 func (c *Contact) postJSON(path string, body any) error {

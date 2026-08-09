@@ -45,6 +45,7 @@ func TestSplitAreaRefusesAddsUntilOwned(t *testing.T) {
 	const delegation = 4
 
 	area, _ := splitArea(t, c, "aa", delegation)
+	c.MarkDelegatedTo(c.base.Parent(area), area, "local-owner")
 
 	if c.Allowing(area) {
 		t.Fatalf("area %q split off but still allowed before Own", area)
@@ -79,6 +80,7 @@ func TestDelegateHandsSubtreeOnceAndDropsOwnership(t *testing.T) {
 	}
 
 	items, _ := c.Delegate(area)
+	c.MarkDelegatedTo(c.base.Parent(area), area, "receiver")
 
 	live, tombs := 0, 0
 	for _, it := range items {
@@ -105,6 +107,74 @@ func TestDelegateHandsSubtreeOnceAndDropsOwnership(t *testing.T) {
 	again, _ := c.Delegate(area)
 	if len(again) != 0 {
 		t.Fatalf("second Delegate returned %d items — a retried transfer would double-send", len(again))
+	}
+}
+
+// A child is either owned here or held by a peer, and the parent must be able
+// to tell them apart: /children reports both, and only the second kind needs an
+// /aggregates pull. A mark that is not a direct child is a cycle waiting to be
+// followed, so it is refused rather than recorded.
+func TestOwnedAndDelegatedChildrenAreDistinguished(t *testing.T) {
+	c := NewCollection("demo", "@", fakeBase{length: 4})
+	c.EnsureSet("@")
+	c.Own("@", Delegation{})
+	c.EnsureSet("a")
+	c.Own("a", Delegation{})
+	set, _ := c.Get("a")
+	set.Put("a:x", NewAbelian(3, []float64{3}))
+
+	if owned := c.OwnedChildren("@"); owned["a"] == nil || owned["a"].Count() != 3 {
+		t.Fatalf("OwnedChildren(@)=%#v want a=3", owned)
+	}
+
+	c.MarkDelegatedTo("@", "b", "peer-b")
+	if !c.IsDelegated("@", "b") {
+		t.Fatal("expected b delegated under @")
+	}
+	if dels := c.DelegatedChildren("@"); len(dels) != 1 || dels[0] != "b" {
+		t.Fatalf("DelegatedChildren(@)=%v want [b]", dels)
+	}
+
+	c.MarkDelegated("@", "@") // self-key
+	c.MarkDelegated("a", "a") // self-key
+	c.MarkDelegated("a", "b") // b is not a direct child of a
+	if c.IsDelegated("@", "@") || c.IsDelegated("a", "a") || c.IsDelegated("a", "b") {
+		t.Fatal("MarkDelegated accepted an edge that is not a direct child")
+	}
+}
+
+func TestMarkDelegatedToStoresPeerAndLegacyMarkIsAnonymous(t *testing.T) {
+	c := NewCollection("demo", "@", fakeBase{length: 4})
+	c.EnsureSet("@")
+	c.Own("@", Delegation{})
+
+	c.MarkDelegatedTo("@", "a", "peer-alpha")
+	d := c.owned["@"]["a"]
+	if d.Peer != "peer-alpha" {
+		t.Fatalf("MarkDelegatedTo peer: got %q want peer-alpha", d.Peer)
+	}
+	if d.At == 0 {
+		t.Fatal("MarkDelegatedTo must set At")
+	}
+
+	c.MarkDelegated("@", "b")
+	legacy := c.owned["@"]["b"]
+	if legacy.Peer != "" {
+		t.Fatalf("MarkDelegated peer: got %q want empty", legacy.Peer)
+	}
+	if legacy.At == 0 {
+		t.Fatal("MarkDelegated must set At")
+	}
+	// Old snapshots contain only "delegation|child": no peer and no tick.
+	c.NoteDelegatedHandoff("b", Handoff{})
+	if !c.Allowing("ba") {
+		t.Fatal("anonymous legacy mark must not block writes")
+	}
+	if _, _, blocked := c.DelegatedCover("ba"); blocked {
+		t.Fatal("anonymous legacy mark must not produce a delegated cover")
+	}
+	if c.IsDelegated("@", "b") {
+		t.Fatal("anonymous legacy mark must remain unresolved, not authoritative")
 	}
 }
 
